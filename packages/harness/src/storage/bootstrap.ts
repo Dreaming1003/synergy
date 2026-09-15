@@ -8,7 +8,7 @@ import { AtomicFile } from "./atomic-file"
 import { authorityRecordRoots, StoragePortable } from "./portable"
 import { StorageConfiguration, readStorageConfiguration, resolveStoreOptions } from "./config"
 import { StorageIntegrityError } from "./errors"
-import { LegacyJsonImporter, legacySources, legacyRecordKey, type ImportProgress } from "./legacy-import"
+import { LegacyJsonImporter, legacyRecords, type ImportProgress } from "./legacy-import"
 import { TransactionalStore } from "./transactional-store"
 import type { StoreOptions } from "./sql-contract"
 
@@ -62,12 +62,12 @@ async function optionalJson(filename: string): Promise<unknown | undefined> {
 async function rejectLegacyWriters(dataRoot: string, progress?: (progress: ImportProgress) => void) {
   let current = 0
   progress?.({ stage: "check", current, total: 0, bytes: 0 })
-  for await (const entry of legacySources(dataRoot)) {
+  for await (const _record of legacyRecords(dataRoot, () => {
     progress?.({ stage: "check", current: ++current, total: 0, bytes: 0 })
-    if (legacyRecordKey(entry.relative))
-      throw new StorageIntegrityError(
-        "Legacy JSON records appeared after database activation; preserve both datasets and resolve the old writer before starting",
-      )
+  })) {
+    throw new StorageIntegrityError(
+      "Legacy JSON records appeared after database activation; preserve both datasets and resolve the old writer before starting",
+    )
   }
 }
 

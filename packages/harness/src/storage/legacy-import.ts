@@ -57,6 +57,46 @@ export function legacyRecordKey(relative: string): string[] | undefined {
   return recordRoots.has(key[0]) ? key : undefined
 }
 
+function recordDirectory(segments: string[]) {
+  const [root, child] = segments
+  if (root === "channel") return child !== "workspaces"
+  if (root === "browser") return !child || /^sessions(?:-v\d+)?$/.test(child)
+  if (root === "push") return !child || child === "subscriptions"
+  if (root === "library") return !child || child === "stats"
+  if (root === "snapshot-v2" && (segments.includes(".locks") || segments.includes("leases"))) return false
+  return recordRoots.has(root)
+}
+
+export async function* legacyRecords(dataRoot: string, visit?: () => void): AsyncGenerator<string> {
+  async function* walk(segments: string[]): AsyncGenerator<string> {
+    const directory = await fs.opendir(path.join(dataRoot, ...segments))
+    for await (const entry of directory) {
+      if (entry.name === ".locks" || entry.name.startsWith(".tmp-") || entry.name.endsWith(".tmp")) continue
+      visit?.()
+      const child = [...segments, entry.name]
+      const relative = child.join("/")
+      if (entry.isDirectory()) {
+        if (recordDirectory(child)) yield* walk(child)
+      } else if (entry.isSymbolicLink()) {
+        if (recordRoots.has(child[0]) || legacyRecordKey(relative))
+          throw new StorageIntegrityError("Authoritative legacy records cannot be symbolic links")
+      } else if (entry.isFile()) {
+        if (legacyRecordKey(relative)) yield relative
+      } else if (recordDirectory(child) || legacyRecordKey(relative))
+        throw new StorageIntegrityError("Legacy storage contains an unsupported file type")
+    }
+  }
+  yield* walk([])
+  try {
+    const lock = await fs.lstat(path.join(dataRoot, "..", "plugin.lock"))
+    if (!lock.isFile() || lock.isSymbolicLink())
+      throw new StorageIntegrityError("Plugin installation metadata is not a regular file")
+    yield "@home/plugin.lock"
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error
+  }
+}
+
 export type ImportProgress = StorageStartupProgress
 
 interface ImportFile {
