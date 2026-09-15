@@ -29,3 +29,5 @@ Desktop renews the existing five-minute inactivity deadline only for advancing s
 ## Consequences
 
 The startup schema gains a storage variant, and consumers must understand its ordering. Payloads contain no paths or record contents. Reporting observes work without changing migration checkpoints, backup contents or activation policy. Progress tests cover real legacy fixtures and Desktop deadline transitions.
+
+This change does not reduce the immutable backup, database and journal space budget. A large legacy home can make observable progress and still fail its capacity prerequisite. Restoring availability with a compatible runtime and completing the SQL upgrade are separate operational outcomes; successful progress reporting or a smaller snapshot store must not be presented as proof that the full upgrade completed.
