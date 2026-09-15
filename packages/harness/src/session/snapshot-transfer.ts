@@ -131,6 +131,23 @@ export namespace SnapshotTransfer {
       return { added, keep }
     }
 
+    async verifyTrees(repository: string, trees: string[], signal?: AbortSignal) {
+      if (!trees.length) return
+      const expected = new Set(trees)
+      const input = path.join(this.directory, "verify-trees")
+      await Bun.write(input, [...expected].join("\n") + "\n")
+      for await (const line of SnapshotGit.lines(
+        repository,
+        ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        { signal, input },
+      )) {
+        const [oid, type] = line.split(" ")
+        if (type !== "tree" || !expected.delete(oid))
+          throw new SnapshotStore.StorageError("Historical snapshot tree is missing or invalid")
+      }
+      if (expected.size) throw new SnapshotStore.StorageError("Historical snapshot tree verification was incomplete")
+    }
+
     trees() {
       return this.db
         .query<{ oid: string }, []>("SELECT oid FROM incoming WHERE type = 'tree'")
@@ -138,7 +155,15 @@ export namespace SnapshotTransfer {
         .map((row) => row.oid)
     }
 
-    async protect(sessionID: string | undefined, roots: string[], signal?: AbortSignal) {
+    async protect(
+      sessionID: string | undefined,
+      roots: string[],
+      signal?: AbortSignal,
+      options: { packReferences?: boolean } = {},
+    ) {
+      const update = options.packReferences
+        ? ["-c", "core.fsync=-reference", "update-ref", "--stdin"]
+        : ["update-ref", "--stdin"]
       const refsFile = path.join(this.directory, "references")
       await Bun.write(refsFile, "")
       const refs = Bun.file(refsFile).writer()
@@ -154,7 +179,7 @@ export namespace SnapshotTransfer {
         await Promise.all([refs.end(), rootWriter.end()])
       }
       if (roots.length) {
-        if (sessionID) await SnapshotGit.checked(this.target, ["update-ref", "--stdin"], { signal, input: refsFile })
+        if (sessionID) await SnapshotGit.checked(this.target, update, { signal, input: refsFile })
         const cover = this.db.prepare("INSERT OR IGNORE INTO covered VALUES (?)")
         for await (const oid of SnapshotGit.lines(
           this.target,
@@ -177,7 +202,23 @@ export namespace SnapshotTransfer {
       } finally {
         await preserved.end()
       }
-      if (count) await SnapshotGit.checked(this.target, ["update-ref", "--stdin"], { signal, input: refsFile })
+      if (count) await SnapshotGit.checked(this.target, update, { signal, input: refsFile })
+      if (options.packReferences && (count || (sessionID && roots.length))) {
+        // Provenance: https://git-scm.com/docs/git-config#Documentation/git-config.txt-corefsync
+        // and https://github.com/git/git/blob/v2.50.1/refs/packed-backend.c (write_with_updates).
+        // Migration retains its source and import keep until the packed reference file and its rename are durable.
+        const pack = ["-c", "core.fsync=reference", "-c", "core.fsyncMethod=fsync", "pack-refs", "--all"]
+        await SnapshotGit.checked(this.target, [...pack, "--no-prune"], { signal })
+        if (process.platform !== "win32") {
+          const directory = await fs.open(this.target, "r")
+          try {
+            await directory.sync()
+          } finally {
+            await directory.close()
+          }
+        }
+        await SnapshotGit.checked(this.target, pack, { signal })
+      }
       return count
     }
 

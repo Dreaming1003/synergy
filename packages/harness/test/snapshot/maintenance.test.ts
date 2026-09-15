@@ -6,12 +6,46 @@ import { Snapshot } from "../../src/session/snapshot"
 import { SnapshotStore } from "../../src/session/snapshot-store"
 import { SnapshotMaintenance } from "../../src/session/snapshot-maintenance"
 import { SnapshotTransfer } from "../../src/session/snapshot-transfer"
+import { SnapshotGit } from "../../src/session/snapshot-git"
 import { ScopeContext } from "../../src/scope/context"
 import { Storage } from "../../src/storage/storage"
 import { StoragePath } from "../../src/storage/path"
 import { Identifier } from "../../src/id/id"
 import { Session } from "../../src/session"
 import { tmpdir } from "../support/fixture"
+
+test("migration keeps its source until packed retention references are durable", async () => {
+  await using tmp = await tmpdir({ git: true })
+  const scope = await tmp.scope()
+  await ScopeContext.provide({
+    scope,
+    fn: async () => {
+      const session = await Session.create({ scope })
+      const source = SnapshotStore.legacyRepository(scope.id, session.id)
+      await SnapshotStore.initializeBareRepository(source)
+      await Bun.write(path.join(tmp.path, "retained.txt"), "retained")
+      await SnapshotStore.command(source, ["-C", tmp.path, "--work-tree", tmp.path, "add", "retained.txt"])
+      const tree = await SnapshotStore.command(source, ["write-tree"])
+      await SnapshotMaintenance.registerLegacy(undefined, scope.id)
+      const checked = SnapshotGit.checked
+      {
+        using fault = spyOn(SnapshotGit, "checked").mockImplementation(async (repo, args, options) => {
+          if (args.includes("pack-refs")) throw new Error("interrupted packed reference publication")
+          return checked(repo, args, options)
+        })
+        expect((await SnapshotMaintenance.migrate(scope.id, { apply: true })).results[0].status).toBe("failed")
+      }
+      expect((await SnapshotStore.owner(scope.id, session.id))?.backend).toBe("legacy")
+      expect(await Bun.file(path.join(source, "HEAD")).exists()).toBe(true)
+      expect((await SnapshotMaintenance.migrate(scope.id, { apply: true })).results[0].status).toBe("migrated")
+      expect(await Bun.file(path.join(SnapshotStore.repository(scope.id), "packed-refs")).text()).toContain(tree)
+      expect(await SnapshotStore.owns(scope.id, session.id, tree)).toBe(true)
+      expect(await SnapshotStore.command(SnapshotStore.repository(scope.id), ["show", `${tree}:retained.txt`])).toBe(
+        "retained",
+      )
+    },
+  })
+})
 
 for (const phase of ["imported", "verified", "protected", "switched"] as const) {
   test(`migration resumes after durable ${phase} checkpoint`, async () => {
