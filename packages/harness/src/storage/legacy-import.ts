@@ -3,6 +3,7 @@ import fs from "node:fs/promises"
 import { createReadStream } from "node:fs"
 import path from "node:path"
 import { z } from "zod"
+import type { StorageStartupProgress } from "@ericsanchezok/synergy-util/runtime-startup"
 import { AtomicFile } from "./atomic-file"
 import { StorageIntegrityError } from "./errors"
 import { TransactionalStore } from "./transactional-store"
@@ -56,12 +57,7 @@ export function legacyRecordKey(relative: string): string[] | undefined {
   return recordRoots.has(key[0]) ? key : undefined
 }
 
-export interface ImportProgress {
-  stage: "backup" | "import" | "verify"
-  current: number
-  total: number
-  bytes: number
-}
+export type ImportProgress = StorageStartupProgress
 
 interface ImportFile {
   relative: string
@@ -211,9 +207,12 @@ export class LegacyJsonImporter {
     if (!saved) {
       let backupBytes = 0n
       let recordBytes = 0n
+      let files = 0
+      progress?.({ stage: "scan", current: 0, total: 0, bytes: 0 })
       for await (const entry of legacySources(dataRoot)) {
         backupBytes += BigInt(entry.size)
         if (legacyRecordKey(entry.relative)) recordBytes += BigInt(entry.size) + 4096n
+        progress?.({ stage: "scan", current: ++files, total: 0, bytes: Number(backupBytes) })
       }
       const disk = await fs.statfs(dataRoot, { bigint: true })
       const required = backupBytes + recordBytes * 3n + 32n * 1024n * 1024n
@@ -278,6 +277,8 @@ export class LegacyJsonImporter {
     }
     if (state.backedUp && count !== state.files)
       throw new StorageIntegrityError("Legacy files disappeared after the migration snapshot was sealed")
+    progress?.({ stage: "inventory", current: 0, total: count, bytes: 0 })
+    let inventoried = 0
     const inventoryPath = path.join(backupRoot, "inventory.ndjson")
     await fs.mkdir(backupRoot, { recursive: true, mode: 0o700 })
     const inventory = await fs.open(inventoryPath + ".tmp", "w", 0o600)
@@ -298,6 +299,7 @@ export class LegacyJsonImporter {
             }) + "\n"
           inventoryHash.update(line)
           await inventory.writeFile(line)
+          progress?.({ stage: "inventory", current: ++inventoried, total: count, bytes: 0 })
         }
         cursor = records.at(-1)!.key
       }
@@ -322,6 +324,8 @@ export class LegacyJsonImporter {
     )
 
     // Validate owners first so migrations never see children of a quarantined Session.
+    progress?.({ stage: "owners", current: 0, total: count, bytes: 0 })
+    let checkedOwners = 0
     let sessionAfter: string[] | undefined
     for (;;) {
       const batch = await store.query<ImportFile>({ kind: "storage_import_files", after: sessionAfter, limit: 128 })
@@ -335,6 +339,7 @@ export class LegacyJsonImporter {
           entry.key[3] === "info"
         )
           await this.import(record.key, entry)
+        progress?.({ stage: "owners", current: ++checkedOwners, total: count, bytes: 0 })
       }
       sessionAfter = batch.at(-1)!.key
     }
@@ -376,14 +381,19 @@ export class LegacyJsonImporter {
   }
 
   async retire(): Promise<void> {
-    const { store, dataRoot, backupRoot } = this.options
+    const { store, dataRoot, backupRoot, progress } = this.options
+    let current = 0
+    progress?.({ stage: "activate", current, total: 0, bytes: 0 })
     let after: string[] | undefined
     for (;;) {
       const batch = await store.query<ImportFile>({ kind: "storage_import_files", after, limit: 128 })
       if (!batch.length) return
       for (const record of batch) {
         const entry = record.value
-        if (!entry.key || entry.retired) continue
+        if (!entry.key || entry.retired) {
+          progress?.({ stage: "activate", current: ++current, total: 0, bytes: 0 })
+          continue
+        }
         if (entry.disposition !== "imported" && entry.disposition !== "quarantined")
           throw new StorageIntegrityError("Cannot retire an unaccounted legacy record")
         if ((await digest(path.join(backupRoot, "data", entry.relative))) !== entry.hash)
@@ -398,6 +408,7 @@ export class LegacyJsonImporter {
         }
         entry.retired = true
         await store.write(record.key, entry)
+        progress?.({ stage: "activate", current: ++current, total: 0, bytes: 0 })
       }
       after = batch.at(-1)!.key
     }

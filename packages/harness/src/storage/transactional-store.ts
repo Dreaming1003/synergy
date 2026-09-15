@@ -612,8 +612,9 @@ export class TransactionalStore {
     )
   }
 
-  async verify() {
+  async verify(progress?: (current: number) => void) {
     this.check()
+    progress?.(0)
     return this.driver.transaction(
       async (connection) => {
         if (this.driver.backend === "sqlite") {
@@ -650,6 +651,7 @@ export class TransactionalStore {
                   issues.push({ key, reason: "identity_mismatch" })
               }
             }
+            progress?.(records)
             after = batch.at(-1)!.key
           }
           const [invalid] = await connection.query(

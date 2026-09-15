@@ -165,7 +165,8 @@ async function runCliImplementation(options: CliOptions): Promise<void> {
     ),
   )
   const directory = Flag.SYNERGY_CWD || process.cwd()
-  for (const command of (await options.pluginCommands?.(directory)) ?? []) {
+  const pluginCommands = hasCommand ? [] : ((await options.pluginCommands?.(directory)) ?? [])
+  for (const command of pluginCommands) {
     const names = (Array.isArray(command.command) ? command.command : [command.command])
       .filter((name): name is string => typeof name === "string")
       .map((name) => name.split(" ")[0])
