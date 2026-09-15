@@ -13,6 +13,8 @@ export const StorageStartupProgress = z.object({
     "owners",
     "import",
     "verify",
+    "archive-verify",
+    "archive-import",
     "validate",
     "activate",
     "check",
