@@ -1,5 +1,5 @@
 import type { Platform } from "@/context/platform"
-import { dialog } from "@/locales/messages"
+import { dialog, type AppMessageDescriptor } from "@/locales/messages"
 
 export interface PickProjectDirectoriesOptions {
   title: string
@@ -16,6 +16,7 @@ export type ProjectDirectoryPickerToast = (toast: { type: "error"; title: string
 export interface ProjectDirectoryPickerRuntime {
   platform: Platform
   showErrorToast: ProjectDirectoryPickerToast
+  translate(descriptor: AppMessageDescriptor): string
   pickServer(options: PickProjectDirectoriesOptions): Promise<PickProjectDirectoriesResult | null>
   isPending(): boolean
   setPending(pending: boolean): void
@@ -61,14 +62,22 @@ export async function pickProjectDirectoriesWithRuntime(
           title: options.title,
           multiple: options.multiple,
         })
+        if (selected !== null && !Array.isArray(selected) && typeof selected === "object") {
+          runtime.showErrorToast({
+            type: "error",
+            title: runtime.translate(dialog.directoryPickerDenied),
+            description: runtime.translate(dialog.directoryPickerDeniedHint),
+          })
+          return null
+        }
         const directoryPaths = normalizePickedDirectories(selected)
         if (!directoryPaths) return null
         return { directoryPaths, source: "native-local" }
       } catch {
         runtime.showErrorToast({
           type: "error",
-          title: dialog.directoryPickerFailed.message,
-          description: dialog.directoryPickerCantOpen.message,
+          title: runtime.translate(dialog.directoryPickerFailed),
+          description: runtime.translate(dialog.directoryPickerCantOpen),
         })
         return null
       }
