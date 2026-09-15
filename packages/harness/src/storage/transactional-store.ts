@@ -627,8 +627,9 @@ export class TransactionalStore {
     )
   }
 
-  async verify() {
+  async verify(progress?: (current: number) => void) {
     this.check()
+    progress?.(0)
     return this.driver.transaction(
       async (connection) => {
         if (this.driver.backend === "sqlite") {
@@ -643,6 +644,7 @@ export class TransactionalStore {
         try {
           for await (const record of tx.records<Record<string, unknown>>()) {
             records++
+            if (records % 256 === 0) progress?.(records)
             const meta = metadata(record.key)
             kinds[meta.kind] = (kinds[meta.kind] ?? 0) + 1
             const key = record.key
@@ -661,6 +663,7 @@ export class TransactionalStore {
                 issues.push({ key, reason: "identity_mismatch" })
             }
           }
+          progress?.(records)
           const [invalid] = await connection.query(
             "SELECT COUNT(*) AS count FROM storage_records r LEFT JOIN storage_nodes n ON r.namespace = n.namespace AND r.key_id = n.key_id WHERE r.namespace = ? AND r.body IS NOT NULL AND (n.key_id IS NULL OR n.key_text <> r.key_text OR r.revision < 1)",
             [this.options.namespace],

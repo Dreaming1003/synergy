@@ -80,6 +80,9 @@ test("host contributes its default command without loading unselected commands",
   await runCli({
     argv: [],
     defaultCommand: "server",
+    pluginCommands: async () => {
+      throw new Error("Plugin metadata cannot open an interrupted storage upgrade")
+    },
     beforeCommand: async (command) => {
       calls.push(`before:${command}`)
     },

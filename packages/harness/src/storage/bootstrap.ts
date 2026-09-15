@@ -59,8 +59,11 @@ async function optionalJson(filename: string): Promise<unknown | undefined> {
   }
 }
 
-async function rejectLegacyWriters(dataRoot: string) {
+async function rejectLegacyWriters(dataRoot: string, progress?: (progress: ImportProgress) => void) {
+  let current = 0
+  progress?.({ stage: "check", current, total: 0, bytes: 0 })
   for await (const entry of legacySources(dataRoot)) {
+    progress?.({ stage: "check", current: ++current, total: 0, bytes: 0 })
     if (legacyRecordKey(entry.relative))
       throw new StorageIntegrityError(
         "Legacy JSON records appeared after database activation; preserve both datasets and resolve the old writer before starting",
@@ -179,6 +182,7 @@ export namespace StorageBootstrap {
     recover?: boolean
     progress?: (progress: ImportProgress) => void
   }) {
+    options.progress?.({ stage: "prepare", current: 0, total: 0, bytes: 0 })
     const root = path.resolve(options.root)
     if (await optionalJson(path.join(root, "data", "storage", "switch.json")))
       throw new StorageIntegrityError("An interrupted storage switch requires data storage resume")
@@ -258,13 +262,13 @@ export namespace StorageBootstrap {
           manifest.phase = "validating"
           await persist()
         }
-        if (manifest.phase === "active") await rejectLegacyWriters(path.join(root, "data"))
+        if (manifest.phase === "active") await rejectLegacyWriters(path.join(root, "data"), options.progress)
         const activate = async () => {
           if (manifest.phase === "active") return
           manifest.phase = "activating"
           await persist()
           await importer.retire()
-          await rejectLegacyWriters(path.join(root, "data"))
+          await rejectLegacyWriters(path.join(root, "data"), options.progress)
           manifest.phase = "active"
           await persist()
         }
