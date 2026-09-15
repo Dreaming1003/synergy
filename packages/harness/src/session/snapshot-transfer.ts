@@ -204,11 +204,24 @@ export namespace SnapshotTransfer {
       }
       if (count) await SnapshotGit.checked(this.target, update, { signal, input: refsFile })
       if (options.packReferences && (count || (sessionID && roots.length))) {
+        const version = /^git version (\d+)\.(\d+)/.exec(
+          await SnapshotGit.checked(this.target, ["version"], { signal }),
+        )
+        if (!version || Number(version[1]) < 2 || (Number(version[1]) === 2 && Number(version[2]) < 36)) {
+          await this.syncLooseReferences(sessionID, roots, signal)
+          return count
+        }
         // Provenance: https://git-scm.com/docs/git-config#Documentation/git-config.txt-corefsync
         // and https://github.com/git/git/blob/v2.50.1/refs/packed-backend.c (write_with_updates).
         // Migration retains its source and import keep until the packed reference file and its rename are durable.
         const pack = ["-c", "core.fsync=reference", "-c", "core.fsyncMethod=fsync", "pack-refs", "--all"]
         await SnapshotGit.checked(this.target, [...pack, "--no-prune"], { signal })
+        const packed = await fs.open(path.join(this.target, "packed-refs"), "r+")
+        try {
+          await packed.sync()
+        } finally {
+          await packed.close()
+        }
         if (process.platform !== "win32") {
           const directory = await fs.open(this.target, "r")
           try {
@@ -220,6 +233,48 @@ export namespace SnapshotTransfer {
         await SnapshotGit.checked(this.target, pack, { signal })
       }
       return count
+    }
+
+    private async syncLooseReferences(sessionID: string | undefined, roots: string[], signal?: AbortSignal) {
+      // Provenance: https://git-scm.com/docs/git-config/2.36.0#Documentation/git-config.txt-corefsync
+      // Older Git cannot flush packed refs before rename; retain explicitly flushed loose refs instead.
+      const directories = new Set<string>()
+      const sync = async (reference: string) => {
+        signal?.throwIfAborted()
+        const filename = path.join(this.target, reference)
+        const file = await fs.open(filename, "r+").catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error
+          return fs.open(path.join(this.target, "packed-refs"), "r+")
+        })
+        try {
+          await file.sync()
+        } finally {
+          await file.close()
+        }
+        let directory = path.dirname(filename)
+        while (directory.startsWith(this.target + path.sep)) {
+          directories.add(directory)
+          directory = path.dirname(directory)
+        }
+        directories.add(this.target)
+      }
+      if (sessionID) for (const oid of new Set(roots)) await sync(SnapshotStore.reference(sessionID, oid))
+      for (const row of this.db
+        .query<{ oid: string }, []>("SELECT oid FROM incoming WHERE oid NOT IN (SELECT oid FROM covered)")
+        .iterate())
+        await sync(`refs/synergy/preserved/${row.oid}`)
+      if (process.platform === "win32") return
+      for (const directory of [...directories].sort((a, b) => b.length - a.length)) {
+        const file = await fs.open(directory, "r").catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error
+          return undefined
+        })
+        try {
+          await file?.sync()
+        } finally {
+          await file?.close()
+        }
+      }
     }
 
     async releaseKeep(hash?: string) {

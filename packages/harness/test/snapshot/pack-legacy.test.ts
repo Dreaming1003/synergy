@@ -50,15 +50,22 @@ test("keeps loose originals if pack verification fails and resumes safely", asyn
   const checked = SnapshotGit.checked
   {
     using failure = spyOn(SnapshotGit, "checked").mockImplementation(async (repository, args, options) => {
-      if (args[0] === "verify-pack") throw new Error("injected pack verification failure")
+      if (args[0] === "verify-pack") {
+        await Bun.write(args.at(-1)!.replace(/\.idx$/, ".pack"), "corrupt pack")
+        throw new Error("injected pack verification failure")
+      }
       return checked(repository, args, options)
     })
     const result = await SnapshotMaintenance.packLegacy(data, { scopeID: "scope", apply: true })
     expect(result.ok).toBe(false)
     expect(await Bun.file(path.join(repo, "objects", unknown.slice(0, 2), unknown.slice(2))).exists()).toBe(true)
+    expect((await fs.readdir(path.join(repo, "objects", "pack"))).filter((name) => /\.(pack|idx)$/.test(name))).toEqual(
+      [],
+    )
   }
   expect((await SnapshotMaintenance.packLegacy(data, { scopeID: "scope", apply: true })).ok).toBe(true)
   expect(await SnapshotStore.command(repo, ["cat-file", "-p", unknown])).toBe("unreferenced evidence")
+  await SnapshotGit.checked(repo, ["fsck", "--full", "--no-dangling"])
 })
 
 test("packs only local loose objects while retaining an alternate dependency", async () => {

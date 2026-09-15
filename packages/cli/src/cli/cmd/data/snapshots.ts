@@ -58,7 +58,7 @@ export async function executeSnapshots(input: Input) {
       }
       return { ok, results }
     }
-    if (input.apply) await SnapshotMaintenance.registerLegacy(undefined, input.scope)
+    if (input.apply) await SnapshotMaintenance.registerLegacy(undefined, input.scope, input.session)
     const scopes = input.scope ? [SnapshotStore.component(input.scope)] : await SnapshotMaintenance.scopes()
     const results = []
     let ok = true

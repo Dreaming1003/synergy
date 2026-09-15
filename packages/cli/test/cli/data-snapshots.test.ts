@@ -30,7 +30,7 @@ test("a filtered migration preserves unrelated repositories and reconstructs sel
       expect(result.ok).toBe(true)
       expect(await Bun.file(path.join(repositories[0], "HEAD")).exists()).toBe(false)
       expect(await Bun.file(path.join(repositories[1], "HEAD")).exists()).toBe(true)
-      expect((await SnapshotStore.owner(scope.id, sessions[1].id))?.backend).toBe("legacy")
+      expect(await SnapshotStore.owner(scope.id, sessions[1].id)).toBeUndefined()
       expect(await SnapshotStore.command(SnapshotStore.repository(scope.id), ["show", `${tree}:history.txt`])).toBe(
         "retained history",
       )

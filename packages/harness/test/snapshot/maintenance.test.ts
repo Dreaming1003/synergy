@@ -27,21 +27,62 @@ test("migration keeps its source until packed retention references are durable",
       await SnapshotStore.command(source, ["-C", tmp.path, "--work-tree", tmp.path, "add", "retained.txt"])
       const tree = await SnapshotStore.command(source, ["write-tree"])
       await SnapshotMaintenance.registerLegacy(undefined, scope.id)
-      const checked = SnapshotGit.checked
+      const open = fs.open
       {
-        using fault = spyOn(SnapshotGit, "checked").mockImplementation(async (repo, args, options) => {
-          if (args.includes("pack-refs")) throw new Error("interrupted packed reference publication")
-          return checked(repo, args, options)
+        using fault = spyOn(fs, "open").mockImplementation(async (...args) => {
+          const file = await open(...args)
+          if (
+            args[0] === path.join(SnapshotStore.repository(scope.id), "packed-refs") ||
+            args[0] === path.join(SnapshotStore.repository(scope.id), SnapshotStore.reference(session.id, tree))
+          ) {
+            file.sync = async () => {
+              throw new Error("interrupted packed reference publication")
+            }
+          }
+          return file
         })
         expect((await SnapshotMaintenance.migrate(scope.id, { apply: true })).results[0].status).toBe("failed")
       }
       expect((await SnapshotStore.owner(scope.id, session.id))?.backend).toBe("legacy")
       expect(await Bun.file(path.join(source, "HEAD")).exists()).toBe(true)
       expect((await SnapshotMaintenance.migrate(scope.id, { apply: true })).results[0].status).toBe("migrated")
-      expect(await Bun.file(path.join(SnapshotStore.repository(scope.id), "packed-refs")).text()).toContain(tree)
       expect(await SnapshotStore.owns(scope.id, session.id, tree)).toBe(true)
       expect(await SnapshotStore.command(SnapshotStore.repository(scope.id), ["show", `${tree}:retained.txt`])).toBe(
         "retained",
+      )
+    },
+  })
+})
+
+test("older Git keeps and flushes loose retention references instead of rewriting packed history", async () => {
+  await using tmp = await tmpdir({ git: true })
+  const scope = await tmp.scope()
+  await ScopeContext.provide({
+    scope,
+    fn: async () => {
+      const session = await Session.create({ scope })
+      const source = SnapshotStore.legacyRepository(scope.id, session.id)
+      await SnapshotStore.initializeBareRepository(source)
+      await Bun.write(path.join(tmp.path, "history.txt"), "older Git history")
+      await SnapshotStore.command(source, ["-C", tmp.path, "--work-tree", tmp.path, "add", "history.txt"])
+      const tree = await SnapshotStore.command(source, ["write-tree"])
+      await SnapshotMaintenance.registerLegacy(undefined, scope.id)
+      const checked = SnapshotGit.checked
+      using version = spyOn(SnapshotGit, "checked").mockImplementation(async (repo, args, options) => {
+        if (args[0] === "version") return "git version 2.25.1"
+        if (args.includes("pack-refs")) throw new Error("Older Git cannot durably rewrite packed references")
+        return checked(repo, args, options)
+      })
+      expect((await SnapshotMaintenance.migrate(scope.id, { apply: true })).results[0].status).toBe("migrated")
+      expect(
+        (
+          await Bun.file(
+            path.join(SnapshotStore.repository(scope.id), SnapshotStore.reference(session.id, tree)),
+          ).text()
+        ).trim(),
+      ).toBe(tree)
+      expect(await SnapshotStore.command(SnapshotStore.repository(scope.id), ["show", `${tree}:history.txt`])).toBe(
+        "older Git history",
       )
     },
   })
