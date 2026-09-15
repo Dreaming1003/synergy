@@ -245,6 +245,7 @@ export namespace StorageBootstrap {
           const archive = path.join(root, "data", "agent-records.ndjson")
           if (await Bun.file(archive).exists())
             await StoragePortable.importFile(store, archive, {
+              progress: options.progress,
               operationID: `portable-${manifest.backupID}`,
               accept: (entry) =>
                 entry.type !== "record" ||

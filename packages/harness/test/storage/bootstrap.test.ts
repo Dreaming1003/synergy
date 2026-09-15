@@ -3,6 +3,7 @@ import { afterAll, expect, spyOn, test } from "bun:test"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { StorageBootstrap } from "../../src/storage/bootstrap"
+import { StoragePortable } from "../../src/storage/portable"
 
 const fixtures = await fs.mkdtemp(path.join(process.env.SYNERGY_TEST_ROOT!, "storage-bootstrap-"))
 afterAll(() => fs.rm(fixtures, { recursive: true, force: true }))
@@ -12,6 +13,29 @@ async function home() {
   await fs.mkdir(path.join(root, "data"), { recursive: true })
   return root
 }
+
+test("restored portable records report hashing and import before activation", async () => {
+  const source = await StorageBootstrap.prepare({ root: await home() })
+  const root = await home()
+  try {
+    await source.store.write(["notes", "scope", "archive"], { preserved: true })
+    await StoragePortable.exportFile(source.store, path.join(root, "data", "agent-records.ndjson"))
+  } finally {
+    await source.store.close()
+  }
+  const stages: string[] = []
+  const restored = await StorageBootstrap.prepare({ root, progress: (value) => stages.push(value.stage) })
+  try {
+    expect(stages).toContain("archive-verify")
+    expect(stages).toContain("archive-import")
+    expect(await restored.store.read<{ preserved: boolean }>(["notes", "scope", "archive"])).toEqual({
+      preserved: true,
+    })
+    await restored.activate()
+  } finally {
+    await restored.store.close()
+  }
+})
 
 test("keeps JSON intact until validation and activation and then uses only the database", async () => {
   const root = await home()

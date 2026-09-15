@@ -95,6 +95,8 @@ export class DesktopServerStartup {
         owners: "Checking saved sessions",
         import: "Importing saved records",
         verify: "Verifying the import",
+        "archive-verify": "Verifying the saved archive",
+        "archive-import": "Importing the saved archive",
         validate: "Verifying saved records",
         activate: "Activating saved records",
         check: "Checking storage ownership",

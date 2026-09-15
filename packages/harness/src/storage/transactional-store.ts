@@ -8,6 +8,7 @@ import {
   StorageOwnershipError,
 } from "./errors"
 import { StorageQueue } from "./queue"
+import { observeStorageProgress } from "./progress"
 import { SqliteDriver } from "./sqlite-driver"
 import { PostgresDriver } from "./postgres-driver"
 import type { SqlConnection, SqlDriver, SqlRow, SqlValue, StoreOptions } from "./sql-contract"
@@ -630,7 +631,8 @@ export class TransactionalStore {
   async verify(progress?: (current: number) => void) {
     this.check()
     progress?.(0)
-    return this.driver.transaction(
+    let work = 0
+    return observeStorageProgress((recordProgress) => this.driver.transaction(
       async (connection) => {
         if (this.driver.backend === "sqlite") {
           const rows = await connection.query("PRAGMA integrity_check", [], { maintenance: true })
@@ -644,7 +646,7 @@ export class TransactionalStore {
         try {
           for await (const record of tx.records<Record<string, unknown>>()) {
             records++
-            if (records % 256 === 0) progress?.(records)
+            if (++work % 256 === 0) recordProgress(work)
             const meta = metadata(record.key)
             kinds[meta.kind] = (kinds[meta.kind] ?? 0) + 1
             const key = record.key
@@ -663,7 +665,7 @@ export class TransactionalStore {
                 issues.push({ key, reason: "identity_mismatch" })
             }
           }
-          progress?.(records)
+          recordProgress(work)
           const [invalid] = await connection.query(
             "SELECT COUNT(*) AS count FROM storage_records r LEFT JOIN storage_nodes n ON r.namespace = n.namespace AND r.key_id = n.key_id WHERE r.namespace = ? AND r.body IS NOT NULL AND (n.key_id IS NULL OR n.key_text <> r.key_text OR r.revision < 1)",
             [this.options.namespace],
@@ -676,6 +678,7 @@ export class TransactionalStore {
         }
       },
       { readOnly: true },
+    ), progress
     )
   }
 

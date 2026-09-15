@@ -10,7 +10,9 @@ An existing installation can spend longer than the ordinary Desktop health deadl
 
 The public startup framing includes aggregate storage stages with increasing step identifiers, item counts and byte counts. Storage bootstrap reports preparation, inventory scanning, backup, inventory publication, owner validation, import, verification, activation and legacy-writer checks. Runtime forwards these events independently of domain migration and execution recovery reporters. The managed server bounds emission frequency while preserving stage transitions.
 
-Built-in CLI commands dispatch without loading unrelated plugin command metadata. Their startup and offline recovery paths remain callable while storage is importing; root help and plugin dispatch still discover and validate plugin namespaces.
+Built-in CLI commands and version flags dispatch without loading unrelated plugin command metadata. Their startup and offline recovery paths remain callable while storage is importing; root help and plugin dispatch still discover and validate plugin namespaces.
+
+Portable bootstrap archives report both checksum scanning and import work. Database verification and portable import collect bounded progress in memory while the operation runs; a caller-side observer emits it outside retryable transaction callbacks. Counts include work repeated by transaction retries, so a retry cannot silently reset the managed inactivity clock. Completion and activation remain conditional on successful verification and commit.
 
 Desktop renews the existing five-minute inactivity deadline only for advancing storage work or a new step. Storage completion restores the ordinary health deadline. Domain migrations and storage activation can alternate before execution recovery starts; stale storage output cannot reopen completed recovery.
 

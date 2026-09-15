@@ -79,6 +79,8 @@ For managed startup changes, test a fresh home and an isolated upgrade lasting l
 
 Also exercise execution-history recovery after migration completion with a large journal fixture. Recovery must report actual scanned owners, journal records and validated evidence before HTTP admission; throttle output without inventing timer-driven progress. Verify continuing recovery survives the ordinary health deadline, failure never announces completion, and successful recovery restores the health deadline. A fresh-home smoke alone cannot establish that an existing home starts successfully.
 
+Include portable archive hashing/import and a retried database verification in storage startup tests. Progress observers must run outside retryable SQL callbacks; count actual repeated work monotonically and keep queued progress bounded. Version flags and built-in maintenance commands must remain available when plugin metadata cannot open storage.
+
 For CLI migration progress, exercise both foreground server and local `send --format json` startup. Keep human progress on stderr, display the step before its first await, and preserve stdout for command results or machine protocols. Test TTY updates, redirected output, `NO_COLOR`, `TERM=dumb`, failure cleanup and retry; explicit silent migration callers remain silent. Exercise ACP initialization on fresh and already-migrated homes with the Desktop progress environment flag both unset and inherited; its first stdout line must remain an ACP JSON frame and stderr must contain no migration rendering. Keep Desktop reporter selection in the server command rather than shared network resolution.
 
 ## Clean Up
