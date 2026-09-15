@@ -12,6 +12,8 @@ The public startup framing includes aggregate storage stages with increasing ste
 
 Built-in CLI commands and version flags dispatch without loading unrelated plugin command metadata. Their startup and offline recovery paths remain callable while storage is importing; root help and plugin dispatch still discover and validate plugin namespaces.
 
+After activation, legacy-writer detection enumerates only namespaces that can hold authoritative records and checks directory entries without statting every artifact. It still rejects recreated records, including Rollout chunk metadata and home-level plugin installation metadata, and propagates errors within authoritative namespaces. Initial backup inventory remains complete and unchanged.
+
 Portable bootstrap archives report both checksum scanning and import work. Database verification and portable import collect bounded progress in memory while the operation runs; a caller-side observer emits it outside retryable transaction callbacks. Counts include work repeated by transaction retries, so a retry cannot silently reset the managed inactivity clock. Completion and activation remain conditional on successful verification and commit.
 
 Desktop renews the existing five-minute inactivity deadline only for advancing storage work or a new step. Storage completion restores the ordinary health deadline. Domain migrations and storage activation can alternate before execution recovery starts; stale storage output cannot reopen completed recovery.

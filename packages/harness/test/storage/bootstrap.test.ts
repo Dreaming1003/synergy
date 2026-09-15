@@ -106,6 +106,49 @@ test("rejects legacy records recreated by an old writer after activation", async
   expect(failure).toMatchObject({ name: "StorageIntegrityError" })
 })
 
+test.each([
+  "data/channel/provider/account.json",
+  "data/browser/sessions-v2/session.json",
+  "data/push/subscriptions/device.json",
+  "data/library/stats/info.json",
+  "data/snapshot-v2/scope/owners/session.json",
+  "data/sessions/scope/session/rollout/artifacts/artifact/chunks/000000000000.json",
+  "plugin.lock",
+])("active startup detects recreated legacy record %s", async (relative) => {
+  const root = await home()
+  const prepared = await StorageBootstrap.prepare({ root })
+  await prepared.activate()
+  await prepared.store.close()
+  const filename = path.join(root, relative)
+  await fs.mkdir(path.dirname(filename), { recursive: true })
+  await Bun.write(filename, "{}")
+  await expect(StorageBootstrap.prepare({ root })).rejects.toThrow("Legacy JSON records appeared")
+})
+
+test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+  "active database startup does not require access to unrelated artifact trees",
+  async () => {
+    const root = await home()
+    const artifacts = path.join(root, "data", "snapshot", "scope", "session")
+    await fs.mkdir(artifacts, { recursive: true })
+    await Bun.write(path.join(artifacts, "unrelated.json"), "{}")
+    const prepared = await StorageBootstrap.prepare({ root })
+    await prepared.activate()
+    await prepared.store.close()
+    await fs.chmod(path.join(root, "data", "snapshot"), 0)
+    try {
+      const reopened = await StorageBootstrap.prepare({ root })
+      try {
+        expect(reopened.manifest.phase).toBe("active")
+      } finally {
+        await reopened.store.close()
+      }
+    } finally {
+      await fs.chmod(path.join(root, "data", "snapshot"), 0o700)
+    }
+  },
+)
+
 test("explicit target migration preserves data and switches configuration only after verification", async () => {
   const root = await home()
   const prepared = await StorageBootstrap.prepare({ root })
