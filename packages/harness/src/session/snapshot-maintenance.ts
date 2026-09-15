@@ -127,7 +127,13 @@ export namespace SnapshotMaintenance {
     return [...result].sort()
   }
 
-  export async function registerLegacy(progress?: (current: number, total: number) => void, scopeID?: string) {
+  export async function registerLegacy(
+    progress?: (current: number, total: number) => void,
+    scopeID?: string,
+    sessionID?: string,
+  ) {
+    if (sessionID && !scopeID) throw new Error("A session filter requires a Scope")
+    if (sessionID) SnapshotStore.component(sessionID)
     const ids = scopeID ? [SnapshotStore.component(scopeID)] : await scopes()
     let done = 0
     for (const scopeID of ids) {
@@ -136,6 +142,7 @@ export namespace SnapshotMaintenance {
           path.join(path.join(Storage.current().artifactDirectory, "snapshot"), scopeID),
         )) {
           if (!entry.isDirectory() || !/^[a-zA-Z0-9_-]+$/.test(entry.name)) continue
+          if (sessionID && entry.name !== sessionID) continue
           if (
             !(await Bun.file(
               path.join(path.join(Storage.current().artifactDirectory, "snapshot"), scopeID, entry.name, "HEAD"),
