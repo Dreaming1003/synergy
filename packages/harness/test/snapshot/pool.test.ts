@@ -60,39 +60,45 @@ test("scope migration consolidates an unowned pool while retaining borrowers and
   ).toBe("pooled history")
 })
 
-for (const phase of ["rename", "sync", "cleanup"] as const) {
-  test(`pool consolidation resumes after interrupted ${phase} without losing borrowed objects`, async () => {
-    const { tmp, scope, pool, borrower, tree, loose } = await fixture()
-    await using cleanup = tmp
-    const alternate = path.join(pool, "objects", "info", "alternates")
-    const rename = fs.rename
-    const open = fs.open
-    const rm = fs.rm
-    {
-      using renameFault = spyOn(fs, "rename").mockImplementation(async (...args) => {
-        if (phase === "rename" && args[1] === alternate) throw new Error("interrupted pool rename")
-        return rename(...args)
-      })
-      using syncFault = spyOn(fs, "open").mockImplementation(async (...args) => {
-        const file = await open(...args)
-        if (phase === "sync" && args[0] === path.dirname(alternate))
-          file.sync = async () => {
-            throw new Error("interrupted pool sync")
-          }
-        return file
-      })
-      using cleanupFault = spyOn(fs, "rm").mockImplementation(async (...args) => {
-        await rm(...args)
-        if (phase === "cleanup" && args[0] === loose) throw new Error("interrupted pool cleanup")
-      })
-      await expect(SnapshotMaintenance.migrate(scope.id, { apply: true })).rejects.toThrow("interrupted pool")
-    }
-    expect(await SnapshotStore.command(borrower, ["show", `${tree}:file.txt`])).toBe("pooled history")
-    if (phase !== "cleanup") expect(await Bun.file(loose).exists()).toBe(true)
-    expect((await SnapshotMaintenance.migrate(scope.id, { apply: true })).pool?.status).toBe("consolidated")
-    await SnapshotGit.checked(SnapshotStore.repository(scope.id), ["fsck", "--full"])
-    expect(await SnapshotStore.command(borrower, ["show", `${tree}:file.txt`])).toBe("pooled history")
-  })
+for (const phase of ["rename", "file-sync", "directory-sync", "cleanup"] as const) {
+  test.skipIf(process.platform === "win32" && phase === "directory-sync")(
+    `pool consolidation resumes after interrupted ${phase} without losing borrowed objects`,
+    async () => {
+      const { tmp, scope, pool, borrower, tree, loose } = await fixture()
+      await using cleanup = tmp
+      const alternate = path.join(pool, "objects", "info", "alternates")
+      const rename = fs.rename
+      const open = fs.open
+      const rm = fs.rm
+      {
+        using renameFault = spyOn(fs, "rename").mockImplementation(async (...args) => {
+          if (phase === "rename" && args[1] === alternate) throw new Error("interrupted pool rename")
+          return rename(...args)
+        })
+        using syncFault = spyOn(fs, "open").mockImplementation(async (...args) => {
+          const file = await open(...args)
+          if (
+            (phase === "directory-sync" && args[0] === path.dirname(alternate)) ||
+            (phase === "file-sync" && String(args[0]).startsWith(alternate + ".") && String(args[0]).endsWith(".tmp"))
+          )
+            file.sync = async () => {
+              throw new Error("interrupted pool sync")
+            }
+          return file
+        })
+        using cleanupFault = spyOn(fs, "rm").mockImplementation(async (...args) => {
+          await rm(...args)
+          if (phase === "cleanup" && args[0] === loose) throw new Error("interrupted pool cleanup")
+        })
+        await expect(SnapshotMaintenance.migrate(scope.id, { apply: true })).rejects.toThrow("interrupted pool")
+      }
+      expect(await SnapshotStore.command(borrower, ["show", `${tree}:file.txt`])).toBe("pooled history")
+      if (phase !== "cleanup") expect(await Bun.file(loose).exists()).toBe(true)
+      expect((await SnapshotMaintenance.migrate(scope.id, { apply: true })).pool?.status).toBe("consolidated")
+      await SnapshotGit.checked(SnapshotStore.repository(scope.id), ["fsck", "--full"])
+      expect(await SnapshotStore.command(borrower, ["show", `${tree}:file.txt`])).toBe("pooled history")
+    },
+  )
 }
 
 test("pool consolidation waits for legacy owners and stays outside session pilots", async () => {
