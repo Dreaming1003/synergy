@@ -335,19 +335,45 @@ export namespace SnapshotMaintenance {
         const repo = SnapshotStore.repository(scopeID)
         await SnapshotGit.checked(repo, ["fsck", "--full"], options)
         await using catalog = await SnapshotTransfer.Catalog.create(repo, options.signal)
-        for (const sessionID of pending) {
-          options.signal?.throwIfAborted()
+        const failed = (sessionID: string, error: unknown): MigrationResult => {
+          if (options.signal?.aborted) throw error
+          return {
+            sessionID,
+            status: "failed",
+            reason: error instanceof Error ? error.message : String(error),
+          }
+        }
+        for (let offset = 0; offset < pending.length; offset += 32) {
+          const batch: Array<{ sessionID: string; prepared: MigrationResult | (() => Promise<MigrationResult>) }> = []
+          for (const sessionID of pending.slice(offset, offset + 32)) {
+            options.signal?.throwIfAborted()
+            try {
+              batch.push({ sessionID, prepared: await prepareMigration(scopeID, sessionID, catalog, options.signal) })
+            } catch (error) {
+              batch.push({ sessionID, prepared: failed(sessionID, error) })
+            }
+          }
+          let publication: { error: unknown } | undefined
           try {
-            results.push(await migrateOne(scopeID, sessionID, catalog, options.signal))
+            await catalog.publishReferences(options.signal)
           } catch (error) {
             if (options.signal?.aborted) throw error
-            results.push({
-              sessionID,
-              status: "failed",
-              reason: error instanceof Error ? error.message : String(error),
-            })
+            publication = { error }
           }
-          options.progress?.(results.length, results.at(-1)!)
+          for (const { sessionID, prepared } of batch) {
+            try {
+              results.push(
+                typeof prepared !== "function"
+                  ? prepared
+                  : publication
+                    ? failed(sessionID, publication.error)
+                    : await prepared(),
+              )
+            } catch (error) {
+              results.push(failed(sessionID, error))
+            }
+            options.progress?.(results.length, results.at(-1)!)
+          }
         }
         await SnapshotGit.checked(repo, ["fsck", "--full"], options)
         return { scopeID, applied: true, results }
@@ -356,12 +382,12 @@ export namespace SnapshotMaintenance {
     )
   }
 
-  async function migrateOne(
+  async function prepareMigration(
     scopeID: string,
     sessionID: string,
     catalog: SnapshotTransfer.Catalog,
     signal?: AbortSignal,
-  ): Promise<MigrationResult> {
+  ): Promise<MigrationResult | (() => Promise<MigrationResult>)> {
     const key = StoragePath.snapshotMigration(scopeID, sessionID)
     const previous = await SnapshotStore.optional<unknown>(key)
     let journal: Journal = previous
@@ -372,7 +398,7 @@ export namespace SnapshotMaintenance {
     const info = await SnapshotStore.optional<unknown>(
       StoragePath.sessionInfo(Identifier.asScopeID(scopeID), Identifier.asSessionID(sessionID)),
     )
-    if (!info || scopeID === "__reclaimed__")
+    if (!info)
       return {
         sessionID,
         status: "skipped",
@@ -383,7 +409,11 @@ export namespace SnapshotMaintenance {
       await SnapshotGit.checked(source, ["fsck", "--full"], { signal })
       const roots = await historicalRoots(scopeID, sessionID)
       await catalog.verifyTrees(source, roots, signal)
-      const imported = await catalog.import(source, { signal, keepToken: `synergy-migration-${sessionID}` })
+      const imported = await catalog.import(source, {
+        signal,
+        requiredTrees: roots,
+        keepToken: `synergy-migration-${sessionID}`,
+      })
       journal = {
         ...journal,
         phase: "imported",
@@ -394,28 +424,35 @@ export namespace SnapshotMaintenance {
       await catalog.verifyTrees(target, trees, signal)
       journal.phase = "verified"
       await SnapshotStore.write(key, journal)
-      journal.preserved = await catalog.protect(sessionID, trees, signal, { packReferences: true })
-      journal.phase = "protected"
-      await SnapshotStore.write(key, journal)
-      await SnapshotStore.write(StoragePath.snapshotOwner(scopeID, sessionID), {
-        version: 2,
-        backend: "shared",
-      } satisfies SnapshotStore.Owner)
-      journal.phase = "switched"
-      await SnapshotStore.write(key, journal)
+      journal.preserved = await catalog.protect(sessionID, trees, signal, {
+        packReferences: true,
+        deferPublication: true,
+      })
     }
-    if (journal.phase === "switched") {
-      for (const hash of await historicalRoots(scopeID, sessionID)) {
-        if (!(await SnapshotStore.owns(scopeID, sessionID, hash)))
-          throw new SnapshotStore.StorageError("Cannot clean legacy snapshot with an unprotected history root")
+    return async () => {
+      signal?.throwIfAborted()
+      if (journal.phase !== "switched" && journal.phase !== "cleaned") {
+        journal.phase = "protected"
+        await SnapshotStore.write(key, journal)
+        await SnapshotStore.write(StoragePath.snapshotOwner(scopeID, sessionID), {
+          version: 2,
+          backend: "shared",
+        } satisfies SnapshotStore.Owner)
+        journal.phase = "switched"
+        await SnapshotStore.write(key, journal)
       }
-      await SnapshotTransfer.releaseKeeps(target, `synergy-migration-${sessionID}`)
-      await fs.rm(source, { recursive: true, force: true })
-      await fs.rm(SnapshotStore.cache(scopeID, sessionID), { recursive: true, force: true })
-      journal.phase = "cleaned"
-      await SnapshotStore.write(key, journal)
+      if (journal.phase === "switched") {
+        if ((await SnapshotStore.owner(scopeID, sessionID))?.backend !== "shared")
+          throw new SnapshotStore.StorageError("Cannot clean legacy snapshot without shared ownership")
+        await catalog.verifyRetention(sessionID, await historicalRoots(scopeID, sessionID), signal)
+        await SnapshotTransfer.releaseKeeps(target, `synergy-migration-${sessionID}`)
+        await fs.rm(source, { recursive: true, force: true })
+        await fs.rm(SnapshotStore.cache(scopeID, sessionID), { recursive: true, force: true })
+        journal.phase = "cleaned"
+        await SnapshotStore.write(key, journal)
+      }
+      return { sessionID, status: "migrated", objectsAdded: journal.added }
     }
-    return { sessionID, status: "migrated", objectsAdded: journal.added }
   }
 
   export async function compact(
