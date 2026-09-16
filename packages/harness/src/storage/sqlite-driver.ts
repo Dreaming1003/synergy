@@ -11,6 +11,7 @@ import {
 } from "./errors"
 import { ServerProcessLock } from "../util/server-process-lock"
 import { StorageQueue } from "./queue"
+import { sqlParameterBytes } from "./sql-contract"
 import type {
   SqlConnection,
   SqlDriver,
@@ -117,12 +118,7 @@ export class SqliteDriver implements SqlDriver {
 
   private request(request: Omit<SqliteRequest, "id">): Promise<SqlRow[]> {
     if (this.closed) return Promise.reject(new StorageClosedError())
-    const bytes = (request.values ?? []).reduce<number>(
-      (total, value) =>
-        total +
-        (typeof value === "string" ? Buffer.byteLength(value) : value instanceof Uint8Array ? value.byteLength : 8),
-      0,
-    )
+    const bytes = sqlParameterBytes(request.values ?? [])
     if (this.queuedBytes + bytes > 32 * 1024 * 1024)
       return Promise.reject(new StorageBusyError("Authoritative storage byte queue is full"))
     const id = ++this.sequence

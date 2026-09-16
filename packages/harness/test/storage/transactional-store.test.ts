@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test"
 import fs from "node:fs/promises"
 import path from "node:path"
+import { randomBytes } from "node:crypto"
 import { TransactionalStore } from "../../src/storage/transactional-store"
 
 if (process.env.SYNERGY_REQUIRE_POSTGRES_TESTS === "1" && !process.env.SYNERGY_TEST_POSTGRES_URL)
@@ -103,6 +104,29 @@ for (const backend of ["sqlite", ...(process.env.SYNERGY_TEST_POSTGRES_URL ? ["p
         }),
       ).rejects.toThrow("transaction aborted")
     })
+
+    test("bulk writes split large encoded records and keep the checkpoint atomic", async () => {
+      const store = await open()
+      const payload = randomBytes(9 * 1024 * 1024).toString("base64")
+      const entries = Array.from({ length: 3 }, (_, index) => ({
+        key: ["large-batch", String(index)],
+        value: { payload, index },
+      }))
+      await store.transaction(async (tx) => {
+        await tx.writeMany(entries)
+        await tx.write(["large-checkpoint"], { cursor: 3 })
+      })
+      for (const entry of entries) expect(await store.read<typeof entry.value>(entry.key)).toEqual(entry.value)
+      await expect(
+        store.transaction(async (tx) => {
+          await tx.writeMany(entries.map((entry) => ({ ...entry, value: { ...entry.value, changed: true } })))
+          await tx.write(["large-checkpoint"], { cursor: 6 })
+          throw new Error("interrupt after large writes")
+        }),
+      ).rejects.toThrow("interrupt after large writes")
+      expect(await store.read<{ cursor: number }>(["large-checkpoint"])).toEqual({ cursor: 3 })
+      for (const entry of entries) expect(await store.read<typeof entry.value>(entry.key)).toEqual(entry.value)
+    }, 30_000)
 
     test("serializes concurrent read-modify-write and preserves unknown fields", async () => {
       const store = await open()

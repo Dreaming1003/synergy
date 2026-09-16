@@ -93,7 +93,9 @@ test("complete exports traverse the existing key index without repeated sorting"
     expect(actual).toEqual(expected)
     expect(plans.length).toBeGreaterThan(2)
     expect(plans.join("\n")).not.toContain("TEMP B-TREE")
-    expect(plans.every((plan) => /key_id>/.test(plan))).toBe(true)
+    expect(plans.filter((plan) => /SEARCH (r|storage_records) /.test(plan)).every((plan) => /key_id>/.test(plan))).toBe(
+      true,
+    )
   } finally {
     tx.finish()
   }

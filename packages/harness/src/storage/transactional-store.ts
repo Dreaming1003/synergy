@@ -13,6 +13,7 @@ import { StorageQueue } from "./queue"
 import { observeStorageProgress } from "./progress"
 import { SqliteDriver } from "./sqlite-driver"
 import { PostgresDriver } from "./postgres-driver"
+import { sqlParameterBytes } from "./sql-contract"
 import type { SqlConnection, SqlDriver, SqlRow, SqlValue, StoreOptions } from "./sql-contract"
 
 export type { StoreOptions } from "./sql-contract"
@@ -191,10 +192,35 @@ export class StoreTransaction {
       const id = keyID(key)
       if (unique.has(id)) throw new StorageIntegrityError("A bulk write must contain distinct logical keys")
       unique.add(id)
-      return { key, id, text: JSON.stringify(key), body: RecordCodec.encode(value), meta: metadata(key) }
+      const text = JSON.stringify(key)
+      const body = RecordCodec.encode(value)
+      const meta = metadata(key)
+      const bytes = sqlParameterBytes([
+        this.namespace,
+        id,
+        text,
+        body,
+        0n,
+        meta.kind,
+        meta.scope,
+        meta.session,
+        meta.message,
+        meta.order,
+        0,
+      ])
+      return { key, id, text, body, meta, bytes }
     })
-    for (let offset = 0; offset < prepared.length; offset += 64) {
-      const batch = prepared.slice(offset, offset + 64)
+    for (let offset = 0; offset < prepared.length; ) {
+      let end = offset,
+        bytes = 0
+      while (end < prepared.length && end - offset < 64) {
+        const size = prepared[end].bytes
+        if (end > offset && bytes + size > 8 * 1024 * 1024) break
+        bytes += size
+        end++
+      }
+      const batch = prepared.slice(offset, end)
+      offset = end
       const owners = new Map<string, string[]>()
       for (const { key } of batch)
         if (key[0] === "sessions" && key.length >= 4) {
@@ -398,17 +424,20 @@ export class StoreTransaction {
     let after = ""
     for (;;) {
       this.check()
-      const page = await this.connection.query<RecordRow & { key_id: string }>(
-        "SELECT key_id, key_text, body, revision FROM storage_records WHERE namespace = ? AND body IS NOT NULL AND key_id > ? ORDER BY key_id LIMIT 256",
+      const page = await this.connection.query<RecordRow & { key_id: string; node_key_text: string | null }>(
+        "SELECT r.key_id, r.key_text, r.body, r.revision, n.key_text AS node_key_text FROM storage_records r LEFT JOIN storage_nodes n ON n.namespace = r.namespace AND n.key_id = r.key_id WHERE r.namespace = ? AND r.body IS NOT NULL AND r.key_id > ? ORDER BY r.key_id LIMIT 256",
         [this.namespace, after],
       )
       if (!page.length) break
-      for (const row of page)
+      for (const row of page) {
+        if (row.node_key_text !== row.key_text || BigInt(row.revision) < 1n)
+          throw new StorageIntegrityError("Logical storage index integrity verification failed")
         yield {
           key: JSON.parse(row.key_text) as string[],
           value: RecordCodec.decode<T>(row.body!),
           revision: BigInt(row.revision),
         }
+      }
       after = page.at(-1)!.key_id
     }
   }
@@ -888,12 +917,6 @@ export class TransactionalStore {
               }
               if (batch.length) await verifyBatch()
               recordProgress(work)
-              const [invalid] = await connection.query(
-                "SELECT COUNT(*) AS count FROM storage_records r LEFT JOIN storage_nodes n ON r.namespace = n.namespace AND r.key_id = n.key_id WHERE r.namespace = ? AND r.body IS NOT NULL AND (n.key_id IS NULL OR n.key_text <> r.key_text OR r.revision < 1)",
-                [this.options.namespace],
-              )
-              if (Number(invalid.count))
-                throw new StorageIntegrityError("Logical storage index integrity verification failed")
               return { backend: this.driver.backend, namespace: this.options.namespace, records, kinds, issues }
             } finally {
               tx.finish()
