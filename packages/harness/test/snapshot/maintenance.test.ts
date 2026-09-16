@@ -293,6 +293,41 @@ test("migration retains its source when switched ownership is inconsistent", asy
   })
 })
 
+test("migration retains a historical tree already recovered into the shared store", async () => {
+  await using tmp = await tmpdir({ git: true })
+  const scope = await tmp.scope()
+  await ScopeContext.provide({
+    scope,
+    fn: async () => {
+      const first = await Session.create({ scope })
+      const second = await Session.create({ scope })
+      const source = SnapshotStore.legacyRepository(scope.id, first.id)
+      await SnapshotStore.initializeBareRepository(source)
+      await SnapshotStore.initializeBareRepository(SnapshotStore.legacyRepository(scope.id, second.id))
+      await Bun.write(path.join(tmp.path, "history.txt"), "shared recovery")
+      await SnapshotStore.command(source, ["-C", tmp.path, "--work-tree", tmp.path, "add", "history.txt"])
+      const tree = await SnapshotStore.command(source, ["write-tree"])
+      await Storage.write(
+        StoragePath.messagePart(
+          Identifier.asScopeID(scope.id),
+          Identifier.asSessionID(second.id),
+          Identifier.asMessageID("recovered-message"),
+          Identifier.asPartID("recovered-part"),
+        ),
+        { type: "step-start", snapshot: tree },
+      )
+      await SnapshotMaintenance.registerLegacy(undefined, scope.id)
+      await SnapshotMaintenance.migrate(scope.id, { apply: true, sessionID: first.id })
+      const result = await SnapshotMaintenance.migrate(scope.id, { apply: true, sessionID: second.id })
+      expect(result.results[0].status).toBe("migrated")
+      expect(await SnapshotStore.owns(scope.id, second.id, tree)).toBe(true)
+      expect(await SnapshotStore.command(SnapshotStore.repository(scope.id), ["show", `${tree}:history.txt`])).toBe(
+        "shared recovery",
+      )
+    },
+  })
+})
+
 test("migration materializes alternates once and preserves unknown blobs", async () => {
   await using tmp = await tmpdir({ git: true })
   const scope = await tmp.scope()
