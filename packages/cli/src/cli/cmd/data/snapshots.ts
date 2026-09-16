@@ -83,7 +83,7 @@ export async function executeSnapshots(input: Input) {
             )
           },
         })
-        ok &&= !result.results.some((entry) => entry.status === "failed")
+        ok &&= !result.results.some((entry) => entry.status === "failed") && result.pool?.status !== "blocked"
         results.push(result)
       } else results.push(await SnapshotMaintenance.compact(scopeID, { apply: input.apply, prune: input.prune }))
     }

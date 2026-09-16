@@ -12,6 +12,7 @@ import { SnapshotTransfer } from "./snapshot-transfer"
 import { StorageBootstrap } from "../storage/bootstrap"
 import { SnapshotPack } from "./snapshot-pack"
 import { SnapshotRecords } from "./snapshot-records"
+import { SnapshotPool } from "./snapshot-pool"
 
 export namespace SnapshotMaintenance {
   const Journal = z.object({
@@ -31,6 +32,11 @@ export namespace SnapshotMaintenance {
     status: "pending" | "migrated" | "skipped" | "failed"
     reason?: string
     objectsAdded?: number
+  }
+  export interface PoolMigrationResult {
+    status: "pending" | "consolidated" | "blocked"
+    objectsAdded?: number
+    removedBytes?: number
   }
 
   const { entries, historicalRoots } = SnapshotRecords
@@ -324,15 +330,18 @@ export namespace SnapshotMaintenance {
           if (owner?.backend === "legacy" || (journal && Journal.parse(journal).phase !== "cleaned"))
             pending.push(sessionID)
         }
-        if (!options.apply || pending.length === 0) {
+        const repo = SnapshotStore.repository(scopeID)
+        const legacyPool = SnapshotPool.repository(Storage.current().artifactDirectory, scopeID)
+        const pool = !options.sessionID && (await SnapshotPool.pending(legacyPool, repo)) ? legacyPool : undefined
+        if (!options.apply || (pending.length === 0 && !pool)) {
           return {
             scopeID,
             applied: false,
             results: pending.map((sessionID): MigrationResult => ({ sessionID, status: "pending" })),
+            pool: pool ? { status: "pending" as const } : undefined,
           }
         }
         await SnapshotStore.initializeRepository(scopeID)
-        const repo = SnapshotStore.repository(scopeID)
         await SnapshotGit.checked(repo, ["fsck", "--full"], options)
         await using catalog = await SnapshotTransfer.Catalog.create(repo, options.signal)
         const failed = (sessionID: string, error: unknown): MigrationResult => {
@@ -375,8 +384,14 @@ export namespace SnapshotMaintenance {
             options.progress?.(results.length, results.at(-1)!)
           }
         }
+        let poolResult: PoolMigrationResult | undefined
+        if (pool) {
+          poolResult = results.every((result) => result.status === "migrated")
+            ? { status: "consolidated", ...(await SnapshotPool.consolidate(pool, catalog, options.signal)) }
+            : { status: "blocked" }
+        }
         await SnapshotGit.checked(repo, ["fsck", "--full"], options)
-        return { scopeID, applied: true, results }
+        return { scopeID, applied: true, results, pool: poolResult }
       },
       { signal: options.signal },
     )
