@@ -14,6 +14,8 @@ Legacy backup format 2 groups at most 1,024 files or approximately 4 MiB of logi
 
 Binary evidence has no new 32 MiB product limit: historical writers accepted larger objects. Only compressed blocks carry that bound; larger writes and legacy blobs use raw blocks with safe byte offsets and streaming verification. A single raw object may exceed the 64 MiB pack rotation target. Quarantining otherwise valid large evidence would silently reduce the available history, so both JSON-authority and existing-SQL upgrades preserve and independently restore these objects.
 
+The record codec follows the same compatibility rule: the 128 MiB bound limits compressed expansion, while larger JSON bodies keep their plain representation and remain subject to existing engine admission limits. Adding compression must not reject an otherwise accepted plain record.
+
 The capacity budget includes backup content and metadata, SQL overhead, journals, owner migrations and recovery reserve without crediting future deletion. Phase checks stop before consuming the reserve. The SQL per-record allowances are estimates to calibrate against actual data, not guaranteed upper bounds. Measurements distinguish logical bytes, allocated blocks and unique file identities. Restoration verifies into a new staged Home and publishes only after the final inventory validates.
 
 ## Alternatives considered

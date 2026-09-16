@@ -8,7 +8,7 @@ SQLite is the default backend. PostgreSQL is an explicit deployment choice using
 
 ## Records and transactions
 
-Namespace format 2 stores record bodies as plain JSON or `z:`-prefixed base64 deflate. Bodies below 512 bytes stay plain; larger bodies compress only when the encoded result saves at least 10%. Decoding is bounded to 128 MiB. Opening a format 1 namespace for writing advances its writer fence; existing plain JSON remains valid. Older writers reject format 2. Bulk record writes preserve revisions, Session tombstone checks and atomic checkpoints without adding per-file import ledger rows.
+Namespace format 2 stores record bodies as plain JSON or `z:`-prefixed base64 deflate. Bodies below 512 bytes stay plain; larger bodies compress only when the encoded result saves at least 10%. Compressed expansion is bounded to 128 MiB; larger bodies remain plain JSON, preserving prior codec compatibility subject to the engine's existing admission limits. Opening a format 1 namespace for writing advances its writer fence; existing plain JSON remains valid. Older writers reject format 2. Bulk record writes preserve revisions, Session tombstone checks and atomic checkpoints without adding per-file import ledger rows.
 
 The SQL schema stores independently addressable records with keys, revisions and indexed kind, Scope, Session, Message and ordering columns. Session metadata, message info and individual parts remain separate records. Relational identity checks and domain schemas complement the generic storage contract. Unknown fields owned by unloaded packages survive persistence, upgrades and portable exports.
 

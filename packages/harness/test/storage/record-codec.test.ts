@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { deflateSync } from "node:zlib"
 import { RecordCodec } from "../../src/storage/record-codec"
 
 test("stores small values plainly and compresses repetitive records without changing JSON semantics", () => {
@@ -18,4 +19,13 @@ test("corrupt compressed records fail with an integrity error", () => {
   expect(() => RecordCodec.decode(encoded.slice(0, -4))).toThrow()
   expect(() => RecordCodec.decode("z:!!!!")).toThrow()
   expect(() => RecordCodec.encode(undefined)).toThrow()
+})
+
+test("large records retain plain JSON compatibility while compressed expansion stays bounded", () => {
+  const value = { text: "x".repeat(128 * 1024 * 1024) }
+  const encoded = RecordCodec.encode(value)
+  expect(encoded.startsWith("{")).toBe(true)
+  expect(RecordCodec.decode<typeof value>(encoded).text).toBe(value.text)
+  const compressed = "z:" + deflateSync(encoded, { level: 1 }).toString("base64")
+  expect(() => RecordCodec.decode(compressed)).toThrow("Stored record encoding is invalid")
 })

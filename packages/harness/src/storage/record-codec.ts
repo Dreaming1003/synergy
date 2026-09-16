@@ -6,8 +6,7 @@ export namespace RecordCodec {
     const json = JSON.stringify(value)
     if (json === undefined) throw new StorageIntegrityError("A storage record must be JSON serializable")
     const bytes = Buffer.byteLength(json)
-    if (bytes > 128 * 1024 * 1024) throw new StorageIntegrityError("A storage record exceeds the decoded byte limit")
-    if (bytes < 512) return json
+    if (bytes < 512 || bytes > 128 * 1024 * 1024) return json
     const compressed = "z:" + deflateSync(json, { level: 1 }).toString("base64")
     return compressed.length < bytes * 0.9 ? compressed : json
   }
