@@ -56,6 +56,44 @@ for (const backend of ["sqlite", ...(process.env.SYNERGY_TEST_POSTGRES_URL ? ["p
       expect(await store.read<Record<string, unknown>>(["session_index", "session"])).toEqual({ scopeID: "scope" })
     })
 
+    test("bulk writes preserve revisions, tree identity, tombstones and rollback checkpoints", async () => {
+      const store = await open()
+      const owner = ["sessions", "scope", "bulk", "info"]
+      const first = ["sessions", "scope", "bulk", "rollout", "journal", "events", "0001"]
+      await store.transaction(async (tx) => {
+        await tx.writeMany([
+          { key: owner, value: { id: "bulk" } },
+          { key: first, value: { event: 1 } },
+          { key: ["notes", "a/b"], value: 1 },
+          { key: ["notes", "a", "b"], value: 2 },
+        ])
+      })
+      expect(await store.scan(["notes"])).toEqual(["a", "a/b"])
+      await store.transaction(async (tx) => {
+        await tx.writeMany([{ key: first, value: { event: 2 } }])
+        expect((await tx.versioned(first)).revision).toBe(2n)
+      })
+      await expect(
+        store.transaction(async (tx) => {
+          await tx.writeMany([{ key: first, value: { event: 3 } }])
+          await tx.write(["storage_import", "cursor"], { offset: 3 })
+          throw new Error("interrupted batch")
+        }),
+      ).rejects.toThrow("interrupted batch")
+      expect(await store.read<{ event: number }>(first)).toEqual({ event: 2 })
+      expect(await store.readMany([["storage_import", "cursor"]])).toEqual([undefined])
+      await store.remove(owner)
+      await expect(
+        store.transaction((tx) =>
+          tx.writeMany([
+            ...Array.from({ length: 130 }, (_, index) => ({ key: ["rollback-batch", String(index)], value: true })),
+            { key: first, value: { event: 4 } },
+          ]),
+        ),
+      ).rejects.toMatchObject({ name: "StorageConflictError" })
+      expect(await store.scan(["rollback-batch"])).toEqual([])
+    })
+
     test("propagates asynchronous transaction rejection", async () => {
       const store = await open()
       await expect(

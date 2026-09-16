@@ -12,6 +12,7 @@ export namespace StorageRecovery {
   }
   export async function recoverOwners() {
     sealed = true
+    await Storage.collectArtifactGarbage({ scanOrphans: true })
     for (const recover of owners.values()) await recover()
   }
 

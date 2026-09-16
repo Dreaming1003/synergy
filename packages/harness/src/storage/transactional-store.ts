@@ -7,6 +7,8 @@ import {
   StorageIntegrityError,
   StorageOwnershipError,
 } from "./errors"
+import { ArtifactLocation } from "./artifact-location"
+import { RecordCodec } from "./record-codec"
 import { StorageQueue } from "./queue"
 import { observeStorageProgress } from "./progress"
 import { SqliteDriver } from "./sqlite-driver"
@@ -82,6 +84,10 @@ function metadata(key: string[]) {
 }
 
 const schema = [
+  "CREATE TABLE IF NOT EXISTS storage_artifact_gc (namespace TEXT NOT NULL, pack TEXT NOT NULL, PRIMARY KEY(namespace, pack))",
+  "CREATE TABLE IF NOT EXISTS storage_artifacts (namespace TEXT NOT NULL, key_text TEXT NOT NULL, owner_key TEXT NOT NULL, location TEXT NOT NULL, pack TEXT NOT NULL, PRIMARY KEY(namespace, key_text))",
+  "CREATE INDEX IF NOT EXISTS storage_artifacts_owner ON storage_artifacts(namespace, owner_key)",
+  "CREATE INDEX IF NOT EXISTS storage_artifacts_pack ON storage_artifacts(namespace, pack)",
   "CREATE TABLE IF NOT EXISTS storage_namespaces (namespace TEXT PRIMARY KEY, version INTEGER NOT NULL, owner TEXT NOT NULL, state TEXT NOT NULL, next_event BIGINT NOT NULL DEFAULT 0)",
   "CREATE TABLE IF NOT EXISTS storage_nodes (namespace TEXT NOT NULL, key_id TEXT NOT NULL, parent_id TEXT NOT NULL, key_text TEXT NOT NULL, segment TEXT NOT NULL, PRIMARY KEY(namespace, key_id))",
   "CREATE INDEX IF NOT EXISTS storage_nodes_parent ON storage_nodes(namespace, parent_id)",
@@ -144,7 +150,7 @@ export class StoreTransaction {
   async versioned<T = unknown>(key: string[]): Promise<StoredRecord<T>> {
     const row = await this.row(key)
     if (!row || row.body === null) throw new NotFoundError({ message: "Storage record does not exist" })
-    return { key, value: JSON.parse(row.body) as T, revision: BigInt(row.revision) }
+    return { key, value: RecordCodec.decode<T>(row.body), revision: BigInt(row.revision) }
   }
 
   async read<T = unknown>(key: string[]): Promise<T> {
@@ -165,7 +171,7 @@ export class StoreTransaction {
         const row = index.get(keyID(key))
         if (row && row.key_text !== JSON.stringify(key))
           throw new StorageIntegrityError("Logical key identity collision")
-        result.push(row?.body ? (JSON.parse(row.body) as T) : undefined)
+        result.push(row?.body ? RecordCodec.decode<T>(row.body) : undefined)
       }
     }
     return result
@@ -175,6 +181,75 @@ export class StoreTransaction {
     this.check(true)
     if (key[0] === "sessions" && key.length >= 4) await this.assertNotDeleted([...key.slice(0, 3), "info"])
     await this.put(key, value, options)
+  }
+
+  async writeMany(entries: Array<{ key: string[]; value: unknown }>): Promise<void> {
+    this.check(true)
+    const unique = new Set<string>()
+    const prepared = entries.map(({ key, value }) => {
+      if (!key.length) throw new StorageIntegrityError("Cannot write the storage root")
+      const id = keyID(key)
+      if (unique.has(id)) throw new StorageIntegrityError("A bulk write must contain distinct logical keys")
+      unique.add(id)
+      return { key, id, text: JSON.stringify(key), body: RecordCodec.encode(value), meta: metadata(key) }
+    })
+    for (let offset = 0; offset < prepared.length; offset += 64) {
+      const batch = prepared.slice(offset, offset + 64)
+      const owners = new Map<string, string[]>()
+      for (const { key } of batch)
+        if (key[0] === "sessions" && key.length >= 4) {
+          const owner = [...key.slice(0, 3), "info"]
+          owners.set(keyID(owner), owner)
+        }
+      const identities = [...new Set([...batch.map((entry) => entry.id), ...owners.keys()])]
+      const rows = await this.connection.query<RecordRow & { key_id: string }>(
+        `SELECT key_id, key_text, body, revision FROM storage_records WHERE namespace = ? AND key_id IN (${identities.map(() => "?").join(",")})`,
+        [this.namespace, ...identities],
+      )
+      const previous = new Map(rows.map((row) => [row.key_id, row]))
+      for (const [id, key] of owners) {
+        const row = previous.get(id)
+        if (row && row.key_text !== JSON.stringify(key))
+          throw new StorageIntegrityError("Logical key identity collision")
+        if (row?.body === null) throw new StorageConflictError("A deleted record cannot be revived by a delayed writer")
+      }
+      const nodes = new Map<string, SqlValue[]>()
+      const values: SqlValue[] = []
+      for (const entry of batch) {
+        const before = previous.get(entry.id)
+        if (before && before.key_text !== entry.text) throw new StorageIntegrityError("Logical key identity collision")
+        for (let depth = 1; depth <= entry.key.length; depth++) {
+          const prefix = entry.key.slice(0, depth)
+          const id = keyID(prefix)
+          nodes.set(id, [this.namespace, id, keyID(prefix.slice(0, -1)), JSON.stringify(prefix), prefix.at(-1)!])
+        }
+        values.push(
+          this.namespace,
+          entry.id,
+          entry.text,
+          entry.body,
+          BigInt(before?.revision ?? 0) + 1n,
+          entry.meta.kind,
+          entry.meta.scope,
+          entry.meta.session,
+          entry.meta.message,
+          entry.meta.order,
+          Date.now(),
+        )
+      }
+      const paths = [...nodes.values()]
+      for (let index = 0; index < paths.length; index += 128) {
+        const group = paths.slice(index, index + 128)
+        await this.connection.query(
+          `INSERT INTO storage_nodes(namespace, key_id, parent_id, key_text, segment) VALUES ${group.map(() => "(?, ?, ?, ?, ?)").join(",")} ON CONFLICT(namespace, key_id) DO NOTHING`,
+          group.flat(),
+        )
+      }
+      await this.connection.query(
+        `INSERT INTO storage_records(namespace, key_id, key_text, body, revision, kind, scope_id, session_id, message_id, order_key, updated) VALUES ${batch.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(",")} ON CONFLICT(namespace, key_id) DO UPDATE SET body = excluded.body, revision = excluded.revision, kind = excluded.kind, scope_id = excluded.scope_id, session_id = excluded.session_id, message_id = excluded.message_id, order_key = excluded.order_key, updated = excluded.updated`,
+        values,
+      )
+    }
   }
 
   private async put<T>(key: string[], value: T, options: { expectedRevision?: bigint } = {}): Promise<void> {
@@ -200,7 +275,7 @@ export class StoreTransaction {
         this.namespace,
         keyID(key),
         JSON.stringify(key),
-        encode(value),
+        RecordCodec.encode(value),
         revision + 1n,
         meta.kind,
         meta.scope,
@@ -250,6 +325,24 @@ export class StoreTransaction {
 
   async removeTree(prefix: string[]): Promise<void> {
     this.check(true)
+    let artifactCondition = "namespace = ?"
+    const artifactValues: SqlValue[] = [this.namespace]
+    if (prefix.length) {
+      const text = JSON.stringify(prefix)
+      const like = (text.slice(0, -1) + ",").replace(/[!%_]/g, (value) => "!" + value) + "%"
+      artifactCondition += " AND (key_text = ? OR key_text LIKE ? ESCAPE '!')"
+      artifactValues.push(text, like)
+      const ownerLength = ["sessions", "operations"].includes(prefix[0]) ? 3 : 1
+      if (prefix.length >= ownerLength) {
+        artifactCondition += " AND owner_key = ?"
+        artifactValues.push(JSON.stringify(prefix.slice(0, ownerLength)))
+      }
+    }
+    await this.connection.query(
+      `INSERT INTO storage_artifact_gc(namespace, pack) SELECT DISTINCT namespace, pack FROM storage_artifacts WHERE ${artifactCondition} ON CONFLICT(namespace, pack) DO NOTHING`,
+      artifactValues,
+    )
+    await this.connection.query(`DELETE FROM storage_artifacts WHERE ${artifactCondition}`, artifactValues)
     if (!prefix.length) {
       await this.connection.query(
         "UPDATE storage_records SET body = NULL, revision = revision + 1, updated = ? WHERE namespace = ? AND body IS NOT NULL",
@@ -296,7 +389,7 @@ export class StoreTransaction {
     )
     return rows.map((row) => ({
       key: JSON.parse(row.key_text) as string[],
-      value: JSON.parse(row.body!) as T,
+      value: RecordCodec.decode<T>(row.body!),
       revision: BigInt(row.revision),
     }))
   }
@@ -313,7 +406,7 @@ export class StoreTransaction {
       for (const row of page)
         yield {
           key: JSON.parse(row.key_text) as string[],
-          value: JSON.parse(row.body!) as T,
+          value: RecordCodec.decode<T>(row.body!),
           revision: BigInt(row.revision),
         }
       after = page.at(-1)!.key_id
@@ -323,6 +416,7 @@ export class StoreTransaction {
   async *exportEntries(): AsyncGenerator<StorageEntry> {
     for await (const record of this.records())
       yield { type: "record", key: record.key, value: record.value, revision: record.revision.toString() }
+    for await (const artifact of this.artifacts()) yield { type: "artifact", ...artifact }
     let operationID = ""
     for (;;) {
       const page = await this.connection.query(
@@ -359,6 +453,98 @@ export class StoreTransaction {
     }
   }
 
+  async artifact(key: string[]): Promise<ArtifactLocation> {
+    this.check()
+    keyID(key)
+    const [row] = await this.connection.query(
+      "SELECT location FROM storage_artifacts WHERE namespace = ? AND key_text = ?",
+      [this.namespace, JSON.stringify(key)],
+    )
+    if (!row) throw new NotFoundError({ message: "Artifact does not exist" })
+    return ArtifactLocation.parse(JSON.parse(String(row.location)))
+  }
+
+  async writeArtifacts(entries: Array<{ key: string[]; location: ArtifactLocation }>) {
+    this.check(true)
+    for (let start = 0; start < entries.length; start += 128) {
+      const batch = entries.slice(start, start + 128)
+      const owners = new Map<string, string[]>()
+      for (const { key, location } of batch) {
+        keyID(key)
+        ArtifactLocation.parse(location)
+        if (key[0] === "sessions" && key.length >= 4) {
+          const owner = [...key.slice(0, 3), "info"]
+          owners.set(JSON.stringify(owner), owner)
+        }
+      }
+      for (const owner of owners.values()) await this.assertNotDeleted(owner)
+      await this.connection.query(
+        `INSERT INTO storage_artifact_gc(namespace, pack) SELECT DISTINCT namespace, pack FROM storage_artifacts WHERE namespace = ? AND key_text IN (${batch.map(() => "?").join(",")}) ON CONFLICT(namespace, pack) DO NOTHING`,
+        [this.namespace, ...batch.map(({ key }) => JSON.stringify(key))],
+      )
+      await this.connection.query(
+        `INSERT INTO storage_artifacts(namespace, key_text, owner_key, location, pack) VALUES ${batch.map(() => "(?, ?, ?, ?, ?)").join(",")} ON CONFLICT(namespace, key_text) DO UPDATE SET location = excluded.location, pack = excluded.pack`,
+        batch.flatMap(({ key, location }) => [
+          this.namespace,
+          JSON.stringify(key),
+          JSON.stringify(key.slice(0, ["sessions", "operations"].includes(key[0]) ? 3 : 1)),
+          JSON.stringify(location),
+          location.pack,
+        ]),
+      )
+    }
+  }
+
+  async *artifactPacks(): AsyncGenerator<string> {
+    this.check()
+    let after = ""
+    for (;;) {
+      const rows = await this.connection.query(
+        "SELECT DISTINCT pack FROM storage_artifacts WHERE namespace = ? AND pack > ? ORDER BY pack LIMIT 256",
+        [this.namespace, after],
+      )
+      if (!rows.length) return
+      for (const row of rows) yield String(row.pack)
+      after = String(rows.at(-1)!.pack)
+    }
+  }
+
+  async artifactGarbage() {
+    this.check()
+    const rows = await this.connection.query(
+      "SELECT g.pack, CASE WHEN EXISTS (SELECT 1 FROM storage_artifacts a WHERE a.namespace = g.namespace AND a.pack = g.pack) THEN 1 ELSE 0 END AS used FROM storage_artifact_gc g WHERE g.namespace = ? ORDER BY g.pack LIMIT 256",
+      [this.namespace],
+    )
+    return rows.map((row) => ({ pack: String(row.pack), used: Boolean(Number(row.used)) }))
+  }
+
+  async acknowledgeArtifactGarbage(packs: string[]) {
+    this.check(true)
+    if (!packs.length) return
+    await this.connection.query(
+      `DELETE FROM storage_artifact_gc WHERE namespace = ? AND pack IN (${packs.map(() => "?").join(",")})`,
+      [this.namespace, ...packs],
+    )
+  }
+
+  async *artifacts(): AsyncGenerator<{ key: string[]; location: ArtifactLocation }> {
+    this.check()
+    let after = ""
+    for (;;) {
+      const rows = await this.connection.query(
+        "SELECT key_text, location FROM storage_artifacts WHERE namespace = ? AND key_text > ? ORDER BY key_text LIMIT 256",
+        [this.namespace, after],
+      )
+      if (!rows.length) return
+      for (const row of rows)
+        yield {
+          key: JSON.parse(String(row.key_text)) as string[],
+          location: ArtifactLocation.parse(JSON.parse(String(row.location))),
+        }
+      after = String(rows.at(-1)!.key_text)
+    }
+  }
+
   async assertNotDeleted(key: string[]) {
     this.check()
     const [record] = await this.connection.query(
@@ -371,6 +557,15 @@ export class StoreTransaction {
 
   async restoreEntry(entry: StorageEntry) {
     this.check(true)
+    if (entry.type === "artifact") {
+      const [existing] = await this.connection.query(
+        "SELECT location FROM storage_artifacts WHERE namespace = ? AND key_text = ?",
+        [this.namespace, JSON.stringify(entry.key)],
+      )
+      if (existing) throw new StorageConflictError("Portable artifact conflicts with existing target data")
+      await this.writeArtifacts([{ key: entry.key, location: entry.location }])
+      return
+    }
     if (entry.type === "record") {
       if (BigInt(entry.revision) > 9223372036854775807n) throw new StorageIntegrityError("Unsupported record revision")
       if ((await this.readMany([entry.key]))[0] !== undefined)
@@ -440,9 +635,13 @@ export class TransactionalStore {
             [options.namespace],
           )
           if (options.mustExist && !existing) throw new StorageIntegrityError("The active storage namespace is missing")
-          if (existing && Number(existing.version) !== 1)
+          if (existing && ![1, 2].includes(Number(existing.version)))
             throw new StorageIntegrityError("Unsupported authoritative storage version")
           if (options.readonly) {
+            if (existing && Number(existing.version) === 1)
+              throw new StorageIntegrityError(
+                "Storage format upgrade required; run data storage resume before inspection",
+              )
             if (!existing) throw new StorageIntegrityError("Storage namespace does not exist")
             return
           }
@@ -451,7 +650,7 @@ export class TransactionalStore {
               "The previous PostgreSQL Runtime did not release ownership; verify it has stopped before recovering",
             )
           await connection.query(
-            "INSERT INTO storage_namespaces(namespace, version, owner, state) VALUES (?, 1, ?, 'active') ON CONFLICT(namespace) DO UPDATE SET owner = excluded.owner, state = excluded.state",
+            "INSERT INTO storage_namespaces(namespace, version, owner, state) VALUES (?, 2, ?, 'active') ON CONFLICT(namespace) DO UPDATE SET version = excluded.version, owner = excluded.owner, state = excluded.state",
             [options.namespace, store.owner],
           )
         },
@@ -632,53 +831,77 @@ export class TransactionalStore {
     this.check()
     progress?.(0)
     let work = 0
-    return observeStorageProgress((recordProgress) => this.driver.transaction(
-      async (connection) => {
-        if (this.driver.backend === "sqlite") {
-          const rows = await connection.query("PRAGMA integrity_check", [], { maintenance: true })
-          if (rows.length !== 1 || rows[0].integrity_check !== "ok")
-            throw new StorageIntegrityError("SQLite integrity verification failed")
-        }
-        const tx = new StoreTransaction(connection, this.options.namespace, true)
-        const issues: Array<{ key: string[]; reason: string }> = []
-        const kinds: Record<string, number> = {}
-        let records = 0
-        try {
-          for await (const record of tx.records<Record<string, unknown>>()) {
-            records++
-            if (++work % 256 === 0) recordProgress(work)
-            const meta = metadata(record.key)
-            kinds[meta.kind] = (kinds[meta.kind] ?? 0) + 1
-            const key = record.key
-            if (key[0] !== "sessions") continue
-            const parents: string[][] = []
-            if (key[3] !== "info") parents.push([...key.slice(0, 3), "info"])
-            if (meta.kind === "part") parents.push([...key.slice(0, 5), "info"])
-            const values = await tx.readMany(parents)
-            for (const [index, parent] of values.entries()) {
-              if (parent === undefined)
-                issues.push({ key, reason: index === 0 ? "missing_session" : "missing_message" })
+    return observeStorageProgress(
+      (recordProgress) =>
+        this.driver.transaction(
+          async (connection) => {
+            if (this.driver.backend === "sqlite") {
+              const rows = await connection.query("PRAGMA integrity_check", [], { maintenance: true })
+              if (rows.length !== 1 || rows[0].integrity_check !== "ok")
+                throw new StorageIntegrityError("SQLite integrity verification failed")
             }
-            if (["session", "message", "part"].includes(meta.kind)) {
-              const expectedID = meta.kind === "part" ? key.at(-1) : key.at(-2)
-              if (!record.value || typeof record.value !== "object" || record.value.id !== expectedID)
-                issues.push({ key, reason: "identity_mismatch" })
+            const tx = new StoreTransaction(connection, this.options.namespace, true)
+            const issues: Array<{ key: string[]; reason: string }> = []
+            const kinds: Record<string, number> = {}
+            let records = 0
+            try {
+              let batch: StoredRecord<Record<string, unknown>>[] = []
+              const verifyBatch = async () => {
+                const parents = new Map<string, string[]>()
+                for (const { key } of batch) {
+                  if (key[0] !== "sessions") continue
+                  if (key[3] !== "info") {
+                    const owner = [...key.slice(0, 3), "info"]
+                    parents.set(JSON.stringify(owner), owner)
+                  }
+                  if (metadata(key).kind === "part") {
+                    const message = [...key.slice(0, 5), "info"]
+                    parents.set(JSON.stringify(message), message)
+                  }
+                }
+                const keys = [...parents.keys()]
+                const values = await tx.readMany([...parents.values()])
+                const present = new Set(keys.filter((_, index) => values[index] !== undefined))
+                for (const record of batch) {
+                  records++
+                  const meta = metadata(record.key)
+                  kinds[meta.kind] = (kinds[meta.kind] ?? 0) + 1
+                  const key = record.key
+                  if (key[0] !== "sessions") continue
+                  if (key[3] !== "info" && !present.has(JSON.stringify([...key.slice(0, 3), "info"])))
+                    issues.push({ key, reason: "missing_session" })
+                  if (meta.kind === "part" && !present.has(JSON.stringify([...key.slice(0, 5), "info"])))
+                    issues.push({ key, reason: "missing_message" })
+                  if (["session", "message", "part"].includes(meta.kind)) {
+                    const expectedID = meta.kind === "part" ? key.at(-1) : key.at(-2)
+                    if (!record.value || typeof record.value !== "object" || record.value.id !== expectedID)
+                      issues.push({ key, reason: "identity_mismatch" })
+                  }
+                }
+                work += batch.length
+                recordProgress(work)
+                batch = []
+              }
+              for await (const record of tx.records<Record<string, unknown>>()) {
+                batch.push(record)
+                if (batch.length === 256) await verifyBatch()
+              }
+              if (batch.length) await verifyBatch()
+              recordProgress(work)
+              const [invalid] = await connection.query(
+                "SELECT COUNT(*) AS count FROM storage_records r LEFT JOIN storage_nodes n ON r.namespace = n.namespace AND r.key_id = n.key_id WHERE r.namespace = ? AND r.body IS NOT NULL AND (n.key_id IS NULL OR n.key_text <> r.key_text OR r.revision < 1)",
+                [this.options.namespace],
+              )
+              if (Number(invalid.count))
+                throw new StorageIntegrityError("Logical storage index integrity verification failed")
+              return { backend: this.driver.backend, namespace: this.options.namespace, records, kinds, issues }
+            } finally {
+              tx.finish()
             }
-          }
-          recordProgress(work)
-          const [invalid] = await connection.query(
-            "SELECT COUNT(*) AS count FROM storage_records r LEFT JOIN storage_nodes n ON r.namespace = n.namespace AND r.key_id = n.key_id WHERE r.namespace = ? AND r.body IS NOT NULL AND (n.key_id IS NULL OR n.key_text <> r.key_text OR r.revision < 1)",
-            [this.options.namespace],
-          )
-          if (Number(invalid.count))
-            throw new StorageIntegrityError("Logical storage index integrity verification failed")
-          return { backend: this.driver.backend, namespace: this.options.namespace, records, kinds, issues }
-        } finally {
-          tx.finish()
-        }
-      },
-      { readOnly: true },
-    ), progress
+          },
+          { readOnly: true },
+        ),
+      progress,
     )
   }
 

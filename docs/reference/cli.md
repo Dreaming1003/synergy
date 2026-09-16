@@ -688,7 +688,7 @@ stop plugin runtime
 
 ## storage
 
-inspect, verify, recover, and move authoritative Agent storage
+inspect, verify, recover, restore backups, and move authoritative Agent storage
 
 | Option | Description |
 | --- | --- |

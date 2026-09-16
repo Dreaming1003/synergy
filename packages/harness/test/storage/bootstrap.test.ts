@@ -19,6 +19,23 @@ test("restored portable records report hashing and import before activation", as
   const root = await home()
   try {
     await source.store.write(["notes", "scope", "archive"], { preserved: true })
+    await source.store.transaction((tx) =>
+      tx.writeArtifacts([
+        {
+          key: ["permissions", "untrusted"],
+          location: {
+            pack: "0".repeat(64) + ".pack",
+            blockOffset: 0,
+            blockBytes: 0,
+            decodedBytes: 0,
+            offset: 0,
+            size: 0,
+            codec: "raw",
+            sha256: "0".repeat(64),
+          },
+        },
+      ]),
+    )
     await StoragePortable.exportFile(source.store, path.join(root, "data", "agent-records.ndjson"))
   } finally {
     await source.store.close()
@@ -28,6 +45,7 @@ test("restored portable records report hashing and import before activation", as
   try {
     expect(stages).toContain("archive-verify")
     expect(stages).toContain("archive-import")
+    expect(await restored.store.snapshot(async (tx) => Array.fromAsync(tx.artifacts()))).toEqual([])
     expect(await restored.store.read<{ preserved: boolean }>(["notes", "scope", "archive"])).toEqual({
       preserved: true,
     })
@@ -199,5 +217,33 @@ test("resumes a target switch interrupted between configuration and manifest act
     expect(await resumed.store.read<{ value: number }>(["notes", "scope", "retained"])).toEqual({ value: 7 })
   } finally {
     await resumed.store.close()
+  }
+})
+
+test("activation verifies binary references before retiring legacy evidence", async () => {
+  const root = await home()
+  const key = ["sessions", "scope", "owner", "rollout", "blobs", "content"]
+  const owner = path.join(root, "data", "sessions", "scope", "owner", "info.json")
+  const binary = path.join(root, "data", ...key) + ".bin"
+  await fs.mkdir(path.dirname(binary), { recursive: true })
+  await Bun.write(
+    owner,
+    JSON.stringify({ id: "owner", title: "historical", scope: { id: "scope" }, time: { created: 1, updated: 2 } }),
+  )
+  await Bun.write(binary, "original bytes")
+  const prepared = await StorageBootstrap.prepare({ root })
+  try {
+    const location = await prepared.store.snapshot((tx) => tx.artifact(key))
+    await prepared.store.transaction((tx) =>
+      tx.writeArtifacts([{ key, location: { ...location, sha256: "0".repeat(64) } }]),
+    )
+    await expect(prepared.activate()).rejects.toThrow("integrity")
+    expect(await Bun.file(owner).exists()).toBe(true)
+    expect(await Bun.file(binary).text()).toBe("original bytes")
+    await prepared.store.transaction((tx) => tx.writeArtifacts([{ key, location }]))
+    await prepared.activate()
+    expect(await Bun.file(binary).exists()).toBe(false)
+  } finally {
+    await prepared.store.close()
   }
 })

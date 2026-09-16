@@ -2,100 +2,14 @@ import { createHash, randomUUID } from "node:crypto"
 import fs from "node:fs/promises"
 import { createReadStream } from "node:fs"
 import path from "node:path"
-import { z } from "zod"
+import { validateLegacyRecord } from "./legacy-record"
 import type { StorageStartupProgress } from "@ericsanchezok/synergy-util/runtime-startup"
 import { AtomicFile } from "./atomic-file"
 import { StorageIntegrityError } from "./errors"
 import { TransactionalStore } from "./transactional-store"
 
-const recordRoots = new Set([
-  "projects",
-  "sessions",
-  "operations",
-  "session_index",
-  "endpoint_session",
-  "sessions_page_index",
-  "session_child_index",
-  "session_nav_v2",
-  "session_search_v1",
-  "session_search_dirty_v1",
-  "session_message_order_v1",
-  "permissions",
-  "permission-rules",
-  "shares",
-  "meta",
-  "agenda",
-  "notes",
-  "blueprint_loops",
-  "superplan",
-  "lattice",
-  "holos",
-  "synergy_link",
-  "stats",
-  "snapshot-v2",
-  "plugin-approvals",
-  "plugin-audit",
-  "plugin-runtime-state",
-  "plugin-incompatible",
-  "registry",
-])
-
-export function legacyRecordKey(relative: string): string[] | undefined {
-  if (relative === "@home/plugin.lock") return ["plugin-lock"]
-  if (!relative.endsWith(".json")) return
-  const key = relative.slice(0, -5).split("/")
-  if (key.some((segment) => !segment || segment === "." || segment === ".."))
-    throw new StorageIntegrityError("Invalid legacy record path")
-  if (key[0] === "channel") {
-    if (key[1] === "workspaces") return
-    return key
-  }
-  if (key[0] === "browser" && /^sessions(?:-v\d+)?$/.test(key[1] ?? "")) return key
-  if (key[0] === "push" && key[1] === "subscriptions") return key
-  if (key[0] === "library" && key[1] === "stats") return key
-  if (key[0] === "snapshot-v2" && (key.includes(".locks") || key.includes("leases"))) return
-  return recordRoots.has(key[0]) ? key : undefined
-}
-
-function recordDirectory(segments: string[]) {
-  const [root, child] = segments
-  if (root === "channel") return child !== "workspaces"
-  if (root === "browser") return !child || /^sessions(?:-v\d+)?$/.test(child)
-  if (root === "push") return !child || child === "subscriptions"
-  if (root === "library") return !child || child === "stats"
-  if (root === "snapshot-v2" && (segments.includes(".locks") || segments.includes("leases"))) return false
-  return recordRoots.has(root)
-}
-
-export async function* legacyRecords(dataRoot: string, visit?: () => void): AsyncGenerator<string> {
-  async function* walk(segments: string[]): AsyncGenerator<string> {
-    const directory = await fs.opendir(path.join(dataRoot, ...segments))
-    for await (const entry of directory) {
-      if (entry.name === ".locks" || entry.name.startsWith(".tmp-") || entry.name.endsWith(".tmp")) continue
-      visit?.()
-      const child = [...segments, entry.name]
-      const relative = child.join("/")
-      if (entry.isDirectory()) {
-        if (recordDirectory(child)) yield* walk(child)
-      } else if (entry.isSymbolicLink()) {
-        if (recordRoots.has(child[0]) || legacyRecordKey(relative))
-          throw new StorageIntegrityError("Authoritative legacy records cannot be symbolic links")
-      } else if (entry.isFile()) {
-        if (legacyRecordKey(relative)) yield relative
-      } else if (recordDirectory(child) || legacyRecordKey(relative))
-        throw new StorageIntegrityError("Legacy storage contains an unsupported file type")
-    }
-  }
-  yield* walk([])
-  try {
-    const lock = await fs.lstat(path.join(dataRoot, "..", "plugin.lock"))
-    if (!lock.isFile() || lock.isSymbolicLink())
-      throw new StorageIntegrityError("Plugin installation metadata is not a regular file")
-    yield "@home/plugin.lock"
-  } catch (error) {
-    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error
-  }
-}
+import { legacyRecordKey, legacySources, sourcePath } from "./legacy-source"
+export { legacyRecordKey, legacyRecords, legacyFiles, legacySources } from "./legacy-source"
 
 export type ImportProgress = StorageStartupProgress
 
@@ -128,12 +42,6 @@ export interface ImportResult {
 
 const stateKey = ["storage_import", "info"]
 
-const legacySessionInfo = z.object({
-  scope: z.object({ id: z.string() }),
-  title: z.string(),
-  time: z.object({ created: z.number(), updated: z.number() }),
-})
-
 function entryKey(relative: string) {
   return ["storage_import_files", createHash("sha256").update(relative).digest("hex")]
 }
@@ -142,60 +50,6 @@ async function digest(filename: string) {
   const hash = createHash("sha256")
   for await (const chunk of createReadStream(filename)) hash.update(chunk)
   return hash.digest("hex")
-}
-
-export async function* legacyFiles(
-  root: string,
-  segments: string[] = [],
-): AsyncGenerator<{ relative: string; size: number; linkTarget?: string }> {
-  const directory = await fs.opendir(path.join(root, ...segments))
-  for await (const entry of directory) {
-    if (entry.name === ".locks" || entry.name.startsWith(".tmp-") || entry.name.endsWith(".tmp")) continue
-    if (segments.length === 0 && entry.name === "storage") continue
-    const child = [...segments, entry.name]
-    if (entry.isSymbolicLink()) {
-      const relative = child.join("/")
-      if (recordRoots.has(child[0]) || legacyRecordKey(relative))
-        throw new StorageIntegrityError("Authoritative legacy records cannot be symbolic links")
-      const linkTarget = await fs.readlink(path.join(root, ...child))
-      yield { relative, size: Buffer.byteLength(linkTarget), linkTarget }
-      continue
-    }
-    if (entry.isDirectory()) yield* legacyFiles(root, child)
-    else if (entry.isFile()) {
-      const stat = await fs.stat(path.join(root, ...child))
-      yield { relative: child.join("/"), size: stat.size }
-    } else throw new StorageIntegrityError("Legacy storage contains an unsupported file type")
-  }
-}
-
-export async function* legacySources(
-  dataRoot: string,
-): AsyncGenerator<{ relative: string; size: number; linkTarget?: string }> {
-  yield* legacyFiles(dataRoot)
-  const config = path.join(dataRoot, "..", "config")
-  try {
-    for await (const entry of legacyFiles(config)) yield { ...entry, relative: `@home/config/${entry.relative}` }
-  } catch (error) {
-    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error
-  }
-  const lock = path.join(dataRoot, "..", "plugin.lock")
-  try {
-    const stat = await fs.lstat(lock)
-    if (!stat.isFile() || stat.isSymbolicLink())
-      throw new StorageIntegrityError("Plugin installation metadata is not a regular file")
-    yield { relative: "@home/plugin.lock", size: stat.size }
-  } catch (error) {
-    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error
-  }
-}
-
-function sourcePath(dataRoot: string, relative: string) {
-  if (relative === "@home/plugin.lock") return path.join(dataRoot, "..", "plugin.lock")
-  const segments = relative.split("/")
-  if (segments.some((segment) => !segment || segment === "." || segment === ".." || segment.includes("\\")))
-    throw new StorageIntegrityError("Unsafe migration source identity")
-  return segments[0] === "@home" ? path.join(dataRoot, "..", ...segments.slice(1)) : path.join(dataRoot, ...segments)
 }
 
 async function backupFile(source: string, target: string, expectedHash: string) {
@@ -473,31 +327,7 @@ export class LegacyJsonImporter {
       value = JSON.parse(await fs.readFile(path.join(backupRoot, "data", entry.relative), "utf8"))
       if (owner === undefined && recovery !== undefined)
         throw new StorageIntegrityError("Legacy Session owner metadata is quarantined")
-      if (
-        entry.key[0] === "projects" &&
-        (!value || typeof value !== "object" || Array.isArray(value) || !("id" in value) || value.id !== entry.key[1])
-      )
-        throw new StorageIntegrityError("Legacy Scope identity does not match its key")
-      if (
-        entry.key[0] === "meta" &&
-        entry.key[1] === "migration" &&
-        (!value ||
-          typeof value !== "object" ||
-          Array.isArray(value) ||
-          Object.values(value).some((timestamp) => typeof timestamp !== "number" || !Number.isFinite(timestamp)))
-      )
-        throw new StorageIntegrityError("Legacy migration ledger is malformed")
-      if (entry.key[0] === "sessions" && (entry.key[3] === "info" || entry.key[3] === "messages")) {
-        const expectedID = entry.key.at(-1) === "info" ? entry.key.at(-2) : entry.key.at(-1)
-        if (!value || typeof value !== "object" || Array.isArray(value) || !("id" in value) || value.id !== expectedID)
-          throw new StorageIntegrityError("Legacy record identity does not match its owner")
-        if (entry.key.length === 4 && entry.key[3] === "info") {
-          const parsed = legacySessionInfo.safeParse(value)
-          if (!parsed.success) throw new StorageIntegrityError("Legacy Session metadata is malformed")
-          if (parsed.data.scope.id !== entry.key[1])
-            throw new StorageIntegrityError("Legacy Session Scope does not match its owner")
-        }
-      }
+      validateLegacyRecord(entry.key, value)
     } catch (error) {
       if (!(error instanceof SyntaxError) && !(error instanceof StorageIntegrityError)) throw error
       entry.disposition = "quarantined"
