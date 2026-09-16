@@ -339,7 +339,7 @@ export class StoreTransaction {
       }
     }
     await this.connection.query(
-      `INSERT INTO storage_artifact_gc(namespace, pack) SELECT DISTINCT namespace, pack FROM storage_artifacts WHERE ${artifactCondition} ON CONFLICT(namespace, pack) DO NOTHING`,
+      `INSERT INTO storage_artifact_gc(namespace, pack) SELECT namespace, pack FROM storage_artifacts WHERE ${artifactCondition} ON CONFLICT(namespace, pack) DO NOTHING`,
       artifactValues,
     )
     await this.connection.query(`DELETE FROM storage_artifacts WHERE ${artifactCondition}`, artifactValues)

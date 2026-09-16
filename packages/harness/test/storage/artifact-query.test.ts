@@ -53,6 +53,11 @@ test("artifact replacement seeks by key and deduplicates shared-pack collection 
     expect(plans.some((plan) => /storage_artifacts_pack.*\(namespace=\?\)/.test(plan))).toBe(false)
     await tx.writeArtifacts(entries.slice(128).map((entry) => ({ ...entry, location: replacement })))
     expect(await tx.artifactGarbage()).toEqual([{ pack: location.pack, used: false }])
+    plans.length = 0
+    await tx.removeTree(["blobs"])
+    expect(plans.some((plan) => /namespace=\? AND owner_key=\?/.test(plan))).toBe(true)
+    expect(plans.some((plan) => /storage_artifacts_pack.*\(namespace=\?\)/.test(plan))).toBe(false)
+    expect((await tx.artifactGarbage()).map((entry) => entry.used)).toEqual([false, false])
     database.run("COMMIT")
   } finally {
     tx.finish()
@@ -86,6 +91,8 @@ test.skipIf(!process.env.SYNERGY_TEST_POSTGRES_URL)(
         const replacement = { ...location, pack: crypto.randomUUID() + ".pack" }
         await tx.writeArtifacts(entries.map((entry) => ({ ...entry, location: replacement })))
         expect(await tx.artifactGarbage()).toEqual([{ pack: location.pack, used: false }])
+        await tx.removeTree(["blobs"])
+        expect((await tx.artifactGarbage()).map((entry) => entry.used)).toEqual([false, false])
       })
     } finally {
       await store.close()
