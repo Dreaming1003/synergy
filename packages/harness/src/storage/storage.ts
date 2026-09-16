@@ -219,7 +219,7 @@ export namespace Storage {
           throw error
         })
       if (previous?.sha256 === hash && previous.size === bytes.byteLength) {
-        await state.pack.read(previous)
+        await state.pack.verify(previous)
         return
       }
       const owner = JSON.stringify(key.slice(0, ["sessions", "operations"].includes(key[0]) ? 3 : 1))
@@ -255,7 +255,7 @@ export namespace Storage {
         handle.store.snapshot(async (tx) => {
           for await (const entry of tx.artifacts()) {
             if (options.accept && !options.accept(entry.key)) continue
-            await pack.read(entry.location)
+            await pack.verify(entry.location)
             if (++count % 256 === 0) options.progress?.(count)
           }
         }),

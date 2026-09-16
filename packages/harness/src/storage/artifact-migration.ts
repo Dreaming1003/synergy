@@ -141,7 +141,7 @@ export namespace StorageArtifactMigration {
       if (location) {
         if (location.sha256 !== entry.hash)
           throw new StorageIntegrityError("Artifact authority changed during migration")
-        await pack.read(location)
+        await pack.verify(location)
       } else {
         let deleted = false
         if (key[0] === "sessions")

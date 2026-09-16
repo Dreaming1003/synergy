@@ -3,7 +3,7 @@ import path from "node:path"
 import { createReadStream } from "node:fs"
 import { randomUUID, createHash } from "node:crypto"
 import { gzipSync, gunzipSync } from "node:zlib"
-import { ArtifactLocation } from "./artifact-location"
+import { ArtifactLocation, MAX_COMPRESSED_ARTIFACT_BYTES } from "./artifact-location"
 import { StorageConflictError, StorageIntegrityError } from "./errors"
 import { isRetryableIOError } from "../util/io-retry"
 import { StorageQueue } from "./queue"
@@ -51,8 +51,6 @@ export class ArtifactPack {
   }
 
   append(content: Uint8Array, owner = ""): Promise<ArtifactLocation> {
-    if (content.byteLength > 32 * 1024 * 1024)
-      return Promise.reject(new StorageConflictError("Binary record exceeds its byte limit"))
     const original = Buffer.from(content)
     return this.queue.run(async () => {
       for (let attempt = 1; ; attempt++) {
@@ -68,8 +66,8 @@ export class ArtifactPack {
   }
 
   private async appendBytes(original: Buffer, owner: string): Promise<ArtifactLocation> {
-    const compressed = gzipSync(original, { level: 1 })
-    const smaller = compressed.length < original.length * 0.9
+    const compressed = original.length <= MAX_COMPRESSED_ARTIFACT_BYTES ? gzipSync(original, { level: 1 }) : undefined
+    const smaller = compressed !== undefined && compressed.length < original.length * 0.9
     const bytes = smaller ? compressed : original
     await this.prepareDirectory()
     const previous = this.active.get(owner)
@@ -185,10 +183,19 @@ export class ArtifactPack {
       throw new StorageConflictError("Binary record exceeds its byte limit")
     const file = await fs.open(path.join(this.root, location.pack), "r")
     try {
-      const stored = Buffer.alloc(location.blockBytes)
+      const raw = location.codec === "raw"
+      const length = raw ? location.size : location.blockBytes
+      if (
+        raw &&
+        (location.blockBytes !== length || length > MAX_COMPRESSED_ARTIFACT_BYTES || length === 0) &&
+        location.blockOffset + location.blockBytes > (await file.stat()).size
+      )
+        throw new StorageIntegrityError("Artifact pack is truncated")
+      const stored = Buffer.alloc(length)
+      const start = location.blockOffset + (raw ? location.offset : 0)
       let offset = 0
       while (offset < stored.length) {
-        const read = await file.read(stored, offset, stored.length - offset, location.blockOffset + offset)
+        const read = await file.read(stored, offset, stored.length - offset, start + offset)
         if (!read.bytesRead) throw new StorageIntegrityError("Artifact pack is truncated")
         offset += read.bytesRead
       }
@@ -201,12 +208,43 @@ export class ArtifactPack {
       } catch {
         throw new StorageIntegrityError("Artifact pack compression integrity check failed")
       }
-      if (decoded.length !== location.decodedBytes)
+      if (decoded.length !== (raw ? location.size : location.decodedBytes))
         throw new StorageIntegrityError("Artifact pack byte count is invalid")
-      const value = decoded.subarray(location.offset, location.offset + location.size)
+      const value = raw ? decoded : decoded.subarray(location.offset, location.offset + location.size)
       if (digest(value) !== location.sha256)
         throw new StorageIntegrityError("Artifact pack content integrity check failed")
       return new Uint8Array(value)
+    } finally {
+      await file.close()
+    }
+  }
+
+  async verify(input: ArtifactLocation): Promise<void> {
+    const location = ArtifactLocation.parse(input)
+    if (location.size <= MAX_COMPRESSED_ARTIFACT_BYTES) {
+      await this.read(location)
+      return
+    }
+    const file = await fs.open(path.join(this.root, location.pack), "r")
+    try {
+      if (location.blockOffset + location.blockBytes > (await file.stat()).size)
+        throw new StorageIntegrityError("Artifact pack is truncated")
+      const hash = createHash("sha256")
+      const buffer = Buffer.alloc(1024 * 1024)
+      let offset = 0
+      while (offset < location.size) {
+        const read = await file.read(
+          buffer,
+          0,
+          Math.min(buffer.length, location.size - offset),
+          location.blockOffset + location.offset + offset,
+        )
+        if (!read.bytesRead) throw new StorageIntegrityError("Artifact pack is truncated")
+        hash.update(buffer.subarray(0, read.bytesRead))
+        offset += read.bytesRead
+      }
+      if (hash.digest("hex") !== location.sha256)
+        throw new StorageIntegrityError("Artifact pack content integrity check failed")
     } finally {
       await file.close()
     }
