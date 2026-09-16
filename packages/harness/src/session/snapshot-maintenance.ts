@@ -408,7 +408,6 @@ export namespace SnapshotMaintenance {
       await SnapshotStore.write(key, journal)
       await SnapshotGit.checked(source, ["fsck", "--full"], { signal })
       const roots = await historicalRoots(scopeID, sessionID)
-      await catalog.verifyTrees(source, roots, signal)
       const imported = await catalog.import(source, {
         signal,
         requiredTrees: roots,

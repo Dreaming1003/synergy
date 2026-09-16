@@ -59,7 +59,7 @@ export namespace SnapshotPack {
       // verification, then remove loose duplicates; alternate stores and existing packs stay untouched.
       const hash = await SnapshotGit.checked(
         repository,
-        ["pack-objects", "--non-empty", "--threads=2", path.join(directory, "pack")],
+        ["pack-objects", "--non-empty", "--threads=2", "--window-memory=64m", path.join(directory, "pack")],
         { ...options, input },
       )
       if (!/^[0-9a-f]{40}$/.test(hash)) throw new Error("Snapshot packing did not return a valid pack identity")
