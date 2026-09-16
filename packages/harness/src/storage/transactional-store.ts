@@ -479,7 +479,7 @@ export class StoreTransaction {
       }
       for (const owner of owners.values()) await this.assertNotDeleted(owner)
       await this.connection.query(
-        `INSERT INTO storage_artifact_gc(namespace, pack) SELECT DISTINCT namespace, pack FROM storage_artifacts WHERE namespace = ? AND key_text IN (${batch.map(() => "?").join(",")}) ON CONFLICT(namespace, pack) DO NOTHING`,
+        `INSERT INTO storage_artifact_gc(namespace, pack) SELECT namespace, pack FROM storage_artifacts WHERE namespace = ? AND key_text IN (${batch.map(() => "?").join(",")}) ON CONFLICT(namespace, pack) DO NOTHING`,
         [this.namespace, ...batch.map(({ key }) => JSON.stringify(key))],
       )
       await this.connection.query(
