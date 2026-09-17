@@ -8,7 +8,7 @@ import { usePrompt } from "@/context/prompt"
 import type { ContentPart, NoteAttachmentPart, SessionAttachmentPart, UploadedAttachmentPart } from "@/context/prompt"
 import { PromptAttachmentError, uploadPromptAttachment } from "@/utils/prompt-attachment"
 import { useLocale } from "@/context/locale"
-import { useGlobalSync } from "@/context/global-sync"
+import { useSync } from "@/context/sync"
 import {
   DEFAULT_ATTACHMENT_LIMITS,
   formatAttachmentBatchToast,
@@ -52,10 +52,17 @@ export function usePromptAttachments(input: PromptAttachmentsInput) {
   const params = useParams()
   const dialog = useDialog()
   const { i18n } = useLocale()
-  const globalSync = useGlobalSync()
+  const sync = useSync()
   const pendingUploads = input.pendingUploads
 
-  const attachmentLimits = () => globalSync.data.config.attachment ?? DEFAULT_ATTACHMENT_LIMITS
+  const attachmentLimits = () => {
+    const limits = sync.data.config.attachment
+    return {
+      maxFiles: limits?.maxFiles ?? DEFAULT_ATTACHMENT_LIMITS.maxFiles,
+      maxFileBytes: limits?.maxFileBytes ?? DEFAULT_ATTACHMENT_LIMITS.maxFileBytes,
+      maxTotalBytes: limits?.maxTotalBytes ?? DEFAULT_ATTACHMENT_LIMITS.maxTotalBytes,
+    }
+  }
 
   const cursor = () => {
     const editor = input.editor()
@@ -97,25 +104,13 @@ export function usePromptAttachments(input: PromptAttachmentsInput) {
     const all = Array.from(files)
     const existing = composerAttachmentScope()
     const limits = attachmentLimits()
-    const batchToast = formatAttachmentBatchToast(all, existing, i18n, {
-      maxFiles: limits.maxFiles ?? DEFAULT_ATTACHMENT_LIMITS.maxFiles,
-      maxFileBytes: limits.maxFileBytes ?? DEFAULT_ATTACHMENT_LIMITS.maxFileBytes,
-      maxTotalBytes: limits.maxTotalBytes ?? DEFAULT_ATTACHMENT_LIMITS.maxTotalBytes,
-    })
+    const batchToast = formatAttachmentBatchToast(all, existing, i18n, limits)
     if (batchToast) {
       showToast(batchToast)
       return
     }
-    const { accepted, rejected } = partitionPromptAttachmentFiles(all, {
-      maxFiles: limits.maxFiles ?? DEFAULT_ATTACHMENT_LIMITS.maxFiles,
-      maxFileBytes: limits.maxFileBytes ?? DEFAULT_ATTACHMENT_LIMITS.maxFileBytes,
-      maxTotalBytes: limits.maxTotalBytes ?? DEFAULT_ATTACHMENT_LIMITS.maxTotalBytes,
-    })
-    const toast = formatOversizedAttachmentToast(rejected, accepted.length, i18n, {
-      maxFiles: limits.maxFiles ?? DEFAULT_ATTACHMENT_LIMITS.maxFiles,
-      maxFileBytes: limits.maxFileBytes ?? DEFAULT_ATTACHMENT_LIMITS.maxFileBytes,
-      maxTotalBytes: limits.maxTotalBytes ?? DEFAULT_ATTACHMENT_LIMITS.maxTotalBytes,
-    })
+    const { accepted, rejected } = partitionPromptAttachmentFiles(all, limits)
+    const toast = formatOversizedAttachmentToast(rejected, accepted.length, i18n, limits)
     if (toast) showToast(toast)
     const draft = prompt.capture()
     try {
