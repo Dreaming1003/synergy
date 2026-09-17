@@ -329,12 +329,12 @@ export class StoreTransaction {
     )
   }
 
-  // SQLite must drive recursion from the frontier to use both columns of the parent index.
-  // CROSS JOIN prevents a namespace-wide node scan for every visited node.
+  // SQLite must drive recursion and record lookups from the frontier; otherwise
+  // even an empty prefix can scan every record in the namespace.
   async scan(prefix: string[]): Promise<string[]> {
     this.check()
     const rows = await this.connection.query<SqlRow & { child: string }>(
-      "WITH RECURSIVE tree(key_id, child) AS (SELECT key_id, segment FROM storage_nodes WHERE namespace = ? AND parent_id = ? UNION ALL SELECT node.key_id, tree.child FROM tree CROSS JOIN storage_nodes node WHERE node.namespace = ? AND node.parent_id = tree.key_id) SELECT DISTINCT tree.child FROM tree JOIN storage_records record ON record.key_id = tree.key_id AND record.namespace = ? WHERE record.body IS NOT NULL",
+      "WITH RECURSIVE tree(key_id, child) AS (SELECT key_id, segment FROM storage_nodes WHERE namespace = ? AND parent_id = ? UNION ALL SELECT node.key_id, tree.child FROM tree CROSS JOIN storage_nodes node WHERE node.namespace = ? AND node.parent_id = tree.key_id) SELECT DISTINCT tree.child FROM tree CROSS JOIN storage_records record WHERE record.key_id = tree.key_id AND record.namespace = ? AND record.body IS NOT NULL",
       [this.namespace, keyID(prefix), this.namespace, this.namespace],
     )
     return rows.map((row) => row.child).sort()
@@ -343,7 +343,7 @@ export class StoreTransaction {
   async list(prefix: string[]): Promise<string[][]> {
     this.check()
     const rows = await this.connection.query<SqlRow & { key_text: string }>(
-      "WITH RECURSIVE tree(key_id) AS (SELECT key_id FROM storage_nodes WHERE namespace = ? AND parent_id = ? UNION ALL SELECT node.key_id FROM tree CROSS JOIN storage_nodes node WHERE node.namespace = ? AND node.parent_id = tree.key_id) SELECT record.key_text FROM tree JOIN storage_records record ON record.key_id = tree.key_id AND record.namespace = ? WHERE record.body IS NOT NULL",
+      "WITH RECURSIVE tree(key_id) AS (SELECT key_id FROM storage_nodes WHERE namespace = ? AND parent_id = ? UNION ALL SELECT node.key_id FROM tree CROSS JOIN storage_nodes node WHERE node.namespace = ? AND node.parent_id = tree.key_id) SELECT record.key_text FROM tree CROSS JOIN storage_records record WHERE record.key_id = tree.key_id AND record.namespace = ? AND record.body IS NOT NULL",
       [this.namespace, keyID(prefix), this.namespace, this.namespace],
     )
     return rows.map((row) => JSON.parse(row.key_text) as string[]).sort()
@@ -942,7 +942,7 @@ export class TransactionalStore {
           else await this.driver.transaction(release)
         }
       } catch (error) {
-        if (!(error instanceof StorageOwnershipError)) throw error
+        if (!(error instanceof StorageOwnershipError) && !(error instanceof StorageClosedError)) throw error
       } finally {
         await this.driver.close()
       }

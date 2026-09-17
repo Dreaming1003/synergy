@@ -45,7 +45,10 @@ function transaction() {
   const plans: string[] = []
   const connection: SqlConnection = {
     async query<Row extends SqlRow>(statement: string, values: SqlValue[] = []) {
-      if (statement.startsWith("SELECT") && statement.includes("FROM storage_records")) {
+      if (
+        statement.startsWith("WITH RECURSIVE") ||
+        (statement.startsWith("SELECT") && statement.includes("FROM storage_records"))
+      ) {
         const plan = database.query<{ detail: string }, SqlValue[]>("EXPLAIN QUERY PLAN " + statement)
         plans.push(...plan.all(...values).map((row) => row.detail))
         plan.finalize()
@@ -60,6 +63,24 @@ function transaction() {
   }
   return { tx: new StoreTransaction(connection, "traversal", true), plans }
 }
+
+test("prefix traversal probes only descendant records, including an absent recovery root", async () => {
+  for (const prefix of [["first"], ["storage_staging"], ["first", "foreign"]]) {
+    const { tx, plans } = transaction()
+    try {
+      const keys = [...expected.keys()]
+        .map((key) => JSON.parse(key) as string[])
+        .filter((key) => key.length > prefix.length && prefix.every((part, index) => key[index] === part))
+      expect(await tx.scan(prefix)).toEqual([...new Set(keys.map((key) => key[prefix.length]))].sort())
+      expect(await tx.list(prefix)).toEqual(keys.sort())
+      const recordPlans = plans.filter((plan) => /(?:SEARCH|SCAN) record\b/.test(plan))
+      expect(recordPlans).toHaveLength(2)
+      expect(recordPlans.every((plan) => /namespace=\? AND key_id=\?/.test(plan))).toBe(true)
+    } finally {
+      tx.finish()
+    }
+  }
+})
 
 test("filtered cursor pages seek into their index in both directions", async () => {
   for (const descending of [false, true]) {
