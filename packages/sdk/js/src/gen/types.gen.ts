@@ -4217,6 +4217,21 @@ export type Config = {
    */
   $schema?: string
   logLevel?: LogLevel
+  /**
+   * Global authoritative storage; backend changes require an explicit storage migration
+   */
+  storage?:
+    | {
+        backend: "sqlite"
+        namespace?: string
+        filename?: string
+      }
+    | {
+        backend: "postgres"
+        namespace: string
+        connectionEnv: string
+        maxConnections?: number
+      }
   server?: ServerConfig
   attachment?: AttachmentConfig
   /**
@@ -5339,6 +5354,7 @@ export type ConfigDomainSummary = {
     | "commands"
     | "permissions"
     | "runtime"
+    | "storage"
     | "plugins"
     | "channels"
     | "holos"
@@ -5395,6 +5411,7 @@ export type ConfigExportResult = {
     | "commands"
     | "permissions"
     | "runtime"
+    | "storage"
     | "plugins"
     | "channels"
     | "holos"
@@ -5453,6 +5470,7 @@ export type ConfigDomainImportDomainPlan = {
     | "commands"
     | "permissions"
     | "runtime"
+    | "storage"
     | "plugins"
     | "channels"
     | "holos"
@@ -5506,6 +5524,7 @@ export type ConfigDomainImportPlanInput = {
     | "commands"
     | "permissions"
     | "runtime"
+    | "storage"
     | "plugins"
     | "channels"
     | "holos"
@@ -5589,6 +5608,7 @@ export type ConfigImportRevisionConflictError = {
       | "commands"
       | "permissions"
       | "runtime"
+      | "storage"
       | "plugins"
       | "channels"
       | "holos"
@@ -5620,6 +5640,7 @@ export type ConfigDomainImportApplyInput = {
     | "commands"
     | "permissions"
     | "runtime"
+    | "storage"
     | "plugins"
     | "channels"
     | "holos"
@@ -12919,6 +12940,7 @@ export type ConfigDomainGetData = {
       | "commands"
       | "permissions"
       | "runtime"
+      | "storage"
       | "plugins"
       | "channels"
       | "holos"
@@ -12969,6 +12991,7 @@ export type ConfigDomainUpdateData = {
       | "commands"
       | "permissions"
       | "runtime"
+      | "storage"
       | "plugins"
       | "channels"
       | "holos"
@@ -13019,6 +13042,7 @@ export type ConfigDomainOpenData = {
       | "commands"
       | "permissions"
       | "runtime"
+      | "storage"
       | "plugins"
       | "channels"
       | "holos"
@@ -13077,6 +13101,7 @@ export type ConfigExportData = {
       | "commands"
       | "permissions"
       | "runtime"
+      | "storage"
       | "plugins"
       | "channels"
       | "holos"
@@ -13094,6 +13119,7 @@ export type ConfigExportData = {
           | "commands"
           | "permissions"
           | "runtime"
+          | "storage"
           | "plugins"
           | "channels"
           | "holos"
