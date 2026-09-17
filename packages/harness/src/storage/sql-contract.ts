@@ -14,6 +14,7 @@ export interface SqlQueryOptions {
   // Maintenance statements (integrity verification) legitimately run longer
   // than ordinary operations; engines may extend their deadline.
   maintenance?: boolean
+  onMaintenanceBudget?: (timeoutMs: number) => void
 }
 
 export interface SqlConnection {

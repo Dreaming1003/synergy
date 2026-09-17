@@ -62,17 +62,21 @@ test("SQLite maintenance budgets grow with the current database while ordinary d
         },
       }),
     )
-    expect(await driver.query("PRAGMA integrity_check", [], { maintenance: true })).toEqual([{ integrity_check: "ok" }])
+    const budgets: number[] = []
+    const maintenance = { maintenance: true, onMaintenanceBudget: (timeoutMs: number) => budgets.push(timeoutMs) }
+    expect(await driver.query("PRAGMA integrity_check", [], maintenance)).toEqual([{ integrity_check: "ok" }])
     const initial = Math.max(...deadlines)
+    expect(budgets).toEqual([initial])
     await driver.transaction((tx) => tx.query("INSERT INTO evidence VALUES (zeroblob(8388608))"))
     deadlines.length = 0
     await driver.transaction(
       async (tx) => {
-        expect(await tx.query("PRAGMA integrity_check", [], { maintenance: true })).toEqual([{ integrity_check: "ok" }])
+        expect(await tx.query("PRAGMA integrity_check", [], maintenance)).toEqual([{ integrity_check: "ok" }])
       },
       { readOnly: true },
     )
     expect(Math.max(...deadlines)).toBeGreaterThan(initial)
+    expect(budgets).toEqual([initial, Math.max(...deadlines)])
     deadlines.length = 0
     expect(await driver.query("SELECT 1 AS value")).toEqual([{ value: 1n }])
     expect(deadlines).toEqual([30_000])
@@ -124,6 +128,7 @@ test("verification reports outside retried transactions and counts repeated scan
   const context = new AsyncLocalStorage<boolean>()
   const transaction = SqliteDriver.prototype.transaction
   const progress: number[] = []
+  const budgets: number[] = []
   using retried = spyOn(SqliteDriver.prototype, "transaction").mockImplementation(async function <T>(
     this: SqliteDriver,
     body: (connection: SqlConnection) => Promise<T>,
@@ -146,11 +151,14 @@ test("verification reports outside retried transactions and counts repeated scan
       }
     }
   })
-  const result = await data.store.verify((current) => {
+  const result = await data.store.verify((current, timeoutMs) => {
     expect(context.getStore()).toBeUndefined()
     progress.push(current)
+    if (timeoutMs !== undefined) budgets.push(timeoutMs)
   })
   expect(result.records).toBe(600)
+  expect(budgets).toHaveLength(2)
+  expect(budgets.every((value) => value >= 600_000)).toBe(true)
   expect(progress.at(-1)).toBe(1200)
   expect(progress.every((value, index) => index === 0 || value >= progress[index - 1])).toBe(true)
 })

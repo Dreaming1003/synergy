@@ -43,6 +43,16 @@ async function run() {
         await window.webContents.executeJavaScript(`document.body.textContent.includes('Scanning saved files. 10001')`),
         true,
       )
+      startup.receive(
+        'SYNERGY_STARTUP_V1 {"phase":"storage","step":2,"stage":"validate-engine","current":0,"total":0,"bytes":0,"timeoutMs":900000}\n',
+      )
+      await window.webContents.executeJavaScript(startupStatusScript(startup.status()))
+      assert.equal(
+        await window.webContents.executeJavaScript(
+          `document.body.textContent.includes('Checking database integrity.')`,
+        ),
+        true,
+      )
       startup.receive('SYNERGY_STARTUP_V1 {"phase":"migration","step":1,"current":358,"total":8494}\n')
       await window.webContents.executeJavaScript(startupStatusScript(startup.status()))
       await window.webContents.executeJavaScript(`(async () => {

@@ -116,7 +116,10 @@ export class SqliteDriver implements SqlDriver {
     }
   }
 
-  private async request(request: Omit<SqliteRequest, "id">): Promise<SqlRow[]> {
+  private async request(
+    request: Omit<SqliteRequest, "id">,
+    onMaintenanceBudget?: (timeoutMs: number) => void,
+  ): Promise<SqlRow[]> {
     if (this.closed) return Promise.reject(new StorageClosedError())
     let deadline = 30_000
     if (request.maintenance) {
@@ -128,6 +131,7 @@ export class SqliteDriver implements SqlDriver {
       // Full integrity checks revisit every index entry (https://sqlite.org/pragma.html#pragma_integrity_check).
       // Size the finite budget from the current snapshot, including uncheckpointed WAL growth.
       deadline = Math.min(2_147_483_647, 600_000 + Math.ceil(bytes / 1024 ** 2) * 1000)
+      onMaintenanceBudget?.(deadline)
     }
     const bytes = sqlParameterBytes(request.values ?? [])
     if (this.queuedBytes + bytes > 32 * 1024 * 1024)
@@ -160,7 +164,10 @@ export class SqliteDriver implements SqlDriver {
     options?: SqlQueryOptions,
   ): Promise<Row[]> {
     return this.readerQueue.run(() =>
-      this.request({ action: "query", reader: true, statement, values, maintenance: options?.maintenance }),
+      this.request(
+        { action: "query", reader: true, statement, values, maintenance: options?.maintenance },
+        options?.onMaintenanceBudget,
+      ),
     ) as Promise<Row[]>
   }
 
@@ -175,13 +182,16 @@ export class SqliteDriver implements SqlDriver {
         values: SqlValue[] = [],
         queryOptions?: SqlQueryOptions,
       ) =>
-        this.request({
-          action: "query",
-          reader: options.readOnly,
-          statement,
-          values,
-          maintenance: queryOptions?.maintenance,
-        }) as Promise<Row[]>
+        this.request(
+          {
+            action: "query",
+            reader: options.readOnly,
+            statement,
+            values,
+            maintenance: queryOptions?.maintenance,
+          },
+          queryOptions?.onMaintenanceBudget,
+        ) as Promise<Row[]>
       await query(options.readOnly ? "BEGIN" : "BEGIN IMMEDIATE")
       let committing = false
       try {

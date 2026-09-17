@@ -76,7 +76,9 @@ export class DesktopServerStartup {
     this.progress = next
     if (next.phase === "starting" && previous?.phase === "recovery") this.recoveryCompleted = true
     const complete = next.phase === "starting" || (next.phase === "storage" && next.stage === "complete")
-    this.deadline = this.now() + (complete ? this.healthTimeoutMs : this.migrationIdleMs)
+    const timeout =
+      next.phase === "storage" && next.stage === "validate-engine" ? next.timeoutMs! : this.migrationIdleMs
+    this.deadline = this.now() + (complete ? this.healthTimeoutMs : timeout)
     this.options.onStatus?.(this.status())
   }
 
@@ -87,6 +89,8 @@ export class DesktopServerStartup {
   status(): DesktopStartupStatus {
     const progress = this.progress
     if (progress?.phase === "storage" && progress.stage !== "complete") {
+      if (progress.stage === "validate-engine")
+        return { title: "Updating saved data", detail: "Checking database integrity." }
       const labels = {
         prepare: "Preparing storage",
         scan: "Scanning saved files",
@@ -126,6 +130,8 @@ export class DesktopServerStartup {
 
   timeoutError(): Error {
     const progress = this.progress
+    if (progress?.phase === "storage" && progress.stage === "validate-engine")
+      return new Error(`Synergy database integrity check exceeded its ${progress.timeoutMs}ms budget`)
     if (progress?.phase === "storage" && progress.stage !== "complete")
       return new Error(
         `Synergy storage update made no progress for ${this.migrationIdleMs}ms (stage ${progress.stage}, ${progress.current} items checked)`,

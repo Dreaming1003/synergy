@@ -856,7 +856,7 @@ export class TransactionalStore {
     )
   }
 
-  async verify(progress?: (current: number) => void) {
+  async verify(progress?: (current: number, timeoutMs?: number) => void) {
     this.check()
     progress?.(0)
     let work = 0
@@ -865,7 +865,10 @@ export class TransactionalStore {
         this.driver.transaction(
           async (connection) => {
             if (this.driver.backend === "sqlite") {
-              const rows = await connection.query("PRAGMA integrity_check", [], { maintenance: true })
+              const rows = await connection.query("PRAGMA integrity_check", [], {
+                maintenance: true,
+                onMaintenanceBudget: (timeoutMs) => recordProgress({ current: work, timeoutMs }),
+              })
               if (rows.length !== 1 || rows[0].integrity_check !== "ok")
                 throw new StorageIntegrityError("SQLite integrity verification failed")
             }
@@ -908,7 +911,7 @@ export class TransactionalStore {
                   }
                 }
                 work += batch.length
-                recordProgress(work)
+                recordProgress({ current: work })
                 batch = []
               }
               for await (const record of tx.records<Record<string, unknown>>()) {
@@ -916,7 +919,7 @@ export class TransactionalStore {
                 if (batch.length === 256) await verifyBatch()
               }
               if (batch.length) await verifyBatch()
-              recordProgress(work)
+              recordProgress({ current: work })
               return { backend: this.driver.backend, namespace: this.options.namespace, records, kinds, issues }
             } finally {
               tx.finish()
@@ -924,7 +927,9 @@ export class TransactionalStore {
           },
           { readOnly: true },
         ),
-      progress,
+      progress
+        ? (value: { current: number; timeoutMs?: number }) => progress(value.current, value.timeoutMs)
+        : undefined,
     )
   }
 

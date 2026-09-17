@@ -168,8 +168,12 @@ export namespace RuntimeHandle {
         reporter: options.reporter,
       })
       if (storage && storage.manifest.phase !== "active")
-        await StorageRecovery.validate((current) =>
-          options.storageReporter?.({ stage: "validate", current, total: 0, bytes: 0 }),
+        await StorageRecovery.validate((current, timeoutMs) =>
+          options.storageReporter?.(
+            timeoutMs === undefined
+              ? { stage: "validate", current, total: 0, bytes: 0 }
+              : { stage: "validate-engine", current: 0, total: 0, bytes: 0, timeoutMs },
+          ),
         )
       await storage?.activate()
       await StorageRecovery.recoverOwners()
