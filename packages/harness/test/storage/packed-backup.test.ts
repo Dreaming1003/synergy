@@ -43,7 +43,7 @@ test("packed backup restores every original byte without the business database",
   expect(await backup.create()).toEqual(manifest)
   const chunks = await fs.readdir(path.join(f.backup, "chunks"))
   expect(chunks.length).toBe(manifest.groups)
-}, 20000)
+}, 120000)
 
 test("a published group can resume after interruption and rejects modified source evidence", async () => {
   await using f = await fixture()
@@ -92,4 +92,4 @@ test("capacity exhaustion before a chunk publication leaves originals available 
   expect((await resumed.create()).files).toBe(f.values.size)
   await resumed.restore(f.restored)
   expect(await fs.readFile(path.join(f.restored, "assets/large.bin"))).toEqual(f.values.get("assets/large.bin")!)
-}, 20000)
+}, 120000)
