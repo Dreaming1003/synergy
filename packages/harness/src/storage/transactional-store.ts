@@ -334,7 +334,7 @@ export class StoreTransaction {
   async scan(prefix: string[]): Promise<string[]> {
     this.check()
     const rows = await this.connection.query<SqlRow & { child: string }>(
-      "WITH RECURSIVE tree(key_id, child) AS (SELECT key_id, segment FROM storage_nodes WHERE namespace = ? AND parent_id = ? UNION ALL SELECT node.key_id, tree.child FROM tree CROSS JOIN storage_nodes node WHERE node.namespace = ? AND node.parent_id = tree.key_id) SELECT DISTINCT tree.child FROM tree CROSS JOIN storage_records record WHERE record.key_id = tree.key_id AND record.namespace = ? AND record.body IS NOT NULL",
+      "SELECT child.segment AS child FROM storage_nodes child WHERE child.namespace = ? AND child.parent_id = ? AND EXISTS (WITH RECURSIVE tree(key_id) AS (SELECT child.key_id UNION ALL SELECT node.key_id FROM tree CROSS JOIN storage_nodes node WHERE node.namespace = ? AND node.parent_id = tree.key_id) SELECT 1 FROM tree CROSS JOIN storage_records record WHERE record.key_id = tree.key_id AND record.namespace = ? AND record.body IS NOT NULL LIMIT 1)",
       [this.namespace, keyID(prefix), this.namespace, this.namespace],
     )
     return rows.map((row) => row.child).sort()
