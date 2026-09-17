@@ -2130,6 +2130,24 @@ export type ServerConfig = {
   cors?: Array<string>
 }
 
+/**
+ * Prompt attachment upload limits (count and byte sizes)
+ */
+export type AttachmentConfig = {
+  /**
+   * Maximum number of prompt attachments per batch (default: 20)
+   */
+  maxFiles?: number
+  /**
+   * Maximum prompt attachment size in bytes per file (default: 209715200 = 200 MiB)
+   */
+  maxFileBytes?: number
+  /**
+   * Maximum aggregate prompt attachment size in bytes per batch (default: 2147483648 = 2 GiB)
+   */
+  maxTotalBytes?: number
+}
+
 export type PermissionActionConfig = "ask" | "allow" | "deny"
 
 export type PermissionObjectConfig = {
@@ -4215,6 +4233,7 @@ export type Config = {
         maxConnections?: number
       }
   server?: ServerConfig
+  attachment?: AttachmentConfig
   /**
    * Command configuration
    */
