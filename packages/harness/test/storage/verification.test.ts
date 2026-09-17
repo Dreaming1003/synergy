@@ -46,6 +46,42 @@ test("verification checks logical identities and reports missing parent records"
   expect((await store.verify()).issues).toEqual([])
 })
 
+test("SQLite maintenance budgets grow with the current database while ordinary deadlines stay bounded", async () => {
+  const root = await fs.mkdtemp(path.join(process.env.SYNERGY_TEST_ROOT!, "verification-budget-"))
+  const driver = await SqliteDriver.open(path.join(root, "agent.sqlite"))
+  try {
+    await driver.transaction((tx) => tx.query("CREATE TABLE evidence (body BLOB NOT NULL)"))
+    const timeout = globalThis.setTimeout
+    const deadlines: number[] = []
+    using observed = spyOn(globalThis, "setTimeout").mockImplementation(
+      new Proxy(timeout, {
+        apply(target, receiver, args) {
+          const delay = args[1]
+          if (typeof delay === "number" && delay >= 30_000) deadlines.push(delay)
+          return Reflect.apply(target, receiver, args)
+        },
+      }),
+    )
+    expect(await driver.query("PRAGMA integrity_check", [], { maintenance: true })).toEqual([{ integrity_check: "ok" }])
+    const initial = Math.max(...deadlines)
+    await driver.transaction((tx) => tx.query("INSERT INTO evidence VALUES (zeroblob(8388608))"))
+    deadlines.length = 0
+    await driver.transaction(
+      async (tx) => {
+        expect(await tx.query("PRAGMA integrity_check", [], { maintenance: true })).toEqual([{ integrity_check: "ok" }])
+      },
+      { readOnly: true },
+    )
+    expect(Math.max(...deadlines)).toBeGreaterThan(initial)
+    deadlines.length = 0
+    expect(await driver.query("SELECT 1 AS value")).toEqual([{ value: 1n }])
+    expect(deadlines).toEqual([30_000])
+  } finally {
+    await driver.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 for (const defect of ["missing-node", "changed-node", "invalid-revision"] as const) {
   test(`verification and export reject ${defect} beyond the first page`, async () => {
     await using data = await fixture()
