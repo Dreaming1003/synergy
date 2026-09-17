@@ -12,12 +12,13 @@ export namespace StorageRecovery {
   }
   export async function recoverOwners() {
     sealed = true
+    await Storage.collectArtifactGarbage({ scanOrphans: true })
     for (const recover of owners.values()) await recover()
   }
 
   const blocked = new WeakMap<object, Set<string>>()
 
-  export async function validate(progress?: (current: number) => void) {
+  export async function validate(progress?: (current: number, timeoutMs?: number) => void) {
     const report = await Storage.current().store.verify(progress)
     for (const issue of report.issues) {
       if (issue.key[0] !== "sessions" || !issue.key[2])

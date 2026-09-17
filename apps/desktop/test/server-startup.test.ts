@@ -4,6 +4,36 @@ import { DesktopServerStartup } from "../src/server-startup.js"
 const line = (value: unknown) => `SYNERGY_STARTUP_V1 ${JSON.stringify(value)}\n`
 
 describe("managed startup progress", () => {
+  test("waits for a finite engine verification budget without renewing duplicate announcements", () => {
+    let now = 0
+    const startup = new DesktopServerStartup({ now: () => now })
+    const engine = {
+      phase: "storage",
+      step: 1,
+      stage: "validate-engine",
+      current: 0,
+      total: 0,
+      bytes: 0,
+      timeoutMs: 900_000,
+    }
+    startup.receive(line(engine))
+    now = 300_001
+    expect(startup.remainingMs()).toBe(599_999)
+    expect(startup.status().detail).toBe("Checking database integrity.")
+    startup.receive(line(engine))
+    startup.receive(line({ ...engine, timeoutMs: 1_800_000 }))
+    expect(startup.remainingMs()).toBe(599_999)
+    now = 900_000
+    expect(startup.remainingMs()).toBe(0)
+    expect(startup.timeoutError().message).toContain("900000ms")
+    startup.receive(line({ phase: "storage", step: 2, stage: "validate", current: 256, total: 0, bytes: 0 }))
+    expect(startup.remainingMs()).toBe(300_000)
+    startup.receive(line(engine))
+    expect(startup.remainingMs()).toBe(300_000)
+    startup.receive(line({ phase: "storage", step: 3, stage: "complete", current: 0, total: 0, bytes: 0 }))
+    expect(startup.remainingMs()).toBe(30_000)
+  })
+
   test("waits through storage scanning, domain migrations and activation without accepting stale work", () => {
     let now = 0
     const startup = new DesktopServerStartup({ now: () => now })

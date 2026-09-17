@@ -41,6 +41,13 @@ describe("desktop migration reporting", () => {
       },
     })
     try {
+      await prepared.store.verify((current, timeoutMs) =>
+        reporter(
+          timeoutMs === undefined
+            ? { stage: "validate", current, total: 0, bytes: 0 }
+            : { stage: "validate-engine", current: 0, total: 0, bytes: 0, timeoutMs },
+        ),
+      )
       await prepared.activate()
       const records = lines.map((line) =>
         RuntimeStartupProgress.parse(JSON.parse(line.slice(RUNTIME_STARTUP_PREFIX.length))),
@@ -52,6 +59,14 @@ describe("desktop migration reporting", () => {
       expect(
         records.some((record) => record.phase === "storage" && record.stage === "activate" && record.current === 1),
       ).toBe(true)
+      const engine = records.find((record) => record.phase === "storage" && record.stage === "validate-engine")
+      expect(engine).toMatchObject({ phase: "storage", current: 0, total: 0, bytes: 0 })
+      if (engine?.phase !== "storage") throw new Error("Missing engine verification progress")
+      expect(engine.timeoutMs).toBeGreaterThanOrEqual(600_000)
+      const checked = records.find(
+        (record) => record.phase === "storage" && record.stage === "validate" && record.current > 0,
+      )
+      expect(checked).toBeDefined()
       expect(lines.join("")).not.toContain("private")
       expect(lines.join("")).not.toContain(root)
     } finally {

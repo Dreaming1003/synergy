@@ -149,3 +149,36 @@ test("maintenance rejects an installed Runtime and malformed targets without cha
   expect(Storage.available()).toBe(false)
   expect(await ServerProcessLock.read()).toBeUndefined()
 })
+
+test("restore-backup publishes a verified separate home and refuses an existing destination", async () => {
+  const legacy = path.join(Global.Path.data, "notes", "home", "restored.json")
+  await Bun.write(legacy, JSON.stringify({ text: "original" }))
+  const prepared = await StorageBootstrap.prepare({ root: Global.Path.root })
+  const state = await prepared.store.read<{ backup: string }>(["storage_import", "info"])
+  await prepared.activate()
+  await prepared.store.close()
+  const target = path.join(home, "restored-home")
+  await invoke(["storage", "restore-backup", state.backup, target])
+  expect(report()).toMatchObject({ status: "restored", files: 1 })
+  expect(await Bun.file(path.join(target, "data", "notes", "home", "restored.json")).json()).toEqual({
+    text: "original",
+  })
+  await expect(invoke(["storage", "restore-backup", state.backup, target])).rejects.toThrow("exists")
+  expect(Storage.available()).toBe(false)
+})
+
+test("restore-backup never publishes a destination when the final inventory digest is corrupt", async () => {
+  await Bun.write(path.join(Global.Path.data, "notes", "saved.json"), JSON.stringify({ saved: true }))
+  const prepared = await StorageBootstrap.prepare({ root: Global.Path.root })
+  const state = await prepared.store.read<{ backup: string }>(["storage_import", "info"])
+  await prepared.activate()
+  await prepared.store.close()
+  const filename = path.join(state.backup, "manifest.json")
+  const manifest = await Bun.file(filename).json()
+  await Bun.write(filename, JSON.stringify({ ...manifest, inventorySHA256: "0".repeat(64) }))
+  const target = path.join(home, "invalid-home")
+  await expect(invoke(["storage", "restore-backup", state.backup, target])).rejects.toThrow("integrity")
+  expect(await fs.readdir(home)).not.toContain("invalid-home")
+  expect((await fs.readdir(home)).some((name) => name.startsWith(".synergy-restore-"))).toBe(false)
+  expect(Storage.available()).toBe(false)
+})
