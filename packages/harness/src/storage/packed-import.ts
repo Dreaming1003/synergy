@@ -1,5 +1,4 @@
 import fs from "node:fs/promises"
-import { createReadStream } from "node:fs"
 import path from "node:path"
 import { createHash } from "node:crypto"
 import type { ArtifactLocation } from "./artifact-location"
@@ -8,6 +7,7 @@ import { PackedBackup, type PackedBackupEntry } from "./packed-backup"
 import { syncRetiredDirectories, legacyBinaryKey, legacyRecordKey, legacySources, sourcePath } from "./legacy-source"
 import { validateLegacyRecord } from "./legacy-record"
 import { StorageIntegrityError } from "./errors"
+import { fileDigest } from "./file-digest"
 import type { ImportProgress, ImportResult } from "./legacy-import"
 import type { TransactionalStore, StoreTransaction } from "./transactional-store"
 
@@ -41,11 +41,6 @@ type Prepared = {
 }
 function hash(value: string) {
   return createHash("sha256").update(value).digest("hex")
-}
-async function fileHash(filename: string) {
-  const digest = createHash("sha256")
-  for await (const bytes of createReadStream(filename)) digest.update(bytes)
-  return digest.digest("hex")
 }
 function isOwner(key?: string[]) {
   return key?.length === 4 && key[0] === "sessions" && key[3] === "info"
@@ -333,10 +328,12 @@ export class PackedLegacyImporter {
       if (legacyRecordKey(entry.relative) || legacyBinaryKey(entry.relative)) {
         const filename = sourcePath(dataRoot, entry.relative)
         try {
-          if ((await fileHash(filename)) !== entry.hash)
+          if ((await fileDigest(filename, entry.size)) !== entry.hash)
             throw new StorageIntegrityError("A legacy writer changed data during activation")
           await fs.unlink(filename)
         } catch (error) {
+          if (error instanceof StorageIntegrityError)
+            throw new StorageIntegrityError("A legacy writer changed data during activation", { cause: error })
           if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error
         }
         directories.add(path.dirname(filename))

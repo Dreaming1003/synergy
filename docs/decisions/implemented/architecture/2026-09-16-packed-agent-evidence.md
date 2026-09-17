@@ -18,6 +18,8 @@ Binary evidence has no new 32 MiB product limit: historical writers accepted lar
 
 The record codec follows the same compatibility rule: the 128 MiB bound limits compressed expansion, while larger JSON bodies keep their plain representation and remain subject to existing engine admission limits. Adding compression must not reject an otherwise accepted plain record.
 
+Backup resumption still hashes every original file, and retirement hashes it again before deletion. Files up to 2 MiB use a bounded read of the expected length plus one byte; larger files remain streamed. Growth or truncation stops verification. An alternating read experiment over the same 10,000 small source files preserved every SHA-256 digest: warm bounded reads took approximately 0.40 seconds versus 0.83 seconds for per-file streams; a colder stream pass took 1.92 seconds. This measures read/hash overhead on one machine, not total migration throughput.
+
 The capacity budget includes backup content and metadata, SQL overhead, journals, owner migrations and recovery reserve without crediting future deletion. Phase checks stop before consuming the reserve. The SQL per-record allowances are estimates to calibrate against actual data, not guaranteed upper bounds. Measurements distinguish logical bytes, allocated blocks and unique file identities. Restoration verifies into a new staged Home and publishes only after the final inventory validates.
 
 ## Alternatives considered

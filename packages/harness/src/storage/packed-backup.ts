@@ -6,6 +6,7 @@ import { gzipSync, gunzipSync } from "node:zlib"
 import { z } from "zod"
 import { AtomicFile } from "./atomic-file"
 import { StorageIntegrityError } from "./errors"
+import { fileDigest } from "./file-digest"
 import { legacyBinaryKey, legacySources, sourcePath } from "./legacy-source"
 
 const MAX_GROUP_BYTES = 4 * 1024 * 1024
@@ -62,11 +63,6 @@ export type PackedBackupEntry = z.infer<typeof Entry> & {
 function hash(data: Uint8Array | string) {
   return createHash("sha256").update(data).digest("hex")
 }
-async function fileHash(filename: string) {
-  const result = createHash("sha256")
-  for await (const bytes of createReadStream(filename)) result.update(bytes)
-  return result.digest("hex")
-}
 function groupName(sequence: number) {
   return String(sequence).padStart(10, "0")
 }
@@ -117,7 +113,7 @@ export class PackedBackup {
     if (
       group.sequence !== sequence ||
       (await fs.stat(filename)).size !== group.storedBytes ||
-      (await fileHash(filename)) !== group.sha256
+      (await fileDigest(filename, group.storedBytes)) !== group.sha256
     )
       throw new StorageIntegrityError("Packed backup failed its integrity check")
     const entries: PackedBackupEntry[] = []
@@ -279,7 +275,7 @@ export class PackedBackup {
             throw new StorageIntegrityError("Legacy data changed after the backup checkpoint")
           const digest =
             entry.linkTarget === undefined
-              ? await fileHash(sourcePath(dataRoot, entry.relative))
+              ? await fileDigest(sourcePath(dataRoot, entry.relative), entry.size)
               : hash(entry.linkTarget)
           if (digest !== entry.hash) throw new StorageIntegrityError("Legacy data changed after the backup checkpoint")
         }
@@ -343,8 +339,8 @@ export class PackedBackup {
             const stat = await fs.stat(temporary)
             if (stat.size !== entry.size) throw new StorageIntegrityError("Legacy data changed during backup")
             await fs.chmod(temporary, 0o600)
-            const digest = await fileHash(temporary)
-            if ((await fileHash(filename)) !== digest)
+            const digest = await fileDigest(temporary, entry.size)
+            if ((await fileDigest(filename, entry.size)) !== digest)
               throw new StorageIntegrityError("Legacy data changed during backup")
             const handle = await fs.open(temporary, "r+")
             try {
