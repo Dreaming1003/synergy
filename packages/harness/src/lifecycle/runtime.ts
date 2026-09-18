@@ -182,8 +182,8 @@ export namespace RuntimeHandle {
       options.storageReporter?.({ stage: "complete", current: 0, total: 0, bytes: 0 })
       const resolved = await ScopeContext.provide({ scope: Scope.home(), fn: () => Config.resolveExecution() })
       const requested = Experiment.applyRuntime(resolved, options.experiment?.runtime ?? {})
-      const shutdownTimeoutMs = configureExecution(requested)
-      const config = resolveExecutionConfiguration(requested)
+      const shutdownTimeoutMs = configureExecution(requested, options.mode)
+      const config = resolveExecutionConfiguration(requested, options.mode)
       Experiment.configureRuntime(config, options.experiment?.runtime)
       ScopeStartup.configure(options.mode)
       SessionManager.openAdmission()
@@ -194,6 +194,23 @@ export namespace RuntimeHandle {
       ObservabilityConfig.refresh(config)
       ObservabilityStore.open()
       ObservabilityResources.start()
+      if (options.mode === "server") {
+        // First-message latency: warm the execution pools and tokenizer while
+        // transport and resident services initialize, so the first turn or
+        // classification finds a ready worker instead of paying cold start.
+        AgentTurn.prewarm()
+        PolicyWorker.prewarm()
+        void ScopeContext.provide({
+          scope: Scope.home(),
+          fn: async () => {
+            const [{ Provider }, { Token }] = await Promise.all([
+              import("../provider/provider"),
+              import("../util/token"),
+            ])
+            await Token.warmup((await Provider.defaultModel()).modelID)
+          },
+        }).catch(() => undefined)
+      }
       services.reload?.start()
       ObservabilityStore.interruptRunningSpans({ reason: "previous_runtime_ended" })
       await ScopeContext.provide({
