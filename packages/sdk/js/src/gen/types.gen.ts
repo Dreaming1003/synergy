@@ -1713,6 +1713,8 @@ export type GlobalActivity = {
   backgroundJobs: number
 }
 
+export type SessionRecoveringReason = "workflow" | "incomplete-turn" | "pending-reply"
+
 export type SessionStatus =
   | {
       type: "idle"
@@ -1729,6 +1731,7 @@ export type SessionStatus =
     }
   | {
       type: "recovering"
+      reason?: SessionRecoveringReason
       description?: string
     }
 
@@ -2677,7 +2680,7 @@ export type ObservabilityConfig = {
        */
       maxSqliteBytes?: number
       /**
-       * Retain authoritative evidence for this long before budgeted pruning may remove it (default: 7 days, bounds 1 hour to 90 days); retention stays off until this is set
+       * Retain authoritative evidence for this long before budgeted pruning may remove it (default: 7 days, bounds 1 hour to 90 days; set 0 to disable). Pruning only runs while the database exceeds maxSqliteBytes.
        */
       retentionMs?: number
       walCheckpointIntervalMs?: number
@@ -4969,6 +4972,8 @@ export type SessionWorkingInfo =
     }
   | {
       status: "recovering"
+      reason?: SessionRecoveringReason
+      description?: string
     }
 
 export type SessionWorkspace = {
@@ -6635,6 +6640,25 @@ export type SessionForkPointMissingError = {
     messageID: string
     message: string
   }
+}
+
+export type SessionAbortResult = {
+  /**
+   * Runtime signal result; not_found/idle mean no running turn was stopped
+   */
+  outcome: "not_found" | "idle" | "signaled" | "already_stopping" | "not_owner"
+  /**
+   * An interrupted turn was terminalized
+   */
+  repaired: boolean
+  /**
+   * A driverless workflow was terminalized
+   */
+  abandoned: boolean
+  /**
+   * The session settled to idle
+   */
+  settled: boolean
 }
 
 export type AttachmentSourceText = {
@@ -14597,9 +14621,9 @@ export type SessionAbortError = SessionAbortErrors[keyof SessionAbortErrors]
 
 export type SessionAbortResponses = {
   /**
-   * Aborted session
+   * Abort result
    */
-  200: boolean
+  200: SessionAbortResult
 }
 
 export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]

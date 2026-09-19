@@ -478,6 +478,76 @@ function collectLegacyToolDisplayPartCandidates() {
   return collectPartCandidates(needsToolDisplayMigration)
 }
 
+/** A tool state still awaiting settlement. Shares MessageV2's classification so
+ * this migration and restore-time repair cannot drift apart. */
+function isNonTerminalToolState(state: unknown): boolean {
+  const status = asRecord(state)?.status
+  return status === "pending" || status === "generating" || status === "running"
+}
+
+/**
+ * Settle tool parts left non-terminal on an already-terminal assistant message.
+ *
+ * A process that ends mid-call can persist the part in `running` while the
+ * owning message is terminal, leaving a permanent spinner that contradicts the
+ * rollout ledger's interrupted record. Only the contradictory pair is touched:
+ * a non-terminal part on a non-terminal message is a genuinely unfinished turn,
+ * which SessionInvoke repair owns.
+ */
+async function migrateOrphanedToolParts(progress: (current: number, total: number) => void) {
+  const candidates: Array<{ key: string[]; part: Record<string, unknown> }> = []
+  for await (const record of Storage.records<unknown>({ kind: "part" })) {
+    const part = asRecord(record.value)
+    if (!part || part.type !== "tool") continue
+    if (!isNonTerminalToolState(part.state)) continue
+    candidates.push({ key: [...record.key], part })
+  }
+  // Report the scanned total even when there is nothing to rewrite, so a
+  // progress reporter shows a completed pass rather than silence.
+  progress(0, candidates.length)
+  if (candidates.length === 0) return
+
+  let done = 0
+  let settled = 0
+  for (const { key, part } of candidates) {
+    try {
+      const [, scopeID, sessionID, , messageID] = key
+      const info = await Storage.read<MessageV2.Info>(
+        StoragePath.messageInfo(
+          Identifier.asScopeID(scopeID),
+          Identifier.asSessionID(sessionID),
+          Identifier.asMessageID(messageID),
+        ),
+      ).catch(() => undefined)
+      if (info?.role !== "assistant" || !SessionProgress.isTerminalAssistant(info)) {
+        done++
+        progress(done, candidates.length)
+        continue
+      }
+      const state = asRecord(part.state)!
+      const input = asRecord(state.input) ?? {}
+      const metadata = asRecord(state.metadata)
+      const start = typeof asRecord(state.time)?.start === "number" ? (state.time as { start: number }).start : 0
+      await Storage.write(key, {
+        ...part,
+        state: {
+          status: "error",
+          input,
+          error: MessageV2.INTERRUPTED_TOOL_ERROR,
+          ...(metadata ? { metadata } : {}),
+          time: { start: start || info.time.created, end: info.time.completed ?? info.time.created },
+        },
+      })
+      settled++
+    } catch (error) {
+      log.warn("failed to settle orphaned tool part", { key: key.join("/"), error: String(error) })
+    }
+    done++
+    progress(done, candidates.length)
+  }
+  log.info("orphaned tool part migration complete", { candidates: candidates.length, settled })
+}
+
 async function migrateSessionAttachmentParts(progress: (current: number, total: number) => void) {
   const tasks = await collectLegacyAttachmentPartCandidates()
   if (tasks.length === 0) return
@@ -2160,6 +2230,13 @@ export const migrations: Migration[] = [
         if (done % 128 === 0) progress?.(done, 0)
       }
       progress?.(done, done)
+    },
+  },
+  {
+    id: "20260919-settle-orphaned-tool-parts",
+    description: "Settle tool parts left running on terminal assistant messages by an interrupted runtime",
+    async up(progress) {
+      await migrateOrphanedToolParts(progress)
     },
   },
 ]
