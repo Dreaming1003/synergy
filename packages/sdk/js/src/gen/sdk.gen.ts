@@ -6500,6 +6500,7 @@ export class Domain extends HeyApiClient {
         | "library"
         | "mcp"
         | "skills"
+        | "worktree"
         | "voice"
       directory?: string
       scopeID?: string
@@ -6549,6 +6550,7 @@ export class Domain extends HeyApiClient {
         | "library"
         | "mcp"
         | "skills"
+        | "worktree"
         | "voice"
       directory?: string
       scopeID?: string
@@ -6605,6 +6607,7 @@ export class Domain extends HeyApiClient {
         | "library"
         | "mcp"
         | "skills"
+        | "worktree"
         | "voice"
       directory?: string
       scopeID?: string
@@ -6862,6 +6865,7 @@ export class Config extends HeyApiClient {
         | "library"
         | "mcp"
         | "skills"
+        | "worktree"
         | "voice"
         | Array<
             | "general"
@@ -6880,6 +6884,7 @@ export class Config extends HeyApiClient {
             | "library"
             | "mcp"
             | "skills"
+            | "worktree"
             | "voice"
           >
       includeSecrets?: string
