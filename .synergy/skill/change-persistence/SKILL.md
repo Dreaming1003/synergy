@@ -29,6 +29,8 @@ description: Add or modify Synergy durable state, JSON storage keys, SQLite tabl
 
 Background maintenance may update session metadata without representing conversation activity. Carry the owning session mutation's activity-preservation option through cleanup helpers, retaining canonical activity timestamps as well as navigation `lastActivityAt` while publishing changed metadata. Test normal reclamation, missing-resource reconciliation and navigation index reconstruction with real session records, and verify new conversation activity still advances recency.
 
+When changing worker liveness or shutdown, close a real worker while a blocking query has entered its busy state. Verify probing exits within the teardown budget and deliberate shutdown emits no terminal-unavailability notification. Recheck driver and request ownership after awaited probes; a closed driver can make retries resolve immediately and starve shutdown timers.
+
 ### SQLite and other domain stores
 
 1. Keep fresh-install schema creation in the owning database initialization.
@@ -102,3 +104,7 @@ Replay committed journal evidence in bounded reads at a captured revision. Test 
 Use a released writer fixture and its actual completion ledger when changing migration eligibility; deriving the fixture ledger from the current registry hides newly introduced barriers. Verify the qualified dependency graph before executing work. Keep unpublished owners behind the central SQL admission fence, and publish derived indexes with the admission marker in one transaction. Test source drift, publication rollback, process reopen, pinned-pack garbage collection and copied-backup recovery without the original Home. A Git fixture must exercise real absolute alternates and empty repository directories.
 
 Keep foreground preparation distinct from background controls. Never pause a job while it holds a lease needed by foreground work: cancel through its durable checkpoint and release the lease before retrying. Report runtime readiness, historical convergence and independent backup completeness independently. Full VACUUM belongs to an explicit maintenance window; necessary long engine operations must expose their finite budget, with duplicate announcements unable to renew it.
+
+For resumable multi-table rewrites, test capacity preflight with metadata-heavy fixtures at the initial phase and an intermediate phase. Count every table still ahead of the cursor, not only the table currently being copied. When combining storage migrations, verify both released-writer startup admission and deferred maintenance dependencies: a format rewrite must not accidentally stage all historical owners or run before its prerequisite conversion.
+
+When adding a bulk variant of a storage operation, exercise every supported namespace encoding and a batch boundary. Preserve admission, revision fences, rollback, and structural cleanup from the single-record path; successful SQL execution alone does not prove that encoded keys matched rows.
