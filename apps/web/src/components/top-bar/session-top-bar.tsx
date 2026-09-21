@@ -11,6 +11,7 @@ import { archiveSessionConfirm, leaveWorktreeConfirm } from "@/components/dialog
 import { DialogSessionExport } from "@/components/dialog/dialog-session-export"
 import { DialogSessionImport } from "@/components/dialog/dialog-session-import"
 import { useLayout } from "@/context/layout"
+import { useGlobalSDK } from "@/context/global-sdk"
 import { useLocal } from "@/context/local"
 import { useCommand } from "@/context/command"
 import { useSessionDataView } from "@/context/session-data-view"
@@ -33,6 +34,7 @@ import {
 import { copySessionID } from "@/utils/session-copy"
 import "./session-top-bar.css"
 import { SlotOutlet } from "@/plugin/slot-outlet"
+import { SessionTagMenu } from "@/components/session/session-tag-menu"
 
 function SessionActionMenu(props: {
   visibility: ReturnType<typeof sessionActionVisibility>
@@ -44,6 +46,9 @@ function SessionActionMenu(props: {
   onExport: () => void
   onImport: () => void
   onArchive: () => void
+  tags: string[]
+  availableTags: string[]
+  onTagsChange: (tags: string[]) => void
 }) {
   const [open, setOpen] = createSignal(false)
   const { _ } = useLingui()
@@ -95,6 +100,13 @@ function SessionActionMenu(props: {
             <Icon name={getSemanticIcon("action.copy")} size="small" />
             <span>{_(topBar.copySessionID)}</span>
           </button>
+        </Show>
+        <Show when={props.visibility.menu}>
+          <SessionTagMenu
+            tags={props.tags}
+            availableTags={props.availableTags}
+            onChange={props.onTagsChange}
+          />
         </Show>
         <Show when={props.visibility.worktree}>
           <button
@@ -151,6 +163,7 @@ export function SessionTopBar(props: {
   const dialog = useDialog()
   const confirm = useConfirm()
   const layout = useLayout()
+  const globalSDK = useGlobalSDK()
   const local = useLocal()
   const command = useCommand()
   const sync = useSync()
@@ -168,6 +181,18 @@ export function SessionTopBar(props: {
   const projectPath = createMemo(() => directory())
 
   const sessionInfo = createMemo(() => (params.id ? sync.session.get(params.id) : undefined))
+  const availableSessionTags = createMemo(() => {
+    const tags = new Set(sessionInfo()?.tags ?? [])
+    const entries = [
+      ...layout.nav.recentEntries(),
+      ...layout.nav.rootNavEntries("home"),
+      ...layout.nav.rootNavEntries("channel"),
+      ...layout.nav.rootNavEntries("background"),
+      ...layout.scopes.list().flatMap((scope) => layout.nav.projectNavEntries(scope)),
+    ]
+    for (const entry of entries) for (const tag of entry.tags ?? []) tags.add(tag)
+    return [...tags].sort()
+  })
   const sessionDirectory = createMemo(() => sessionInfo()?.scope.directory ?? directory())
   const isWorktreeSession = createMemo(() => sessionInfo()?.workspace?.type === "git_worktree")
   const worktreeDisabled = createMemo(() =>
@@ -339,6 +364,17 @@ export function SessionTopBar(props: {
               onExport={() => dialog.show(() => <DialogSessionExport />)}
               onImport={() => dialog.show(() => <DialogSessionImport />)}
               onArchive={archiveSession}
+              tags={sessionInfo()?.tags ?? []}
+              availableTags={availableSessionTags()}
+              onTagsChange={(tags) => {
+                const session = sessionInfo()
+                if (!session) return
+                void globalSDK.client.session.update({
+                  ...sessionScopeRequestFor(session),
+                  sessionID: session.id,
+                  tags,
+                })
+              }}
             />
           </Show>
         </div>
@@ -371,6 +407,17 @@ export function SessionTopBar(props: {
               onExport={() => dialog.show(() => <DialogSessionExport />)}
               onImport={() => dialog.show(() => <DialogSessionImport />)}
               onArchive={archiveSession}
+              tags={sessionInfo()?.tags ?? []}
+              availableTags={availableSessionTags()}
+              onTagsChange={(tags) => {
+                const session = sessionInfo()
+                if (!session) return
+                void globalSDK.client.session.update({
+                  ...sessionScopeRequestFor(session),
+                  sessionID: session.id,
+                  tags,
+                })
+              }}
             />
           </Show>
           <Tooltip

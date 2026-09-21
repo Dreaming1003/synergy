@@ -148,6 +148,7 @@ const BaseInfo = z.preprocess(
       })
       .optional(),
     category: z.enum(["project", "home", "channel", "background", "github"]).optional(),
+    tags: z.array(z.string().trim().min(1).max(40)).max(20).default([]),
     provenance: z.literal("github").optional(),
     endpoint: SessionEndpoint.Info.optional(),
     summary: z

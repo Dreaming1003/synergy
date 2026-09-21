@@ -10,6 +10,7 @@ import { sessionActionVisibility } from "@/components/session/session-actions"
 import { SessionDraftBadge } from "@/components/sidebar/session-draft-badge"
 import { sidebar } from "@/locales/messages"
 import { HOME_SCOPE_KEY } from "@/utils/scope"
+import { SessionTagMenu } from "@/components/session/session-tag-menu"
 
 export interface SessionRowProps {
   session: Session
@@ -26,6 +27,8 @@ export interface SessionRowProps {
   onTogglePin: () => void
   onArchive: () => void
   onRename: (title: string) => void
+  availableTags?: string[]
+  onTagsChange?: (tags: string[]) => void
   onSelectChild?: (session: Session) => void
 }
 
@@ -85,6 +88,9 @@ function ActionMenu(props: {
   onTogglePin: () => void
   onRename: () => void
   onArchive: () => void
+  tags: string[]
+  availableTags: string[]
+  onTagsChange?: (tags: string[]) => void
 }) {
   const { i18n } = useLocale()
   const [open, setOpen] = createSignal(false)
@@ -125,6 +131,13 @@ function ActionMenu(props: {
               <Icon name={getSemanticIcon("action.rename")} size="small" class="text-icon-weak-base" />
               {i18n._(AP.scopesSessionRename.id)}
             </button>
+          </Show>
+          <Show when={props.onTagsChange}>
+            <SessionTagMenu
+              tags={props.tags}
+              availableTags={props.availableTags}
+              onChange={props.onTagsChange!}
+            />
           </Show>
           <Show when={props.archive}>
             <button
@@ -288,6 +301,15 @@ export function SessionRow(props: SessionRowProps) {
           </Show>
         </div>
 
+        <Show when={props.session.tags?.length}>
+          <span
+            class="text-10-medium text-text-interactive-base shrink-0 max-w-[35%] overflow-hidden text-ellipsis whitespace-nowrap"
+            title={props.session.tags?.map((tag) => `#${tag}`).join(" ")}
+          >
+            {props.session.tags?.map((tag) => `#${tag}`).join(" ")}
+          </span>
+        </Show>
+
         {/* Child session badge with popover */}
         <Show when={props.childCount && props.childCount > 0}>
           <ChildSessionBadge
@@ -309,6 +331,9 @@ export function SessionRow(props: SessionRowProps) {
             onTogglePin={props.onTogglePin}
             onRename={startRename}
             onArchive={props.onArchive}
+            tags={props.session.tags ?? []}
+            availableTags={props.availableTags ?? []}
+            onTagsChange={props.onTagsChange}
           />
         </div>
       </div>

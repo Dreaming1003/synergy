@@ -3126,6 +3126,14 @@
           },
           {
             "in": "query",
+            "name": "tag",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "in": "query",
             "name": "search",
             "schema": {
               "type": "string"
@@ -6419,6 +6427,14 @@
           },
           {
             "in": "query",
+            "name": "tag",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "in": "query",
             "name": "parentOnly",
             "schema": {
               "type": "string",
@@ -6827,6 +6843,15 @@
               "type": "boolean"
             },
             "description": "Only include pinned sessions"
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Filter sessions by tag"
           },
           {
             "in": "query",
@@ -7285,6 +7310,15 @@
                 "properties": {
                   "title": {
                     "type": "string"
+                  },
+                  "tags": {
+                    "maxItems": 20,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 40
+                    }
                   },
                   "pinned": {
                     "type": "number"
@@ -32026,6 +32060,12 @@
           "title": {
             "type": "string"
           },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "category": {
             "type": "string",
             "enum": ["project", "home", "channel", "background", "github"]
@@ -38867,6 +38907,16 @@
           "category": {
             "type": "string",
             "enum": ["project", "home", "channel", "background", "github"]
+          },
+          "tags": {
+            "default": [],
+            "maxItems": 20,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 40
+            }
           },
           "provenance": {
             "type": "string",

@@ -2005,6 +2005,7 @@ export class Session extends HeyApiClient {
       directory?: string
       scopeID?: string
       category?: "project" | "home" | "channel" | "background" | "github"
+      tag?: string
       parentOnly?: "true" | "false"
       includeArchived?: "true" | "false"
       limit?: number
@@ -2021,6 +2022,7 @@ export class Session extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "scopeID" },
             { in: "query", key: "category" },
+            { in: "query", key: "tag" },
             { in: "query", key: "parentOnly" },
             { in: "query", key: "includeArchived" },
             { in: "query", key: "limit" },
@@ -2154,6 +2156,7 @@ export class Session extends HeyApiClient {
       since?: number
       before?: number
       pinned?: boolean
+      tag?: string
       parentOnly?: boolean
     },
     options?: Options<never, ThrowOnError>,
@@ -2171,6 +2174,7 @@ export class Session extends HeyApiClient {
             { in: "query", key: "since" },
             { in: "query", key: "before" },
             { in: "query", key: "pinned" },
+            { in: "query", key: "tag" },
             { in: "query", key: "parentOnly" },
           ],
         },
@@ -2337,6 +2341,7 @@ export class Session extends HeyApiClient {
       directory?: string
       scopeID?: string
       title?: string
+      tags?: Array<string>
       pinned?: number
       controlProfile?: "guarded" | "autonomous" | "full_access"
       resolvePendingPermissions?: boolean
@@ -2362,6 +2367,7 @@ export class Session extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "scopeID" },
             { in: "body", key: "title" },
+            { in: "body", key: "tags" },
             { in: "body", key: "pinned" },
             { in: "body", key: "controlProfile" },
             { in: "body", key: "resolvePendingPermissions" },
@@ -3719,6 +3725,7 @@ export class Nav extends HeyApiClient {
       includeArchived?: boolean
       category?: "project" | "home" | "channel" | "background" | "github"
       channelType?: string
+      tag?: string
       search?: string
       limit?: number
       cursorLastActivityAt?: number
@@ -3735,6 +3742,7 @@ export class Nav extends HeyApiClient {
             { in: "query", key: "includeArchived" },
             { in: "query", key: "category" },
             { in: "query", key: "channelType" },
+            { in: "query", key: "tag" },
             { in: "query", key: "search" },
             { in: "query", key: "limit" },
             { in: "query", key: "cursorLastActivityAt" },

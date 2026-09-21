@@ -1710,6 +1710,7 @@ export type SessionNavEntry = {
   scopeID: string
   scopeType: "home" | "project"
   title: string
+  tags?: Array<string>
   category: "project" | "home" | "channel" | "background" | "github"
   lastActivityAt: number
   createdAt?: number
@@ -4993,6 +4994,7 @@ export type Session = {
     title?: string
   }
   category?: "project" | "home" | "channel" | "background" | "github"
+  tags?: Array<string>
   provenance?: "github"
   endpoint?: SessionEndpoint
   summary?: {
@@ -12110,6 +12112,7 @@ export type GlobalNavRecentData = {
     includeArchived?: boolean
     category?: "project" | "home" | "channel" | "background" | "github"
     channelType?: string
+    tag?: string
     search?: string
     limit?: number
     cursorLastActivityAt?: number
@@ -13739,6 +13742,7 @@ export type SessionIndexData = {
     directory?: string
     scopeID?: string
     category?: "project" | "home" | "channel" | "background" | "github"
+    tag?: string
     parentOnly?: "true" | "false"
     includeArchived?: "true" | "false"
     limit?: number
@@ -13913,6 +13917,10 @@ export type SessionListData = {
      * Only include pinned sessions
      */
     pinned?: boolean
+    /**
+     * Filter sessions by tag
+     */
+    tag?: string
     /**
      * Only include top-level sessions (exclude subsessions). Default: true
      */
@@ -14098,6 +14106,7 @@ export type SessionGetResponse = SessionGetResponses[keyof SessionGetResponses]
 export type SessionUpdateData = {
   body?: {
     title?: string
+    tags?: Array<string>
     pinned?: number
     controlProfile?: "guarded" | "autonomous" | "full_access"
     resolvePendingPermissions?: boolean

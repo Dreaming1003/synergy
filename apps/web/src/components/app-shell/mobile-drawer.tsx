@@ -21,7 +21,7 @@ import type { Session } from "@ericsanchezok/synergy-sdk/client"
 import { getSemanticIcon, type SemanticIconTokenName } from "@ericsanchezok/synergy-ui/semantic-icon"
 import type { MessageDescriptor } from "@lingui/core"
 import { useLingui } from "@lingui/solid"
-import { appShell, sidebar } from "@/locales/messages"
+import { appShell, sessionTags, sidebar } from "@/locales/messages"
 import { useDialog } from "@ericsanchezok/synergy-ui/context/dialog"
 import { SettingsDialog } from "@/components/settings"
 import { useProjectDirectoryPicker } from "@/components/dialog/project-directory-picker"
@@ -415,19 +415,25 @@ function SessionListDrawerView(props: {
   const [loading, setLoading] = createSignal(false)
   const [pagedSessions, setPagedSessions] = createSignal<Session[]>([])
   const [pagedTotal, setPagedTotal] = createSignal(0)
+  const [tagFilter, setTagFilter] = createSignal<string | undefined>()
 
   const allSessions = createMemo(() => layout.nav.projectSessions(props.scope))
   const childStore = createMemo(() => layout.nav.childStoreForScope(props.scope))
   const totalPages = createMemo(() => Math.max(1, Math.ceil(pagedTotal() / SESSION_PAGE_SIZE)))
+  const availableTags = createMemo(() => {
+    const tags = new Set<string>()
+    for (const session of [...allSessions(), ...pagedSessions()]) for (const tag of session.tags ?? []) tags.add(tag)
+    return [...tags].sort()
+  })
 
   const scopeName = createMemo(() => getScopeLabel(props.scope))
 
-  function fetchPage(page: number) {
+  function fetchPage(page: number, filter = tagFilter()) {
     setLoading(true)
     const offset = (page - 1) * SESSION_PAGE_SIZE
     const sdk = createSynergyClient({ baseUrl: globalSDK.url, directory: props.scope.worktree, throwOnError: true })
     sdk.session
-      .list({ offset, limit: SESSION_PAGE_SIZE })
+      .list({ offset, limit: SESSION_PAGE_SIZE, ...(filter ? { tag: filter } : {}) })
       .then((x) => {
         const result = x.data!
         setPagedSessions((result.data ?? []).filter((s) => !!s?.id && !s.time?.archived))
@@ -442,6 +448,12 @@ function SessionListDrawerView(props: {
     if (page < 1 || page > totalPages()) return
     setCurrentPage(page)
     fetchPage(page)
+  }
+
+  function selectTag(tag: string | undefined) {
+    setTagFilter(tag)
+    setCurrentPage(1)
+    fetchPage(1, tag)
   }
 
   function getSessionState(session: Session) {
@@ -503,6 +515,31 @@ function SessionListDrawerView(props: {
         <span>{_(appShell.newSession)}</span>
       </button>
 
+      <Show when={availableTags().length > 0}>
+        <div class="flex items-center gap-1.5 px-3 pb-2 overflow-x-auto">
+          <button
+            type="button"
+            class="shrink-0 px-2 py-1 rounded-md text-11-medium border border-border-base/50 cursor-pointer"
+            classList={{ "text-text-interactive-base bg-surface-info-base/15": !tagFilter(), "text-text-weak": !!tagFilter() }}
+            onClick={() => selectTag(undefined)}
+          >
+            {_(sessionTags.all)}
+          </button>
+          <For each={availableTags()}>
+            {(tag) => (
+              <button
+                type="button"
+                class="shrink-0 px-2 py-1 rounded-md text-11-medium border border-border-base/50 cursor-pointer"
+                classList={{ "text-text-interactive-base bg-surface-info-base/15": tagFilter() === tag, "text-text-weak": tagFilter() !== tag }}
+                onClick={() => selectTag(tag)}
+              >
+                #{tag}
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+
       <Show when={childStore()}>
         {(store) => (
           <ActiveZone
@@ -537,6 +574,15 @@ function SessionListDrawerView(props: {
                     title,
                   })
                 }
+                availableTags={availableTags()}
+                onTagsChange={async (tags) => {
+                  await globalSDK.client.session.update({
+                    ...sessionScopeRequestFor(session),
+                    sessionID: session.id,
+                    tags,
+                  })
+                  setPagedSessions((items) => items.map((item) => (item.id === session.id ? { ...item, tags } : item)))
+                }}
               />
             )
           }}

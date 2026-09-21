@@ -10,6 +10,7 @@ const SessionNavQuery = z
   .object({
     scopeID: z.string().optional(),
     category: NavCategory.optional(),
+    tag: z.string().trim().min(1).optional(),
     parentOnly: booleanQuery.optional(),
     includeArchived: booleanQuery.optional().default(false),
     limit: z.coerce.number().int().min(1).max(200).optional().default(20),
@@ -49,6 +50,7 @@ export const SessionNavRoute = new Hono().get(
     const result = await SessionNav.queryScope(targetScopeID, {
       parentOnly: query.parentOnly,
       category: query.category,
+      tag: query.tag,
       includeArchived: query.includeArchived,
       cursor: query.cursor,
       limit: query.limit,

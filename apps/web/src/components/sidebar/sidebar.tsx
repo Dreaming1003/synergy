@@ -15,7 +15,7 @@ import { useLingui } from "@lingui/solid"
 import { Tooltip } from "@ericsanchezok/synergy-ui/tooltip"
 import { showToast } from "@ericsanchezok/synergy-ui/toast"
 import { ResizeHandle } from "@ericsanchezok/synergy-ui/resize-handle"
-import { sidebar } from "@/locales/messages"
+import { sessionTags, sidebar } from "@/locales/messages"
 import { BRAND_ASSETS, brandAssetPath, holosLogoPath } from "@/utils/brand-assets"
 import { base64Encode } from "@ericsanchezok/synergy-util/encode"
 import { getScopeLabel } from "@/utils/scope"
@@ -143,6 +143,9 @@ export function Sidebar(props: SidebarProps) {
   }
 
   const [recentSectionOpen, setRecentSectionOpen] = createSignal(true)
+  const [tagFilter, setTagFilter] = createSignal<string>()
+  const [tagSearch, setTagSearch] = createSignal("")
+  const [tagPickerOpen, setTagPickerOpen] = createSignal(false)
   const [acknowledgingCompletions, setAcknowledgingCompletions] = createSignal(false)
 
   const acknowledgeAllCompletions = async () => {
@@ -189,9 +192,38 @@ export function Sidebar(props: SidebarProps) {
   onCleanup(subscribeNavigation(() => setNavigationRegistryVersion((version) => version + 1)))
   const hasExpandedProject = createMemo(() => scopes().some((s) => s.expanded))
   const channelEntries = createMemo(() => layout.nav.rootNavEntries("channel"))
+  const allLoadedEntries = createMemo(() => [
+    ...recentEntries(),
+    ...layout.nav.rootNavEntries("home"),
+    ...layout.nav.rootNavEntries("channel"),
+    ...layout.nav.rootNavEntries("background"),
+    ...scopes().flatMap((scope) => layout.nav.projectNavEntries(scope)),
+  ])
+  const availableTags = createMemo(() => {
+    const tags = new Set<string>()
+    for (const entry of allLoadedEntries()) for (const tag of entry.tags ?? []) tags.add(tag)
+    return [...tags].sort()
+  })
+  const filteredTags = createMemo(() => {
+    const query = tagSearch().trim().toLowerCase()
+    return availableTags().filter((tag) => !query || tag.toLowerCase().includes(query))
+  })
+  createEffect(() => {
+    if (!tagPickerOpen()) return
+    const close = (event: MouseEvent) => {
+      const target = event.target
+      if (target instanceof Element && !target.closest(".sb-session-tag-filter")) setTagPickerOpen(false)
+    }
+    document.addEventListener("click", close)
+    onCleanup(() => document.removeEventListener("click", close))
+  })
+  const filterEntries = (entries: NavEntry[]) => {
+    const tag = tagFilter()
+    return tag ? entries.filter((entry) => entry.tags?.includes(tag)) : entries
+  }
 
   const channelGroupedEntries = createMemo(() => {
-    const entries = channelEntries()
+    const entries = filterEntries(channelEntries())
     const groups = new Map<string, NavEntry[]>()
     let orphanSessions: NavEntry[] = []
 
@@ -489,6 +521,65 @@ export function Sidebar(props: SidebarProps) {
         }
       >
         <div class="sb-scroll">
+          <Show when={availableTags().length > 0}>
+            <div class="sb-session-tag-filter" onClick={(event) => event.stopPropagation()}>
+              <Icon name={getSemanticIcon("notes.tag")} size="small" class="text-icon-weak-base" />
+              <input
+                type="search"
+                aria-label={_(sessionTags.tags)}
+                placeholder={tagFilter() ? `#${tagFilter()}` : _(sessionTags.tags)}
+                value={tagSearch()}
+                onFocus={() => setTagPickerOpen(true)}
+                onInput={(event) => {
+                  setTagSearch(event.currentTarget.value)
+                  setTagPickerOpen(true)
+                }}
+              />
+              <Show when={tagFilter()}>
+                <button
+                  type="button"
+                  class="sb-session-tag-filter-clear"
+                  aria-label={_(sessionTags.all)}
+                  onClick={() => {
+                    setTagFilter(undefined)
+                    setTagSearch("")
+                  }}
+                >
+                  <Icon name={getSemanticIcon("action.close")} size="small" />
+                </button>
+              </Show>
+              <Show when={tagPickerOpen()}>
+                <div class="sb-session-tag-options">
+                  <button
+                    type="button"
+                    classList={{ "sb-session-tag-option": true, "sb-session-tag-option-active": !tagFilter() }}
+                    onClick={() => {
+                      setTagFilter(undefined)
+                      setTagSearch("")
+                      setTagPickerOpen(false)
+                    }}
+                  >
+                    {_(sessionTags.all)}
+                  </button>
+                  <For each={filteredTags()}>
+                    {(tag) => (
+                      <button
+                        type="button"
+                        classList={{ "sb-session-tag-option": true, "sb-session-tag-option-active": tagFilter() === tag }}
+                        onClick={() => {
+                          setTagFilter(tag)
+                          setTagSearch("")
+                          setTagPickerOpen(false)
+                        }}
+                      >
+                        #{tag}
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+          </Show>
           <Show
             when={layout.nav.scopeIndexLoaded()}
             fallback={
@@ -532,7 +623,7 @@ export function Sidebar(props: SidebarProps) {
                   fallback={<div class="sb-section-empty">{_(sidebar.noRecentSessions)}</div>}
                 >
                   <SidebarSessionList
-                    entries={recentEntries()}
+                    entries={filterEntries(recentEntries())}
                     activeID={params.id}
                     onSessionClick={handleNavEntryClick}
                   />
@@ -550,7 +641,7 @@ export function Sidebar(props: SidebarProps) {
               title={_(sidebar.home)}
               open={homeSectionOpen}
               onToggle={() => setHomeSectionOpen((v) => !v)}
-              entries={layout.nav.rootNavEntries("home")}
+              entries={filterEntries(layout.nav.rootNavEntries("home"))}
               hasMore={layout.nav.hasMoreRootNavSection("home")}
               onLoadMore={() => layout.nav.loadMoreRootNavSection("home")}
               activeID={params.id}
@@ -655,7 +746,7 @@ export function Sidebar(props: SidebarProps) {
                               currentDirectory={currentDirectory()}
                               isSupplemental={(scope) => layout.scopes.isSupplemental(scope)}
                               navLoaded={(scope) => !!layout.nav.navEntries()[scope.worktree]}
-                              projectNavEntries={(scope) => layout.nav.projectNavEntries(scope)}
+                              projectNavEntries={(scope) => filterEntries(layout.nav.projectNavEntries(scope))}
                               hasMoreForProject={hasMoreForProject}
                               managedProject={project.managedProject}
                               onProjectToggle={handleProjectToggle}
@@ -684,7 +775,7 @@ export function Sidebar(props: SidebarProps) {
               title={_(sidebar.background)}
               open={backgroundSectionOpen}
               onToggle={() => setBackgroundSectionOpen((v) => !v)}
-              entries={layout.nav.rootNavEntries("background")}
+              entries={filterEntries(layout.nav.rootNavEntries("background"))}
               hasMore={layout.nav.hasMoreRootNavSection("background")}
               onLoadMore={() => layout.nav.loadMoreRootNavSection("background")}
               activeID={params.id}
@@ -742,7 +833,7 @@ export function Sidebar(props: SidebarProps) {
                         currentDirectory={currentDirectory()}
                         isSupplemental={(scope) => layout.scopes.isSupplemental(scope)}
                         navLoaded={(scope) => !!layout.nav.navEntries()[scope.worktree]}
-                        projectNavEntries={(scope) => layout.nav.projectNavEntries(scope)}
+                        projectNavEntries={(scope) => filterEntries(layout.nav.projectNavEntries(scope))}
                         hasMoreForProject={hasMoreForProject}
                         onProjectToggle={handleProjectToggle}
                         onProjectClick={handleProjectClick}
@@ -779,7 +870,7 @@ export function Sidebar(props: SidebarProps) {
           <div class="sb-flyout-header">{_(sidebar.projectsFlyout)}</div>
           <For each={scopes()}>
             {(scope) => {
-              const sessions = createMemo(() => layout.nav.projectNavEntries(scope))
+              const sessions = createMemo(() => filterEntries(layout.nav.projectNavEntries(scope)))
               return (
                 <div class="sb-flyout-project-group">
                   <button
@@ -1257,8 +1348,13 @@ function SidebarSessionRow(props: {
       </span>
       <SessionDraftBadge sessionID={props.entry.id} label={_(sidebar.draftBadge)} />
       <span class={props.flyout ? "sb-flyout-session-title" : "sb-session-title"}>
-        {props.entry.title || _(sidebar.untitled)}
+        <span class="sb-session-title-text">{props.entry.title || _(sidebar.untitled)}</span>
       </span>
+      <Show when={props.entry.tags?.length}>
+        <span class="sb-session-tags" title={props.entry.tags?.map((tag) => `#${tag}`).join(" ")}>
+          {props.entry.tags?.map((tag) => `#${tag}`).join(" ")}
+        </span>
+      </Show>
     </button>
   )
 }

@@ -4549,11 +4549,11 @@ msgstr ""
 msgid "app.note.blueprint.pluginOwner"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.runMode.active"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.runMode.new"
 msgstr ""
 
@@ -4561,19 +4561,19 @@ msgstr ""
 msgid "app.note.blueprint.runMode.session"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.runMode.worktree"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.state.label"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.state.lastRunFailed"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.state.noActiveRun"
 msgstr ""
 
@@ -4585,27 +4585,27 @@ msgstr ""
 msgid "app.note.blueprint.status.armed"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.status.auditing"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.status.cancelled"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.status.completed"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.status.failed"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.status.running"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.blueprint.status.waiting"
 msgstr ""
 
@@ -4725,31 +4725,31 @@ msgstr ""
 msgid "app.note.bubble.table.toggleHeaderRow"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.bulk.archive"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.bulk.cancel"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.bulk.delete"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.bulk.noNotesFound"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.bulk.refresh"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.bulk.restore"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.bulk.selectAll"
 msgstr ""
 
@@ -4757,7 +4757,7 @@ msgstr ""
 msgid "app.note.bulk.selected"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.bulk.selectNotes"
 msgstr ""
 
@@ -4765,31 +4765,31 @@ msgstr ""
 msgid "app.note.card.from"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.card.noRunsYet"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.card.noteCountLabel"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.card.runHistory"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.card.runsCount"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.detail.addTag"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.detail.addTags"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.detail.keepMine"
 msgstr ""
 
@@ -4797,15 +4797,15 @@ msgstr ""
 msgid "app.note.detail.lastActivity"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.detail.openSession"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.detail.overwriteRemote"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.detail.reloadRemote"
 msgstr ""
 
@@ -4813,47 +4813,47 @@ msgstr ""
 msgid "app.note.editor.backToList"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.convertToBlueprint"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.convertToNote"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.deleteNote"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.downloadMarkdown"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.downloadNote"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.global"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.local"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.makeGlobal"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.makeLocal"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.pin"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.pinnedState"
 msgstr ""
 
@@ -4865,15 +4865,15 @@ msgstr ""
 msgid "app.note.editor.slashHint"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.toBlueprint"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.toNote"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.editor.unpin"
 msgstr ""
 
@@ -4881,23 +4881,23 @@ msgstr ""
 msgid "app.note.filter.all"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.filter.blueprints"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.filter.notes"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.filter.showActive"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.filter.showArchived"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.agentUnavailable"
 msgstr ""
 
@@ -4905,103 +4905,103 @@ msgstr ""
 msgid "app.note.run.blueprint"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.chooseModel"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.currentSession"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.currentSessionDesc"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.currentSessionHint"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.executionAgent"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.executionAgentChooseHelp"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.label"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.model"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.modelChooseHelp"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.newSession"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.newSessionDesc"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.noAgentResults"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.noModelResults"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.searchAgents"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.searchModels"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.selectedAgentUnavailable"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.selectExecutionAgent"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.selectModel"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.useFallback"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.useFallbackDesc"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.withSelectedModel"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.worktreeDesc"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.worktreeHint"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.run.worktreeSession"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.separator.dot"
 msgstr ""
 
@@ -5101,55 +5101,55 @@ msgstr ""
 msgid "app.note.toolbar.back"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.backToAgent"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.backToSession"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.clearSearch"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.close"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.closeRunMenu"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.current"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.newNote"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.noNotes"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.notes"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.searchNotes"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.viewAll"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.toolbar.viewAllNotes"
 msgstr ""
 
-#. ── Note panel ───────────────────────────────────────────────────────────────
+#. js-lingui-explicit-id
 msgid "app.note.untitled"
 msgstr ""
 
@@ -13712,6 +13712,22 @@ msgstr ""
 
 #. subagent-dock.tsx
 msgid "session.subagent.toolsCount"
+msgstr ""
+
+#. ── Note panel ───────────────────────────────────────────────────────────────
+msgid "session.tags.all"
+msgstr ""
+
+#. ── Note panel ───────────────────────────────────────────────────────────────
+msgid "session.tags.create"
+msgstr ""
+
+#. ── Note panel ───────────────────────────────────────────────────────────────
+msgid "session.tags.filterOrCreate"
+msgstr ""
+
+#. ── Note panel ───────────────────────────────────────────────────────────────
+msgid "session.tags.menu"
 msgstr ""
 
 #. session-transition-card.tsx — generic transition card

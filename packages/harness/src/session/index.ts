@@ -298,6 +298,7 @@ export namespace Session {
       scopeID: scope.id,
       scopeType,
       title: session.title,
+      tags: session.tags,
       category,
       lastActivityAt: session.time.updated,
       createdAt: session.time.created,
@@ -398,6 +399,7 @@ export namespace Session {
       parentID?: string
       provenance?: Info["provenance"]
       title?: string
+      tags?: string[]
       permission?: PermissionNext.Ruleset
       controlProfile?: Info["controlProfile"]
       agentOverride?: Info["agentOverride"]
@@ -451,6 +453,7 @@ export namespace Session {
       forkedFrom: input?.forkedFrom,
       provenance: input?.provenance,
       category,
+      tags: [...new Set(input?.tags?.map((tag) => tag.trim()).filter(Boolean) ?? [])],
       title: input?.title ?? createDefaultTitle(!!input?.parentID),
       permission: input?.permission,
       controlProfile,
@@ -982,6 +985,7 @@ export namespace Session {
     before?: number
     pinned?: boolean
     parentOnly?: boolean
+    tag?: string
   }): Promise<ListResult> {
     const scopeID = asScopeID(ScopeContext.current.scope.id)
     const index = await readPageIndex(scopeID)
@@ -994,11 +998,18 @@ export namespace Session {
 
     // When searching, we must read all matching session infos first because
     // title-based search cannot be applied on the page index alone.
-    if (options?.search) {
+    if (options?.search || options?.tag) {
       const keys = entries.map((e) => StoragePath.sessionInfo(scopeID, asSessionID(e.id)))
       const sessions = await Storage.readMany<Info>(keys)
-      const term = options.search.toLowerCase()
-      const matched = sessions.filter((s): s is Info => s != null && !!s.scope && s.title.toLowerCase().includes(term))
+      const term = options.search?.toLowerCase()
+      const tag = options.tag?.trim()
+      const matched = sessions.filter(
+        (s): s is Info =>
+          s != null &&
+          !!s.scope &&
+          (!term || s.title.toLowerCase().includes(term)) &&
+          (!tag || s.tags?.includes(tag)),
+      )
       const total = matched.length
       const offset = options?.offset ?? 0
       const limit = options?.limit ?? total

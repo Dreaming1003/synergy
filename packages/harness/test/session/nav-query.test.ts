@@ -7,6 +7,29 @@ import { SessionNav } from "../../src/session/nav"
 import { tmpdir } from "../support/fixture"
 
 describe("SessionNav.queryGlobal", () => {
+  test("filters sessions by tag before pagination", async () => {
+    await using tmp = await tmpdir({ git: true })
+    const scope = await tmp.scope()
+    const token = `tag-before-pagination-${crypto.randomUUID()}`
+
+    await ScopeContext.provide({
+      scope,
+      fn: async () => {
+        const tagged = await Session.create({ title: `${token} tagged`, tags: ["focus"] })
+        await Session.create({ title: `${token} other`, tags: ["later"] })
+
+        const result = await SessionNav.queryScope(scope.id, { tag: "focus", limit: 1 })
+
+        expect(result.total).toBe(1)
+        expect(result.items).toMatchObject([{ id: tagged.id, tags: ["focus"] }])
+
+        await Session.remove(tagged.id)
+        const sessions = await Session.list({ limit: 100 })
+        for (const session of sessions.data) await Session.remove(session.id)
+      },
+    })
+  })
+
   test("filters by category before pagination", async () => {
     await using tmp = await tmpdir({ git: true })
     const scope = await tmp.scope()
