@@ -28,7 +28,7 @@ export interface SessionRowProps {
   onArchive: () => void
   onRename: (title: string) => void
   availableTags?: string[]
-  onTagsChange?: (tags: string[]) => void
+  onTagsChange?: (tags: string[]) => Promise<string[]>
   onSelectChild?: (session: Session) => void
 }
 
@@ -90,7 +90,7 @@ function ActionMenu(props: {
   onArchive: () => void
   tags: string[]
   availableTags: string[]
-  onTagsChange?: (tags: string[]) => void
+  onTagsChange?: (tags: string[]) => Promise<string[]>
 }) {
   const { i18n } = useLocale()
   const [open, setOpen] = createSignal(false)

@@ -1,4 +1,4 @@
-import z from "zod"
+import { z } from "zod"
 import { SessionSchemaRegistry } from "./schema-registry"
 
 export interface SessionExtensionShape {}
@@ -20,24 +20,15 @@ export function normalizeSessionTag(value: unknown): string | undefined {
 export const TagQuery = z
   .string()
   .trim()
-  .transform((value) => (value.startsWith("#") ? value.slice(1).trim() : value))
+  .transform((value) => value.replace(/^(?:#\s*)+/, ""))
   .pipe(z.string().min(1).max(SESSION_TAG_MAX_LENGTH))
   .meta({ ref: "SessionTagQuery" })
 
 export const Tags = z
-  .array(z.unknown())
+  .array(z.string())
   .transform((values, context) => {
     const tags: string[] = []
     values.forEach((value, index) => {
-      if (typeof value !== "string") {
-        context.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: [index],
-          message: "Session tags must be strings",
-        })
-        return
-      }
-
       const parsed = TagQuery.safeParse(value)
       if (!parsed.success) {
         const tooLong = parsed.error.issues.some((issue) => issue.code === z.ZodIssueCode.too_big)
@@ -143,14 +134,26 @@ export const HistoryInfo = z
   .meta({ ref: "SessionHistoryInfo" })
 export type HistoryInfo = z.infer<typeof HistoryInfo>
 
-/** Why a session reports `recovering`. Carried through to clients so a
- * recovery state is diagnosable instead of collapsing three unrelated causes
- * into one opaque status. `workflow`-caused recovery needs no data repair and
- * is the only reason a session can remain recovering indefinitely. */
-export const RecoveringReason = z
-  .enum(["workflow", "incomplete-turn", "pending-reply"])
-  .meta({ ref: "SessionRecoveringReason" })
-export type RecoveringReason = z.infer<typeof RecoveringReason>
+/** Why a session is `paused`. A pause is the single intermediate state for every
+ * abnormal end, so the reason carries the cause through to clients instead of
+ * collapsing unrelated failures into one opaque status. The session itself is
+ * the only pause authority; workflow state never produces one. */
+export const PausedReason = z
+  .enum(["aborted", "failed", "interrupted", "workflow"])
+  .meta({ ref: "SessionPausedReason" })
+export type PausedReason = z.infer<typeof PausedReason>
+
+/** The durable pause latch on a session. Present means the session is stopped
+ * mid-work and will not be driven again until the user continues, abandons, or
+ * sends new input. */
+export const PausedInfo = z
+  .object({
+    reason: PausedReason,
+    description: z.string().optional(),
+    since: z.number(),
+  })
+  .meta({ ref: "SessionPaused" })
+export type PausedInfo = z.infer<typeof PausedInfo>
 
 export const WorkingInfo = z
   .union([
@@ -165,9 +168,10 @@ export const WorkingInfo = z
       next: z.number(),
     }),
     z.object({
-      status: z.literal("recovering"),
-      reason: RecoveringReason.optional(),
+      status: z.literal("paused"),
+      reason: PausedReason,
       description: z.string().optional(),
+      since: z.number(),
     }),
   ])
   .meta({ ref: "SessionWorkingInfo" })
@@ -261,7 +265,7 @@ const BaseInfo = z.preprocess(
       .optional()
       .describe("Per-session model override set by /model command"),
     agentOverride: z.string().optional().describe("Per-session agent override set by session control"),
-    pendingReply: z.boolean().optional(),
+    paused: PausedInfo.optional(),
     interaction: SessionInteraction.Info.optional(),
     lastExchange: z
       .object({
@@ -305,9 +309,10 @@ export const StatusInfo = z
       description: z.string().optional(),
     }),
     z.object({
-      type: z.literal("recovering"),
-      reason: RecoveringReason.optional(),
+      type: z.literal("paused"),
+      reason: PausedReason,
       description: z.string().optional(),
+      since: z.number(),
     }),
   ])
   .meta({

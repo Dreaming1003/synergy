@@ -39,3 +39,5 @@ Full-array replacement gives updates deterministic semantics, but editors must p
 A newly typed label is available immediately on that session, while broader tag discovery reflects only the sessions loaded into the current Web UI view.
 
 Exact filtering keeps server-owned pagination semantics predictable and applies the membership test before cursor slicing in navigation routes.
+
+Tag filters query the global navigation index before pagination, including history outside loaded sidebar pages. Query changes cancel outstanding requests, metadata events override older query responses, and reconnect reloads the selected filter. Tag menus retain failed input and serialize saves against the last accepted tag list. Repeated leading hash markers normalize idempotently, and generated tag arrays retain their string element type.

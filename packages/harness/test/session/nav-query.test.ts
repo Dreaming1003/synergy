@@ -17,10 +17,12 @@ describe("SessionNav.queryGlobal", () => {
       fn: async () => {
         const tagged = await Session.create({
           title: `${token} tagged`,
-          tags: ["# focus", " focus", "focus"],
+          tags: ["## focus", " # # focus", "focus"],
         })
         await Session.create({ title: `${token} other`, tags: ["later"] })
 
+        expect(tagged.tags).toEqual(["focus"])
+        expect((await Session.get(tagged.id)).tags).toEqual(tagged.tags)
         expect(await Session.list({ tag: "#focus" })).toMatchObject({
           data: [expect.objectContaining({ id: tagged.id, tags: ["focus"] })],
           total: 1,
