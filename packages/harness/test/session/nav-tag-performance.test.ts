@@ -43,15 +43,12 @@ describe("SessionNav tag performance", () => {
             },
           }))
 
-          await Storage.write(
-            StoragePath.sessionNavIndex(scope.id),
-            {
-              version: 1,
-              scopeID: scope.id,
-              updatedAt: now,
-              entries,
-            },
-          )
+          await Storage.write(StoragePath.sessionNavIndex(scope.id), {
+            version: 1,
+            scopeID: scope.id,
+            updatedAt: now,
+            entries,
+          })
 
           // Warm up
           await SessionNav.queryScope(scope.id, {
@@ -73,15 +70,12 @@ describe("SessionNav tag performance", () => {
             times.push(performance.now() - start)
           }
 
-          const averageMs =
-            times.reduce((sum, value) => sum + value, 0) / times.length
+          const averageMs = times.reduce((sum, value) => sum + value, 0) / times.length
 
           const maxMs = Math.max(...times)
 
           expect(result).toBeDefined()
-          expect(result!.items.every((item) =>
-            item.tags?.includes("performance")
-          )).toBe(true)
+          expect(result!.items.every((item) => item.tags?.includes("performance"))).toBe(true)
 
           results.push({
             size,

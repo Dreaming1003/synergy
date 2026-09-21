@@ -4,11 +4,7 @@ import { Icon } from "@ericsanchezok/synergy-ui/icon"
 import { getSemanticIcon } from "@ericsanchezok/synergy-ui/semantic-icon"
 import { sessionTags } from "@/locales/messages"
 
-export function SessionTagMenu(props: {
-  tags: string[]
-  availableTags: string[]
-  onChange: (tags: string[]) => void
-}) {
+export function SessionTagMenu(props: { tags: string[]; availableTags: string[]; onChange: (tags: string[]) => void }) {
   const { _ } = useLingui()
   const [open, setOpen] = createSignal(false)
   const [query, setQuery] = createSignal("")

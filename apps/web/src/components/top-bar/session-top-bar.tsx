@@ -102,11 +102,7 @@ function SessionActionMenu(props: {
           </button>
         </Show>
         <Show when={props.visibility.menu}>
-          <SessionTagMenu
-            tags={props.tags}
-            availableTags={props.availableTags}
-            onChange={props.onTagsChange}
-          />
+          <SessionTagMenu tags={props.tags} availableTags={props.availableTags} onChange={props.onTagsChange} />
         </Show>
         <Show when={props.visibility.worktree}>
           <button

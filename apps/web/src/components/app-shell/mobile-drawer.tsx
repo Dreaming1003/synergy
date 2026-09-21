@@ -520,7 +520,10 @@ function SessionListDrawerView(props: {
           <button
             type="button"
             class="shrink-0 px-2 py-1 rounded-md text-11-medium border border-border-base/50 cursor-pointer"
-            classList={{ "text-text-interactive-base bg-surface-info-base/15": !tagFilter(), "text-text-weak": !!tagFilter() }}
+            classList={{
+              "text-text-interactive-base bg-surface-info-base/15": !tagFilter(),
+              "text-text-weak": !!tagFilter(),
+            }}
             onClick={() => selectTag(undefined)}
           >
             {_(sessionTags.all)}
@@ -530,7 +533,10 @@ function SessionListDrawerView(props: {
               <button
                 type="button"
                 class="shrink-0 px-2 py-1 rounded-md text-11-medium border border-border-base/50 cursor-pointer"
-                classList={{ "text-text-interactive-base bg-surface-info-base/15": tagFilter() === tag, "text-text-weak": tagFilter() !== tag }}
+                classList={{
+                  "text-text-interactive-base bg-surface-info-base/15": tagFilter() === tag,
+                  "text-text-weak": tagFilter() !== tag,
+                }}
                 onClick={() => selectTag(tag)}
               >
                 #{tag}

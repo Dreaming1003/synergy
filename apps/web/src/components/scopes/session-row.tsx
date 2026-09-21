@@ -133,11 +133,7 @@ function ActionMenu(props: {
             </button>
           </Show>
           <Show when={props.onTagsChange}>
-            <SessionTagMenu
-              tags={props.tags}
-              availableTags={props.availableTags}
-              onChange={props.onTagsChange!}
-            />
+            <SessionTagMenu tags={props.tags} availableTags={props.availableTags} onChange={props.onTagsChange!} />
           </Show>
           <Show when={props.archive}>
             <button

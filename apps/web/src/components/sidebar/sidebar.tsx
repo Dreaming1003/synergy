@@ -565,7 +565,10 @@ export function Sidebar(props: SidebarProps) {
                     {(tag) => (
                       <button
                         type="button"
-                        classList={{ "sb-session-tag-option": true, "sb-session-tag-option-active": tagFilter() === tag }}
+                        classList={{
+                          "sb-session-tag-option": true,
+                          "sb-session-tag-option-active": tagFilter() === tag,
+                        }}
                         onClick={() => {
                           setTagFilter(tag)
                           setTagSearch("")

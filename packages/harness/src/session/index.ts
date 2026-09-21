@@ -1005,10 +1005,7 @@ export namespace Session {
       const tag = options.tag?.trim()
       const matched = sessions.filter(
         (s): s is Info =>
-          s != null &&
-          !!s.scope &&
-          (!term || s.title.toLowerCase().includes(term)) &&
-          (!tag || s.tags?.includes(tag)),
+          s != null && !!s.scope && (!term || s.title.toLowerCase().includes(term)) && (!tag || s.tags?.includes(tag)),
       )
       const total = matched.length
       const offset = options?.offset ?? 0
