@@ -7,6 +7,7 @@ import {
   For,
   onCleanup,
   Show,
+  untrack,
   type Component,
   type JSX,
 } from "solid-js"
@@ -25,10 +26,12 @@ import { showToast } from "@ericsanchezok/synergy-ui/toast"
 import { getSemanticIcon } from "@ericsanchezok/synergy-ui/semantic-icon"
 import { useTheme, type ColorScheme } from "@ericsanchezok/synergy-ui/theme"
 import type {
+  AgentWorkerCapacityStatus,
   ChannelStatus,
   ConfigDomainSummary,
   ControlProfileSummary,
   CortexConcurrencyStatus,
+  McpStatus,
   ModelRoleSummary,
   SandboxStatus,
   SkillList,
@@ -65,7 +68,7 @@ import type {
 import { defaultSettingsState, emptyMcp, groupByProvider } from "./types"
 import { isBuiltinSettingsId, settingsGroupOrder } from "./catalog"
 import { ensureInit } from "./hooks/useSettingsForm"
-import { buildPatch } from "./hooks/useConfigPatch"
+import { buildPatch, builtinServerEnabled } from "./hooks/useConfigPatch"
 import { useSettingsSave } from "./hooks/useSettingsSave"
 import {
   hasExplicitSettingsChanges,
@@ -107,6 +110,7 @@ import { ArchivedSessionsPanel } from "./panels/ArchivedSessionsPanel"
 import { StoragePanel } from "./panels/StoragePanel"
 import { WorktreesPanel } from "./panels/WorktreesPanel"
 import { ControlProfilePanel, PermissionsPanel, SandboxPanel } from "./panels/SafetyPanels"
+import { SecretsPanel } from "./panels/SecretsPanel"
 import { CompactionPanel, QuestionsPanel, TimeoutsPanel, ObservabilityPanel } from "./panels/RuntimePanels"
 import { BossModePanel } from "./panels/BossModePanel"
 import { CodeChecksPanel } from "./panels/CodeChecksPanel"
@@ -116,6 +120,7 @@ import { filterSettingsSections, SETTINGS_DEVELOPER_MODE_STORAGE_KEY } from "./s
 import { SaveIndicator } from "./components/SaveIndicator"
 import { canUseConfigFileOpen, configFileOpenFailure } from "./config-file-open-model"
 import { createDesktopZoomController } from "./desktop-zoom-model"
+import { createDesktopPowerController } from "./desktop-power-model"
 import { localizeSettingsSection, settingsSectionGroupKey } from "./settings-section-copy"
 import {
   canRefreshChannelAccount,
@@ -229,6 +234,7 @@ const copy = {
   interfaceZoomRow: { id: "settings.catalog.general.row.zoom", message: "Interface Zoom" },
   themeSaveFailed: { id: "settings.panel.theme.saveFailed", message: "Theme change could not be saved" },
   zoomSaveFailed: { id: "settings.panel.zoom.saveFailed", message: "Interface zoom could not be saved" },
+  preventSleepFailed: { id: "settings.panel.preventSleep.saveFailed", message: "The sleep setting could not be saved" },
 }
 
 export type SettingsPanelProps = DialogSettingsProps & {
@@ -337,9 +343,27 @@ export function SettingsPanel(props: SettingsPanelProps) {
   })
   onCleanup(unsubscribeChannelStatuses)
 
+  const [mcpStatuses, { refetch: refetchMcpStatuses }] = createResource(async () => {
+    const res = await globalSDK.client.mcp.status()
+    return (res.data ?? {}) as Record<string, McpStatus>
+  })
+
+  // The builtin catalog resource is fetched once, so a server that finishes
+  // connecting while the panel is open would otherwise keep reading as
+  // not-yet-connected.
+  const unsubscribeMcpStatuses = globalSDK.event.listen((event) => {
+    if (event.details?.type?.startsWith("mcp.")) void refetchMcpStatuses()
+  })
+  onCleanup(unsubscribeMcpStatuses)
+
   const [cortexConcurrencyStatus, { refetch: refetchCortexConcurrencyStatus }] = createResource(async () => {
     const res = await globalSDK.client.cortex.concurrency()
     return res.data as CortexConcurrencyStatus | undefined
+  })
+
+  const [agentWorkerCapacityStatus, { refetch: refetchAgentWorkerCapacityStatus }] = createResource(async () => {
+    const res = await globalSDK.client.runtime.agentWorkers()
+    return res.data as AgentWorkerCapacityStatus | undefined
   })
 
   const [domainSummaries, { refetch: refetchDomains }] = createResource(async () => {
@@ -370,6 +394,30 @@ export function SettingsPanel(props: SettingsPanelProps) {
         description: requestErrorMessage(error),
       })
     },
+  })
+
+  const [desktopPowerSaved, { mutate: setDesktopPowerSaved }] = createResource(async () => {
+    if (!platform.desktopPower) return undefined
+    return platform.desktopPower.get().catch(() => undefined)
+  })
+  const desktopPowerController = createDesktopPowerController({
+    bridge: platform.desktopPower,
+    onApplied: (snapshot) => setDesktopPowerSaved(snapshot),
+    onFailure: (error) => {
+      showToast({
+        type: "error",
+        title: _(copy.preventSleepFailed),
+        description: requestErrorMessage(error),
+      })
+    },
+  })
+  createEffect(() => {
+    const bridge = platform.desktopPower
+    if (!bridge?.onEvent) return
+    // Solid ignores a returned function (that is React useEffect semantics);
+    // the unsubscribe must go through onCleanup or every dialog mount leaks a
+    // listener on the stable preload bridge.
+    onCleanup(bridge.onEvent((event) => setDesktopPowerSaved(event.snapshot)))
   })
 
   const canOpenConfigFiles = createMemo(() => canUseConfigFileOpen(platform, desktopServerStatus()))
@@ -498,12 +546,15 @@ export function SettingsPanel(props: SettingsPanelProps) {
   createEffect(() => {
     const list = builtinMcps()
     if (!list) return
+    // Read config untracked: the builtin list stays the only re-seed trigger,
+    // so an unrelated config refetch cannot wipe an in-progress key draft.
+    const cfg = untrack(() => config())
     setSettings(
       "mcps",
       "builtins",
       list.map((info) => ({
         ...info,
-        toggle: info.status.status !== "disabled",
+        toggle: builtinServerEnabled(cfg, info.name),
         apiKeyDraft: "",
         clearApiKey: false,
       })),
@@ -544,6 +595,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
       ...(modelFields.some((field) => changed.has(field)) ? [refetchModelRoleSummaries()] : []),
       ...(agentFields.some((field) => changed.has(field)) ? [refetchAgents()] : []),
       ...(changed.has("cortex") ? [refetchCortexConcurrencyStatus()] : []),
+      ...(changed.has("execution") ? [refetchAgentWorkerCapacityStatus()] : []),
       ...(changed.has("channel") ? [refetchChannelStatuses()] : []),
       ...(changed.has("mcp") ? [refetchBuiltinMcps()] : []),
       ...(changed.has("skills") ? [refetchSkillSources()] : []),
@@ -573,6 +625,12 @@ export function SettingsPanel(props: SettingsPanelProps) {
   // the slider in sync with the actually applied zoom factor.
   function restoreInstantZoom() {
     void desktopZoomController.restore()
+  }
+  // Keep-awake is applied instantly and persisted by the desktop bridge, so
+  // re-read the live value on discard and after an explicit save to keep the
+  // toggle in sync with the assertion the shell is actually holding.
+  function restoreInstantPower() {
+    void desktopPowerController.restore()
   }
 
   const serverPatch = createMemo<Record<string, unknown>>(() => {
@@ -621,6 +679,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
     doEnsureInit()
     restoreInstantTheme()
     void restoreInstantZoom()
+    void restoreInstantPower()
   }
 
   const save = useSettingsSave({
@@ -794,6 +853,10 @@ export function SettingsPanel(props: SettingsPanelProps) {
     desktopZoomController.apply(factor)
   }
 
+  function applyDesktopPower(keepAwakeWhileRunning: boolean) {
+    desktopPowerController.apply(keepAwakeWhileRunning)
+  }
+
   const saveFooterStatus = createMemo(() =>
     settingsSaveFooterStatus({
       saving: saving() || personalizeController.busy(),
@@ -893,6 +956,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
         onDesktopUpdateModeChange={stageDesktopUpdateMode}
         desktopZoom={desktopZoomSaved() ?? 1}
         onDesktopZoomChange={applyDesktopZoomFactor}
+        desktopPower={desktopPowerSaved()}
+        onDesktopPowerChange={applyDesktopPower}
         popoverLayer={settingsPopoverLayer()}
       />
     ),
@@ -905,9 +970,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
         roleVariant={settings.roleVariant}
         popoverLayer={settingsPopoverLayer()}
         onModelChange={(key, value) => setSettings("models", key, value)}
-        onVariantChange={(roleId, variant) =>
-          setSettings("roleVariant", roleId, variant || (undefined as unknown as string))
-        }
+        onVariantChange={(roleId, variant) => setSettings("roleVariant", roleId, variant || "")}
         onQuickSwitcherChange={(preferences) => setSettings("models", "quick_switcher", preferences)}
         onConnectProvider={() => setActiveTab("providers")}
       />
@@ -974,6 +1037,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
       <McpPanel
         entries={settings.mcps.entries}
         builtins={settings.mcps.builtins}
+        statuses={mcpStatuses()}
         onAdd={() => setSettings("mcps", "entries", (prev) => [...prev, emptyMcp()])}
         onChange={(index, field, value) =>
           setSettings("mcps", "entries", index, field as keyof McpEntry, value as never)
@@ -1065,6 +1129,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
         onSafetyChange={(key, value) => setSettings("safety", key, value)}
       />
     ),
+    secrets: () => <SecretsPanel />,
     questions: () => (
       <QuestionsPanel runtime={settings.runtime} onRuntimeChange={(key, value) => setSettings("runtime", key, value)} />
     ),
@@ -1082,7 +1147,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
         defaultAgent={settings.agents.defaultAgent}
         onDefaultAgentChange={(agent) => setSettings("agents", "defaultAgent", agent)}
         concurrencyStatus={cortexConcurrencyStatus()}
-        configuredAgentWorkers={config()?.execution?.agentWorkers}
+        capacityStatus={agentWorkerCapacityStatus()}
         popoverLayer={settingsPopoverLayer()}
       />
     ),

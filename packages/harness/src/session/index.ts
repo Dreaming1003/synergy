@@ -1,3 +1,6 @@
+import type { StoreTransaction } from "../storage/transactional-store"
+import { StorageIntegrityError } from "../storage/errors"
+import { SessionStaging } from "./staging"
 import { RolloutAttachment } from "./rollout/attachment"
 import { RolloutContext } from "./rollout/context"
 import { SnapshotLifecycle } from "./snapshot-lifecycle"
@@ -21,11 +24,13 @@ import { MessageV2 } from "./message-v2"
 import { ScopeContext } from "../scope/context"
 import { Scope } from "../scope"
 import { fn } from "../util/fn"
+import { workMap } from "../util/queue"
 import { Snapshot } from "./snapshot"
 import { SnapshotSchema } from "./snapshot-schema"
 import { SessionHistory } from "./history"
 import { publishCompareKey, decideSessionPublish } from "./publish-dedup"
 import { PartWriteBuffer } from "./part-write-buffer"
+import { SessionCompat } from "./compat-import"
 import { Config } from "../config/config"
 import { ControlProfileCompiler } from "../control-profile/compiler"
 import type { ProfileId } from "../control-profile/types"
@@ -103,6 +108,8 @@ export namespace Session {
   const log = Log.create({ service: "session" })
   const { asScopeID, asSessionID, asMessageID, asPartID } = Identifier
 
+  const FORK_PREPARE_CONCURRENCY = 8
+
   export function toIndex(session: Info) {
     const scope = session.scope as Scope
     return {
@@ -113,6 +120,83 @@ export namespace Session {
       endpoint: session.endpoint,
       endpointKey: session.endpoint ? SessionEndpoint.toKey(session.endpoint) : undefined,
     }
+  }
+
+  export function indexEndpoint(endpoint: unknown, archived?: number): SessionEndpoint.Info | undefined {
+    const retiredEndpoint = z.object({ kind: z.literal("holos"), agentId: z.string() })
+    if (retiredEndpoint.safeParse(endpoint).success) {
+      if (!archived)
+        throw new StorageIntegrityError("Retired Session endpoint must be archived before rebuilding indexes")
+      return undefined
+    }
+    if (endpoint === undefined) return
+    const historical = z
+      .object({ kind: z.literal("channel"), channel: z.record(z.string(), z.unknown()) })
+      .parse(endpoint)
+    return SessionEndpoint.Info.parse({
+      ...historical,
+      channel: Object.fromEntries(Object.entries(historical.channel).filter(([, value]) => value !== null)),
+    })
+  }
+
+  export async function rebuildStorageIndexes(tx: StoreTransaction) {
+    for (const root of [
+      "session_index",
+      "endpoint_session",
+      "sessions_page_index",
+      "session_child_index",
+      "session_nav_v2",
+    ])
+      await tx.removeTree([root])
+    const scopes = await tx.scan(["sessions"])
+    for (const scopeID of scopes) {
+      const page: PageIndex = { entries: [] }
+      const children = new Map<string, ChildIndex>()
+      const nav: SessionNavEntry[] = []
+      let after: string[] | undefined
+      for (;;) {
+        const batch = await tx.query<Info>({ kind: "session", scopeID, after, limit: 128 })
+        if (!batch.length) break
+        for (const record of batch) {
+          const session = {
+            ...record.value,
+            endpoint: indexEndpoint(record.value.endpoint, record.value.time.archived),
+          }
+          const index = toIndex(session)
+          if (index.scopeID !== scopeID || session.id !== record.key[2])
+            throw new Error("Session identity does not match its storage owner")
+          await tx.write(["session_index", session.id], index)
+          if (session.endpoint)
+            await tx.write(
+              StoragePath.endpointSession(SessionEndpoint.toKey(session.endpoint), asSessionID(session.id)),
+              { sessionID: session.id, scopeID },
+            )
+          page.entries.push(toPageIndexEntry(session))
+          nav.push(toNavEntry(session))
+          if (session.parentID) {
+            const child = children.get(session.parentID) ?? {
+              version: 1,
+              scopeID,
+              parentID: session.parentID,
+              updatedAt: Date.now(),
+              entries: [],
+            }
+            child.entries.push(toChildIndexEntry(session))
+            children.set(session.parentID, child)
+          }
+        }
+        after = batch.at(-1)!.key
+      }
+      page.entries.sort((a, b) => b.updated - a.updated || b.id.localeCompare(a.id))
+      nav.sort((a, b) => b.lastActivityAt - a.lastActivityAt || b.id.localeCompare(a.id))
+      await tx.write(["sessions_page_index", scopeID], page)
+      await tx.write(["session_nav_v2", scopeID], { version: 1, scopeID, updatedAt: Date.now(), entries: nav })
+      for (const [parentID, child] of children) {
+        sortChildIndexEntries(child.entries)
+        await tx.write(["session_child_index", scopeID, parentID], child)
+      }
+    }
+    await tx.remove(StoragePath.rolloutRecoveryPending())
   }
 
   export function withoutRuntimeInfo(session: Info): Info {
@@ -185,8 +269,16 @@ export namespace Session {
     .meta({ ref: "SessionWorkspaceSelection" })
   export type WorkspaceSelection = z.infer<typeof WorkspaceSelection>
 
+  async function readStoredPageIndex(scopeID: string): Promise<PageIndex> {
+    const index = await Storage.read<PageIndex>(StoragePath.sessionsPageIndex(asScopeID(scopeID))).catch((error) => {
+      if (error instanceof Storage.NotFoundError) return { entries: [] }
+      throw error
+    })
+    return index
+  }
+
   export async function readPageIndex(scopeID: string): Promise<PageIndex> {
-    return Storage.read<PageIndex>(StoragePath.sessionsPageIndex(asScopeID(scopeID))).catch(() => ({ entries: [] }))
+    return SessionCompat.mergePageIndex(scopeID, await readStoredPageIndex(scopeID))
   }
 
   export async function writePageIndex(scopeID: string, index: PageIndex) {
@@ -194,24 +286,26 @@ export namespace Session {
   }
 
   export async function upsertPageIndexEntry(scopeID: string, entry: PageIndex["entries"][number]) {
-    using _ = await Lock.write(`session-page-index:${scopeID}`)
-    const index = await readPageIndex(scopeID)
-    const existing = index.entries.findIndex((e) => e.id === entry.id)
-    if (existing >= 0) index.entries.splice(existing, 1)
-    const insertAt = index.entries.findIndex((e) => e.updated <= entry.updated)
-    if (insertAt === -1) index.entries.push(entry)
-    else index.entries.splice(insertAt, 0, entry)
-    await writePageIndex(scopeID, index)
+    return Storage.transaction(async () => {
+      const index = await readStoredPageIndex(scopeID)
+      const existing = index.entries.findIndex((e) => e.id === entry.id)
+      if (existing >= 0) index.entries.splice(existing, 1)
+      const insertAt = index.entries.findIndex((e) => e.updated <= entry.updated)
+      if (insertAt === -1) index.entries.push(entry)
+      else index.entries.splice(insertAt, 0, entry)
+      await writePageIndex(scopeID, index)
+    })
   }
 
   export async function removePageIndexEntry(scopeID: string, sessionID: string) {
-    using _ = await Lock.write(`session-page-index:${scopeID}`)
-    const index = await readPageIndex(scopeID)
-    index.entries = index.entries.filter((e) => e.id !== sessionID)
-    await writePageIndex(scopeID, index)
+    return Storage.transaction(async () => {
+      const index = await readStoredPageIndex(scopeID)
+      index.entries = index.entries.filter((e) => e.id !== sessionID)
+      await writePageIndex(scopeID, index)
+    })
   }
 
-  function toPageIndexEntry(session: Info): PageIndex["entries"][number] {
+  export function toPageIndexEntry(session: Info): PageIndex["entries"][number] {
     return {
       id: session.id,
       updated: session.time.updated,
@@ -222,7 +316,7 @@ export namespace Session {
     }
   }
 
-  function toChildIndexEntry(session: Info): ChildIndexEntry {
+  export function toChildIndexEntry(session: Info): ChildIndexEntry {
     return {
       id: session.id,
       title: session.title,
@@ -236,16 +330,18 @@ export namespace Session {
     entries.sort((a, b) => b.updated - a.updated || b.id.localeCompare(a.id))
   }
 
+  async function readStoredChildIndex(scopeID: string, parentID: string): Promise<ChildIndex> {
+    const index = await Storage.read<ChildIndex>(
+      StoragePath.sessionChildIndex(asScopeID(scopeID), asSessionID(parentID)),
+    ).catch((error): ChildIndex => {
+      if (error instanceof Storage.NotFoundError) return { version: 1, scopeID, parentID, updatedAt: 0, entries: [] }
+      throw error
+    })
+    return index
+  }
+
   export async function readChildIndex(scopeID: string, parentID: string): Promise<ChildIndex> {
-    return Storage.read<ChildIndex>(StoragePath.sessionChildIndex(asScopeID(scopeID), asSessionID(parentID))).catch(
-      () => ({
-        version: 1,
-        scopeID,
-        parentID,
-        updatedAt: 0,
-        entries: [],
-      }),
-    )
+    return SessionCompat.mergeChildIndex(scopeID, parentID, await readStoredChildIndex(scopeID, parentID))
   }
 
   export async function writeChildIndex(scopeID: string, parentID: string, index: ChildIndex) {
@@ -257,29 +353,30 @@ export namespace Session {
   }
 
   export async function upsertChildIndexEntry(scopeID: string, parentID: string, entry: ChildIndexEntry) {
-    using _ = await Lock.write(`session-child-index:${scopeID}:${parentID}`)
-    const index = await readChildIndex(scopeID, parentID)
-    const existing = index.entries.findIndex((e) => e.id === entry.id)
-    if (existing >= 0) index.entries.splice(existing, 1)
-    index.entries.push(entry)
-    await writeChildIndex(scopeID, parentID, index)
+    return Storage.transaction(async () => {
+      const index = await readStoredChildIndex(scopeID, parentID)
+      const existing = index.entries.findIndex((e) => e.id === entry.id)
+      if (existing >= 0) index.entries.splice(existing, 1)
+      index.entries.push(entry)
+      await writeChildIndex(scopeID, parentID, index)
+    })
   }
 
   export async function removeChildIndexEntry(scopeID: string, parentID: string, sessionID: string) {
-    using _ = await Lock.write(`session-child-index:${scopeID}:${parentID}`)
-    const index = await readChildIndex(scopeID, parentID)
-    const nextEntries = index.entries.filter((e) => e.id !== sessionID)
-    if (nextEntries.length === index.entries.length) return
-    index.entries = nextEntries
-    await writeChildIndex(scopeID, parentID, index)
+    return Storage.transaction(async () => {
+      const index = await readStoredChildIndex(scopeID, parentID)
+      const nextEntries = index.entries.filter((e) => e.id !== sessionID)
+      if (nextEntries.length === index.entries.length) return
+      index.entries = nextEntries
+      await writeChildIndex(scopeID, parentID, index)
+    })
   }
 
   export async function removeChildIndex(scopeID: string, parentID: string) {
-    using _ = await Lock.write(`session-child-index:${scopeID}:${parentID}`)
     await Storage.remove(StoragePath.sessionChildIndex(asScopeID(scopeID), asSessionID(parentID)))
   }
 
-  function toNavEntry(session: Info): SessionNavEntry {
+  export function toNavEntry(session: Info): SessionNavEntry {
     const scope = session.scope as Scope
     const scopeType = scope.type === "home" ? "home" : "project"
     const channelEndpoint = session.endpoint?.kind === "channel" ? session.endpoint.channel : undefined
@@ -298,7 +395,6 @@ export namespace Session {
       scopeID: scope.id,
       scopeType,
       title: session.title,
-      tags: session.tags,
       category,
       lastActivityAt: session.time.updated,
       createdAt: session.time.created,
@@ -307,6 +403,7 @@ export namespace Session {
       archived: !!session.time.archived,
       archivedAt: session.time.archived || undefined,
       parentID: session.parentID,
+      ...SessionNav.deriveSessionIdentity(session),
       endpointKind: channelEndpoint ? "channel" : undefined,
       chatId: channelEndpoint?.chatId,
       chatName: channelEndpoint?.chatName,
@@ -335,7 +432,7 @@ export namespace Session {
     if (!session.endpoint) return
 
     const endpointKey = SessionEndpoint.toKey(session.endpoint)
-    await Storage.remove(StoragePath.endpointSession(endpointKey, asSessionID(session.id))).catch(() => undefined)
+    await Storage.remove(StoragePath.endpointSession(endpointKey, asSessionID(session.id)))
   }
 
   export async function withRuntimeInfo(session: Info): Promise<Info & { working?: WorkingInfoType }> {
@@ -388,8 +485,12 @@ export namespace Session {
     ) {
       return
     }
-    if (info.time.archived) lastPublish.delete(session.id)
-    else lastPublish.set(session.id, { key, at: now })
+    const remember = () => {
+      if (info.time.archived) lastPublish.delete(session.id)
+      else lastPublish.set(session.id, { key, at: now })
+    }
+    if (Storage.inTransaction()) Storage.afterCommit(remember)
+    else remember()
     Bus.publish(event, { info, navEntry })
   }
 
@@ -399,7 +500,6 @@ export namespace Session {
       parentID?: string
       provenance?: Info["provenance"]
       title?: string
-      tags?: string[]
       permission?: PermissionNext.Ruleset
       controlProfile?: Info["controlProfile"]
       agentOverride?: Info["agentOverride"]
@@ -453,7 +553,6 @@ export namespace Session {
       forkedFrom: input?.forkedFrom,
       provenance: input?.provenance,
       category,
-      tags: [...new Set(input?.tags?.map((tag) => tag.trim()).filter(Boolean) ?? [])],
       title: input?.title ?? createDefaultTitle(!!input?.parentID),
       permission: input?.permission,
       controlProfile,
@@ -472,22 +571,28 @@ export namespace Session {
     }
     log.info("created", result)
 
-    await Storage.write(
-      StoragePath.sessionInfo(asScopeID(scope.id), asSessionID(result.id)),
-      withoutRuntimeInfo(result),
-    )
-    await Storage.write(StoragePath.sessionIndex(asSessionID(result.id)), toIndex(result))
-    await writeEndpointIndex(result)
-    await upsertPageIndexEntry(scope.id, toPageIndexEntry(result))
-    if (result.parentID) await upsertChildIndexEntry(scope.id, result.parentID, toChildIndexEntry(result))
-    const navEntry = await SessionNav.upsertNavEntry(toNavEntry(result))
+    await Storage.transaction(async () => {
+      if (result.parentID && !(await SessionManager.getSession(result.parentID)))
+        throw new Storage.NotFoundError({ message: "Parent Session no longer exists" })
+      await Storage.write(
+        StoragePath.sessionInfo(asScopeID(scope.id), asSessionID(result.id)),
+        withoutRuntimeInfo(result),
+      )
+      await Storage.write(StoragePath.sessionIndex(asSessionID(result.id)), toIndex(result))
+      await writeEndpointIndex(result)
+      await upsertPageIndexEntry(scope.id, toPageIndexEntry(result))
+      if (result.parentID) await upsertChildIndexEntry(scope.id, result.parentID, toChildIndexEntry(result))
+      const navEntry = await SessionNav.upsertNavEntry(toNavEntry(result))
 
-    await SessionSchemaRegistry.created(result)
+      await SessionSchemaRegistry.created(result)
 
-    SessionManager.registerRuntime(result.id)
-    Scope.touch(scope.id)
+      Storage.afterCommit(() => {
+        SessionManager.registerRuntime(result.id)
+      })
+      await Scope.touch(scope.id)
 
-    await publishInfo(SessionEvent.Updated, result, navEntry)
+      await publishInfo(SessionEvent.Updated, result, navEntry)
+    })
     return withRuntimeInfo(result)
   }
 
@@ -555,7 +660,9 @@ export namespace Session {
           message: "The fork point message is no longer part of the effective session history.",
         })
       }
-      let session = await create({
+      const sessionID = Identifier.descending("session")
+      const createInput = {
+        id: sessionID,
         scope: source.scope as Scope,
         workspace: source.workspace,
         title: input.title,
@@ -565,66 +672,82 @@ export namespace Session {
           messageID: forkPoint,
           title: source.title,
         },
-      })
+      }
       const selected = forkPoint
         ? msgs.slice(0, msgs.findIndex((msg) => msg.info.id === forkPoint) + (includeForkPoint ? 1 : 0))
         : msgs
+      const stagingID = await SessionStaging.begin(source.scope.id, [sessionID])
+      let session: Info | undefined
       try {
         await SnapshotLifecycle.adopt({
           scopeID: source.scope.id,
           sourceSessionID: source.id,
-          targetSessionID: session.id,
+          targetSessionID: sessionID,
           workspace: source.workspace?.path ?? ScopeContext.current.directory,
           hashes: selected.flatMap((msg) => msg.parts.flatMap(SnapshotRecords.partRoots)),
         })
-        const messageMap = new Map<string, string>()
-        for (const msg of selected) {
-          const id = Identifier.ascending("message")
-          messageMap.set(msg.info.id, id)
-          const cloned = await updateMessage({
+        const messageMap = new Map(selected.map((msg) => [msg.info.id, Identifier.ascending("message")]))
+        const prepared: MessageV2.WithParts[] = selected.map((msg) => ({
+          info: {
             ...msg.info,
             ...(msg.info.role === "assistant" ? { accounting: MessageV2.copyAccounting(msg.info, "inherited") } : {}),
-            sessionID: session.id,
-            id,
+            sessionID,
+            id: messageMap.get(msg.info.id)!,
             ...("parentID" in msg.info && typeof msg.info.parentID === "string"
               ? { parentID: messageMap.get(msg.info.parentID) ?? msg.info.parentID }
               : {}),
-          })
-
-          for (const part of msg.parts) {
-            const from = { kind: "session" as const, scopeID: source.scope.id, sessionID: source.id }
-            const to = { ...from, sessionID: session.id }
-            const state = part.type === "tool" && part.state.status === "completed" ? { ...part.state } : undefined
-            if (state?.outputArtifact) state.outputArtifact = await RolloutArtifact.copy(from, to, state.outputArtifact)
-            if (state?.attachments) {
-              const attachments = []
-              for (const attachment of state.attachments)
-                attachments.push({
-                  ...attachment,
-                  ...(attachment.artifact
-                    ? { artifact: await RolloutArtifact.copy(from, to, attachment.artifact) }
-                    : {}),
-                })
-              state.attachments = attachments
-            }
-            const artifact =
-              part.type === "attachment" && part.artifact
-                ? await RolloutArtifact.copy(from, to, part.artifact)
-                : undefined
-            await updatePart({
+          },
+          parts: [],
+        }))
+        const jobs = selected.flatMap((msg, messageIndex) =>
+          msg.parts.map((part) => ({ part, messageIndex, id: Identifier.ascending("part") })),
+        )
+        const from = { kind: "session" as const, scopeID: source.scope.id, sessionID: source.id }
+        const to = { ...from, sessionID }
+        // One part queue bounds all artifact copies; workMap drains started writes before staging cleanup.
+        const parts = await workMap(FORK_PREPARE_CONCURRENCY, jobs, async ({ part, messageIndex, id }) => {
+          const state = part.type === "tool" && part.state.status === "completed" ? { ...part.state } : undefined
+          if (state?.outputArtifact) state.outputArtifact = await RolloutArtifact.copy(from, to, state.outputArtifact)
+          if (state?.attachments) {
+            const attachments = []
+            for (const attachment of state.attachments)
+              attachments.push({
+                ...attachment,
+                ...(attachment.artifact ? { artifact: await RolloutArtifact.copy(from, to, attachment.artifact) } : {}),
+              })
+            state.attachments = attachments
+          }
+          const artifact =
+            part.type === "attachment" && part.artifact
+              ? await RolloutArtifact.copy(from, to, part.artifact)
+              : undefined
+          return preparePart(
+            {
               ...part,
               ...(artifact ? { artifact } : {}),
               ...(state ? { state } : {}),
-              id: Identifier.ascending("part"),
-              messageID: cloned.id,
-              sessionID: session.id,
-            })
+              id,
+              messageID: prepared[messageIndex].info.id,
+              sessionID,
+            },
+            source.scope.id,
+          )
+        })
+        for (const [index, part] of parts.entries()) prepared[jobs[index].messageIndex].parts.push(part)
+        session = await Storage.transaction(async () => {
+          const created = await create(createInput)
+          for (const message of prepared) {
+            await updateMessage(message.info)
+            for (const part of message.parts) await updatePart(part)
           }
-        }
+          await SessionStaging.finish(stagingID)
+          return created
+        })
 
         session = await applyWorkspaceSelection(session.id, input.workspace)
       } catch (error) {
-        await remove(session.id)
+        if (session) await remove(session.id)
+        else await SessionStaging.discard(stagingID)
         throw error
       }
       return session
@@ -636,10 +759,18 @@ export namespace Session {
     })
   })
 
-  export async function updateWorkspace(sessionID: string, workspace: import("./types").Workspace): Promise<Info> {
-    return update(sessionID, (draft) => {
-      draft.workspace = workspace
-    })
+  export async function updateWorkspace(
+    sessionID: string,
+    workspace: import("./types").Workspace,
+    options?: { preserveActivityAt?: boolean },
+  ): Promise<Info> {
+    return updateInternal(
+      sessionID,
+      (draft) => {
+        draft.workspace = workspace
+      },
+      options,
+    )
   }
 
   export async function updateControlProfile(
@@ -706,11 +837,34 @@ export namespace Session {
     }
   }
 
-  export function defaultControlProfileForSessionSource(session?: Pick<Info, "endpoint">): ProfileId {
-    if (session?.endpoint?.kind === "channel") return "autonomous"
-    const contributed = SessionSchemaRegistry.defaultControlProfile(session)
-    if (contributed) return contributed
-    return "guarded"
+  const NON_INTERACTIVE_DEFAULT: ProfileId = "autonomous"
+
+  /** True for root sessions with no human available to answer an approval prompt. */
+  function isNonInteractiveSource(session?: object): boolean {
+    const endpoint = (session as { endpoint?: { kind?: string } } | undefined)?.endpoint
+    if (endpoint?.kind === "channel") return true
+    return session ? SessionSchemaRegistry.isBackground(session) : false
+  }
+
+  /**
+   * Single owner of the source default. A top-level profile that can answer for
+   * itself still applies to non-interactive roots, so an operator who set
+   * `full_access` or `autonomous` keeps it. `guarded` cannot: an ask raised with
+   * nobody attached would pend forever, which is why the non-interactive key does
+   * not offer it and why the source default supplies `autonomous` instead.
+   */
+  export async function defaultControlProfileForSessionSource(
+    session?: object,
+    topLevelProfile?: string,
+  ): Promise<ProfileId> {
+    const topLevel = topLevelProfile ? ControlProfileCompiler.normalize(topLevelProfile) : undefined
+    if (!isNonInteractiveSource(session)) return topLevel ?? "guarded"
+    if (topLevel && topLevel !== "guarded") return topLevel
+
+    const configured = await Config.current()
+      .then((cfg) => cfg.nonInteractiveControlProfile)
+      .catch(() => undefined)
+    return configured ? ControlProfileCompiler.normalize(configured) : NON_INTERACTIVE_DEFAULT
   }
 
   export async function resolveSessionControlProfile(sessionID: string): Promise<Info["controlProfile"] | undefined> {
@@ -731,9 +885,8 @@ export namespace Session {
       (await Config.current()
         .then((cfg) => cfg.controlProfile)
         .catch(() => undefined))
-    if (topLevelProfile) return ControlProfileCompiler.normalize(topLevelProfile)
 
-    return defaultControlProfileForSessionSource(sessionState?.root)
+    return defaultControlProfileForSessionSource(sessionState?.root, topLevelProfile)
   }
 
   export async function resolveControlProfile(sessionID: string): Promise<NonNullable<Info["controlProfile"]>> {
@@ -748,55 +901,61 @@ export namespace Session {
     return withClientInfo(info)
   })
 
-  // This queue orders completion mutations with their completion events. Canonical writes still use SessionMutation.
-  const completionNoticeMutations = new Map<string, Promise<void>>()
+  // Acquire this publication queue before SQL; a transaction must never wait
+  // on a queued mutation that needs the same SQL writer.
+  const completionNoticeMutations = Storage.state(() => new Map<string, Promise<void>>())
 
   function serializeCompletionNoticeMutation<T>(id: string, mutation: () => Promise<T>): Promise<T> {
-    const previous = completionNoticeMutations.get(id) ?? Promise.resolve()
+    if (Storage.inTransaction()) return mutation()
+    const queue = completionNoticeMutations()
+    const previous = queue.get(id) ?? Promise.resolve()
     const current = previous.then(mutation, mutation)
     const settled = current.then(
       () => undefined,
       () => undefined,
     )
-    completionNoticeMutations.set(id, settled)
+    queue.set(id, settled)
     void settled.finally(() => {
-      if (completionNoticeMutations.get(id) === settled) completionNoticeMutations.delete(id)
+      if (queue.get(id) === settled) queue.delete(id)
     })
     return current
   }
 
   export async function acknowledgeRollback(id: string, rollbackID: string): Promise<RollbackAck> {
-    const session = await SessionManager.requireSession(id)
-    const scope = session.scope as Scope
-    const scopeID = asScopeID(scope.id)
-    const sessionID = asSessionID(id)
-    using _ = await SessionMutation.write(scopeID, sessionID)
-    const currentRollbackID = (await SessionHistory.storedInfo(id))?.rollback?.id
-    if (currentRollbackID !== rollbackID) {
-      throw new RollbackAckConflictError({
-        message: currentRollbackID
-          ? "Only the current rollback can be acknowledged."
-          : "No active rollback can be acknowledged.",
-        rollbackID,
-        currentRollbackID,
-      })
-    }
+    await SessionCompat.requireImported(id)
+    return Storage.transaction(async () => {
+      const session = await SessionManager.requireSession(id)
+      const scope = session.scope as Scope
+      const scopeID = asScopeID(scope.id)
+      const sessionID = asSessionID(id)
 
-    let changed = false
-    const result = await Storage.update<Info>(StoragePath.sessionInfo(scopeID, sessionID), (draft) => {
-      if (draft.rollbackAck?.rollbackID === rollbackID) return
-      draft.rollbackAck = { rollbackID, acknowledgedAt: Date.now() }
-      changed = true
-    })
-    const rollbackAck = result.rollbackAck
-    if (!rollbackAck) {
-      throw new RollbackAckConflictError({
-        message: "No active rollback can be acknowledged.",
-        rollbackID,
+      const currentRollbackID = (await SessionHistory.storedInfo(id))?.rollback?.id
+      if (currentRollbackID !== rollbackID) {
+        throw new RollbackAckConflictError({
+          message: currentRollbackID
+            ? "Only the current rollback can be acknowledged."
+            : "No active rollback can be acknowledged.",
+          rollbackID,
+          currentRollbackID,
+        })
+      }
+
+      let changed = false
+      const result = await Storage.update<Info>(StoragePath.sessionInfo(scopeID, sessionID), (draft) => {
+        if (draft.rollbackAck?.rollbackID === rollbackID) return
+        draft.rollbackAck = { rollbackID, acknowledgedAt: Date.now() }
+        changed = true
       })
-    }
-    if (changed) await publishInfo(SessionEvent.Updated, result)
-    return rollbackAck
+      const rollbackAck = result.rollbackAck
+      if (!rollbackAck) {
+        throw new RollbackAckConflictError({
+          message: "No active rollback can be acknowledged.",
+          rollbackID,
+        })
+      }
+      if (changed) await publishInfo(SessionEvent.Updated, result)
+      return rollbackAck
+    })
   }
 
   async function acknowledgeCompletionNoticeResult(
@@ -804,32 +963,35 @@ export namespace Session {
     acknowledgedCount: number,
     options?: { repairNavOnNoop?: boolean },
   ) {
-    if (!Number.isSafeInteger(acknowledgedCount) || acknowledgedCount < 0) {
-      throw new TypeError("acknowledgedCount must be a non-negative safe integer")
-    }
+    await SessionCompat.requireImported(id)
+    return serializeCompletionNoticeMutation(id, () =>
+      Storage.transaction(async () => {
+        if (!Number.isSafeInteger(acknowledgedCount) || acknowledgedCount < 0) {
+          throw new TypeError("acknowledgedCount must be a non-negative safe integer")
+        }
 
-    return serializeCompletionNoticeMutation(id, async () => {
-      const session = await SessionManager.requireSession(id)
-      const scope = session.scope as Scope
-      const scopeID = asScopeID(scope.id)
-      const sessionID = asSessionID(id)
-      using _ = await SessionMutation.write(scopeID, sessionID)
-      let actualAcknowledgedCount = 0
-      const result = await Storage.update<Info>(StoragePath.sessionInfo(scopeID, sessionID), (draft) => {
-        const current = draft.completionNotice.unreadCount ?? (draft.completionNotice.unread ? 1 : 0)
-        const next = Math.max(0, current - acknowledgedCount)
-        actualAcknowledgedCount = current - next
-        draft.completionNotice.unread = next > 0
-        draft.completionNotice.unreadCount = next
-      })
-      if (actualAcknowledgedCount === 0 && !options?.repairNavOnNoop) {
-        return { info: await withRuntimeInfo(result), acknowledgedCount: 0 }
-      }
+        const session = await SessionManager.requireSession(id)
+        const scope = session.scope as Scope
+        const scopeID = asScopeID(scope.id)
+        const sessionID = asSessionID(id)
 
-      const navEntry = await SessionNav.upsertNavEntry(toNavEntry(result))
-      await publishInfo(SessionEvent.Updated, result, navEntry)
-      return { info: await withRuntimeInfo(result), acknowledgedCount: actualAcknowledgedCount }
-    })
+        let actualAcknowledgedCount = 0
+        const result = await Storage.update<Info>(StoragePath.sessionInfo(scopeID, sessionID), (draft) => {
+          const current = draft.completionNotice.unreadCount ?? (draft.completionNotice.unread ? 1 : 0)
+          const next = Math.max(0, current - acknowledgedCount)
+          actualAcknowledgedCount = current - next
+          draft.completionNotice.unread = next > 0
+          draft.completionNotice.unreadCount = next
+        })
+        if (actualAcknowledgedCount === 0 && !options?.repairNavOnNoop) {
+          return { info: await withRuntimeInfo(result), acknowledgedCount: 0 }
+        }
+
+        const navEntry = await SessionNav.upsertNavEntry(toNavEntry(result))
+        await publishInfo(SessionEvent.Updated, result, navEntry)
+        return { info: await withRuntimeInfo(result), acknowledgedCount: actualAcknowledgedCount }
+      }),
+    )
   }
 
   export async function acknowledgeCompletionNotice(id: string, acknowledgedCount: number) {
@@ -861,21 +1023,24 @@ export namespace Session {
   }
 
   export async function recordCompletionNotice(id: string, options?: { publishEvent?: boolean }) {
-    return serializeCompletionNoticeMutation(id, async () => {
-      let unreadCount: number | undefined
-      const result = await update(id, (draft) => {
-        if (draft.time.archived || draft.completionNotice.silent) return
-        const current = draft.completionNotice.unreadCount ?? (draft.completionNotice.unread ? 1 : 0)
-        const next = Math.min(Number.MAX_SAFE_INTEGER, current + 1)
-        draft.completionNotice.unread = true
-        draft.completionNotice.unreadCount = next
-        if (next !== current) unreadCount = next
-      })
-      if (unreadCount !== undefined && options?.publishEvent !== false) {
-        await Bus.publish(SessionEvent.Completion, { sessionID: id, unreadCount })
-      }
-      return result
-    })
+    await SessionCompat.requireImported(id)
+    return serializeCompletionNoticeMutation(id, () =>
+      Storage.transaction(async () => {
+        let unreadCount: number | undefined
+        const result = await update(id, (draft) => {
+          if (draft.time.archived || draft.completionNotice.silent) return
+          const current = draft.completionNotice.unreadCount ?? (draft.completionNotice.unread ? 1 : 0)
+          const next = Math.min(Number.MAX_SAFE_INTEGER, current + 1)
+          draft.completionNotice.unread = true
+          draft.completionNotice.unreadCount = next
+          if (next !== current) unreadCount = next
+        })
+        if (unreadCount !== undefined && options?.publishEvent !== false) {
+          await Bus.publish(SessionEvent.Completion, { sessionID: id, unreadCount })
+        }
+        return result
+      }),
+    )
   }
 
   async function updateInternal(
@@ -883,49 +1048,50 @@ export namespace Session {
     editor: (session: Info) => void,
     options?: { preserveActivityAt?: boolean; forcePublish?: boolean },
   ) {
-    const session = await SessionManager.requireSession(id)
-    const scope = session.scope as Scope
-    const scopeID = asScopeID(scope.id)
-    const sessionID = asSessionID(id)
-    using _ = await SessionMutation.write(scopeID, sessionID)
-    let before: Info | undefined
-    const result = await Storage.update<Info>(StoragePath.sessionInfo(scopeID, sessionID), (draft) => {
-      before = structuredClone(draft)
-      editor(draft)
-      draft.time.updated = Date.now()
-    })
-    if (!before) throw new Error(`Session ${id} was not available before mutation`)
+    await SessionCompat.requireImported(id)
+    return Storage.transaction(async () => {
+      const session = await SessionManager.requireSession(id)
+      const scope = session.scope as Scope
+      const scopeID = asScopeID(scope.id)
+      const sessionID = asSessionID(id)
 
-    await Storage.write(StoragePath.sessionIndex(asSessionID(result.id)), toIndex(result))
-    await upsertPageIndexEntry(scope.id, toPageIndexEntry(result))
-    if (before.parentID && before.parentID !== result.parentID) {
-      await removeChildIndexEntry(scope.id, before.parentID, result.id)
-    }
-    if (result.parentID) {
-      await upsertChildIndexEntry(scope.id, result.parentID, toChildIndexEntry(result))
-    }
-    const shouldPreserveActivityAt =
-      options?.preserveActivityAt ?? (before.pendingReply === true && result.pendingReply === true)
-    const navEntry = await SessionNav.upsertNavEntry(toNavEntry(result), {
-      preserveActivityAt: shouldPreserveActivityAt,
-    })
-
-    const beforeKey = before.endpoint ? SessionEndpoint.toKey(before.endpoint) : undefined
-    const afterKey = result.endpoint ? SessionEndpoint.toKey(result.endpoint) : undefined
-    if (beforeKey && beforeKey !== afterKey) {
-      await removeEndpointIndex(before)
-    }
-    if (result.endpoint) {
-      await writeEndpointIndex(result)
-    }
-
-    if (!before.time.archived && result.time.archived) {
-      await SessionProjectHealth.detachWorktreeSession(result.id).catch((error) => {
-        log.warn("failed to detach worktree during session archive", { sessionID: result.id, error })
+      let before: Info | undefined
+      const result = await Storage.update<Info>(StoragePath.sessionInfo(scopeID, sessionID), (draft) => {
+        before = structuredClone(draft)
+        editor(draft)
+        if (!options?.preserveActivityAt) draft.time.updated = Date.now()
       })
-    }
-    await publishInfo(SessionEvent.Updated, result, navEntry, { force: options?.forcePublish })
-    return withRuntimeInfo(result)
+      if (!before) throw new Error(`Session ${id} was not available before mutation`)
+
+      await Storage.write(StoragePath.sessionIndex(asSessionID(result.id)), toIndex(result))
+      await upsertPageIndexEntry(scope.id, toPageIndexEntry(result))
+      if (before.parentID && before.parentID !== result.parentID) {
+        await removeChildIndexEntry(scope.id, before.parentID, result.id)
+      }
+      if (result.parentID) {
+        await upsertChildIndexEntry(scope.id, result.parentID, toChildIndexEntry(result))
+      }
+      const shouldPreserveActivityAt =
+        options?.preserveActivityAt ?? (before.pendingReply === true && result.pendingReply === true)
+      const navEntry = await SessionNav.upsertNavEntry(toNavEntry(result), {
+        preserveActivityAt: shouldPreserveActivityAt,
+      })
+
+      const beforeKey = before.endpoint ? SessionEndpoint.toKey(before.endpoint) : undefined
+      const afterKey = result.endpoint ? SessionEndpoint.toKey(result.endpoint) : undefined
+      if (beforeKey && beforeKey !== afterKey) {
+        await removeEndpointIndex(before)
+      }
+      if (result.endpoint) {
+        await writeEndpointIndex(result)
+      }
+
+      if (!before.time.archived && result.time.archived) {
+        Storage.afterCommit(() => SessionProjectHealth.detachWorktreeSession(result.id))
+      }
+      await publishInfo(SessionEvent.Updated, result, navEntry, { force: options?.forcePublish })
+      return withRuntimeInfo(result)
+    })
   }
 
   export async function update(id: string, editor: (session: Info) => void) {
@@ -977,6 +1143,17 @@ export namespace Session {
     total: number
   }
 
+  async function readListInfos(scopeID: string, ids: string[]) {
+    const sid = asScopeID(scopeID)
+    const keys = ids.map((id) => StoragePath.sessionInfo(sid, asSessionID(id)))
+    const sessions = await Storage.readMany<Info>(keys)
+    for (const [index, id] of ids.entries()) {
+      const info = await SessionCompat.pendingInfo(scopeID, id)
+      if (info) sessions[index] = info
+    }
+    return sessions
+  }
+
   export async function list(options?: {
     offset?: number
     limit?: number
@@ -985,7 +1162,6 @@ export namespace Session {
     before?: number
     pinned?: boolean
     parentOnly?: boolean
-    tag?: string
   }): Promise<ListResult> {
     const scopeID = asScopeID(ScopeContext.current.scope.id)
     const index = await readPageIndex(scopeID)
@@ -998,15 +1174,13 @@ export namespace Session {
 
     // When searching, we must read all matching session infos first because
     // title-based search cannot be applied on the page index alone.
-    if (options?.search || options?.tag) {
-      const keys = entries.map((e) => StoragePath.sessionInfo(scopeID, asSessionID(e.id)))
-      const sessions = await Storage.readMany<Info>(keys)
-      const term = options.search?.toLowerCase()
-      const tag = options.tag?.trim()
-      const matched = sessions.filter(
-        (s): s is Info =>
-          s != null && !!s.scope && (!term || s.title.toLowerCase().includes(term)) && (!tag || s.tags?.includes(tag)),
+    if (options?.search) {
+      const sessions = await readListInfos(
+        scopeID,
+        entries.map((e) => e.id),
       )
+      const term = options.search.toLowerCase()
+      const matched = sessions.filter((s): s is Info => s != null && !!s.scope && s.title.toLowerCase().includes(term))
       const total = matched.length
       const offset = options?.offset ?? 0
       const limit = options?.limit ?? total
@@ -1021,8 +1195,10 @@ export namespace Session {
 
     if (slice.length === 0) return { data: [], total }
 
-    const keys = slice.map((e) => StoragePath.sessionInfo(scopeID, asSessionID(e.id)))
-    const sessions = await Storage.readMany<Info>(keys)
+    const sessions = await readListInfos(
+      scopeID,
+      slice.map((e) => e.id),
+    )
     const data = await Promise.all(
       sessions.filter((s): s is Info => s != null && !!s.scope).map((s) => withClientInfo(s)),
     )
@@ -1103,75 +1279,81 @@ export namespace Session {
     return page.items
   })
 
-  async function removeInternal(sessionID: string, removed: Info[]): Promise<void> {
-    try {
-      const indexed = await SessionManager.requireSession(sessionID)
-      const scope = indexed.scope as Scope
-      const scopeID = asScopeID(scope.id)
-      const canonicalSessionID = asSessionID(sessionID)
-      using _ = await SessionMutation.write(scopeID, canonicalSessionID)
-      const session = await Storage.read<Info>(StoragePath.sessionInfo(scopeID, canonicalSessionID))
-      for (const child of await children(sessionID)) {
-        await removeInternal(child.id, removed)
-      }
-      await SnapshotLifecycle.beginDelete(scope.id, sessionID)
-      await SessionProjectHealth.detachWorktreeSession(sessionID).catch((error) => {
-        log.warn("failed to detach worktree during session removal", { sessionID, error })
-      })
-      SessionManager.unregisterRuntime(sessionID)
-      SessionManager.forgetSession(sessionID)
-      SessionMessageCache.disable(sessionID)
-      await removeEndpointIndex(session)
-      await MessageV2.removeOrderIndex(scopeID, canonicalSessionID)
-      await SessionNav.removeNavEntry(scope.id, sessionID)
-      await Storage.removeTree(StoragePath.sessionRoot(scopeID, canonicalSessionID))
-      await Storage.remove(StoragePath.sessionIndex(canonicalSessionID))
-      await removePageIndexEntry(scope.id, sessionID)
-      if (session.parentID) await removeChildIndexEntry(scope.id, session.parentID, sessionID)
-      await SessionSearchIndex.removeRecords(scopeID, canonicalSessionID)
-      await removeChildIndex(scope.id, sessionID)
-      await SnapshotLifecycle.completeDelete(scope.id, sessionID)
-      removed.push(session)
-    } catch (e) {
-      log.error(e)
-    }
-  }
-
   export const remove = fn(Identifier.schema("session"), async (sessionID) => {
+    const pending = [sessionID]
+    const drained = new Set<string>()
+    while (pending.length) {
+      const id = pending.pop()!
+      if (drained.has(id)) continue
+      drained.add(id)
+      if (!(await SessionManager.getSession(id))) continue
+      await flushPartWrites(id)
+      for (const child of await children(id)) pending.push(child.id)
+    }
     const removed: Info[] = []
-    await removeInternal(sessionID, removed)
-    try {
-      for (const info of removed) {
-        await Bus.publish(SessionEvent.Deleted, { info })
+    await Storage.transaction(async () => {
+      const visiting = new Set<string>()
+      async function removeTree(id: string) {
+        if (visiting.has(id)) throw new Error("Session ancestry contains a cycle")
+        visiting.add(id)
+        const session = await SessionManager.getSession(id)
+        if (!session) return
+        const scope = session.scope as Scope
+        const scopeID = asScopeID(scope.id)
+        const sid = asSessionID(id)
+        for (const child of await children(id)) await removeTree(child.id)
+        await SnapshotLifecycle.scheduleDelete(scope.id, id)
+        await removeEndpointIndex(session)
+        await MessageV2.removeOrderIndex(scopeID, sid)
+        await SessionNav.removeNavEntry(scope.id, id)
+        await Storage.removeTree(StoragePath.sessionRoot(scopeID, sid))
+        await Storage.remove(StoragePath.sessionIndex(sid))
+        await removePageIndexEntry(scope.id, id)
+        if (session.parentID) await removeChildIndexEntry(scope.id, session.parentID, id)
+        await SessionSearchIndex.removeRecords(scopeID, sid)
+        await removeChildIndex(scope.id, id)
+        Storage.afterCommit(() => {
+          SessionManager.unregisterRuntime(id)
+          SessionManager.forgetSession(id)
+          SessionMessageCache.disable(id)
+        })
+        await ScopeContext.provide({ scope, fn: () => Bus.publish(SessionEvent.Deleted, { info: session }) })
+        removed.push(session)
       }
-    } catch (e) {
-      log.error(e)
+      await removeTree(sessionID)
+    })
+    for (const session of removed) {
+      await SessionProjectHealth.detachWorktreeSession(session.id)
+      await SnapshotLifecycle.completeDelete(session.scope.id, session.id)
     }
   })
 
   export async function updateLastExchange(sessionID: string) {
-    const session = await SessionManager.requireSession(sessionID)
-    const scopeID = asScopeID((session.scope as Scope).id)
-    const lastExchange: NonNullable<Info["lastExchange"]> = {}
-    const msgs = await SessionHistory.modelMessages({ sessionID })
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const msg = msgs[i]
-      if (!lastExchange.assistant && msg.info.role === "assistant") {
-        const text = MessageV2.extractText(msg.parts, { maxLength: 200 })
-        if (text) lastExchange.assistant = text
+    await SessionCompat.requireImported(sessionID)
+    return Storage.transaction(async () => {
+      const session = await SessionManager.requireSession(sessionID)
+      const scopeID = asScopeID((session.scope as Scope).id)
+      const lastExchange: NonNullable<Info["lastExchange"]> = {}
+      const msgs = await SessionHistory.modelMessages({ sessionID })
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const msg = msgs[i]
+        if (!lastExchange.assistant && msg.info.role === "assistant") {
+          const text = MessageV2.extractText(msg.parts, { maxLength: 200 })
+          if (text) lastExchange.assistant = text
+        }
+        if (!lastExchange.user && msg.info.role === "user") {
+          const text = MessageV2.extractText(msg.parts, { maxLength: 200 })
+          if (text) lastExchange.user = text
+        }
+        if (lastExchange.user && lastExchange.assistant) break
       }
-      if (!lastExchange.user && msg.info.role === "user") {
-        const text = MessageV2.extractText(msg.parts, { maxLength: 200 })
-        if (text) lastExchange.user = text
-      }
-      if (lastExchange.user && lastExchange.assistant) break
-    }
-    // Write lastExchange directly without bumping time.updated or republishing,
-    // since the caller (processor) already performs a proper Session.update().
-    using _ = await SessionMutation.write(scopeID, asSessionID(sessionID))
-    const infoPath = StoragePath.sessionInfo(scopeID, asSessionID(sessionID))
-    await Storage.update<Info>(infoPath, (draft) => {
-      draft.lastExchange = lastExchange
+      // Write lastExchange directly without bumping time.updated or republishing,
+      // since the caller (processor) already performs a proper Session.update().
+
+      const infoPath = StoragePath.sessionInfo(scopeID, asSessionID(sessionID))
+      await Storage.update<Info>(infoPath, (draft) => {
+        draft.lastExchange = lastExchange
+      })
     })
   }
 
@@ -1201,26 +1383,29 @@ export namespace Session {
   }
 
   export const updateMessage = fn(MessageV2.Info, async (msg) => {
-    const canonical = MessageV2.canonicalMessage(msg)
-    const session = await SessionManager.requireSession(msg.sessionID)
-    const scopeID = asScopeID((session.scope as Scope).id)
-    // Invalidate the search index BEFORE the content write so a crash between
-    // the write and the post-write mark can never leave a clean-but-stale
-    // record trusted; the post-write mark below refreshes the marker for any
-    // scan that races this write (commitRebuild only clears markers older
-    // than its scan start).
-    await SessionSearchIndex.markDirty(scopeID, asSessionID(canonical.sessionID))
-    await MessageV2.writeInfo({ scopeID, info: canonical })
-    SessionMessageCache.upsertMessage(canonical.sessionID, canonical)
-    // Flip the rollback projection before publishing the replacement root: the
-    // frontend prefix-cut hides everything after the cut while canUnrollback is
-    // true, so the new branch must never arrive ahead of its invalidation.
-    await publishRollbackInvalidation(canonical, session.history)
-    Bus.publish(MessageV2.Event.Updated, {
-      info: canonical,
+    await SessionCompat.requireImported(msg.sessionID)
+    return Storage.transaction(async () => {
+      const canonical = MessageV2.canonicalMessage(msg)
+      const session = await SessionManager.requireSession(msg.sessionID)
+      const scopeID = asScopeID((session.scope as Scope).id)
+      // Invalidate the search index BEFORE the content write so a crash between
+      // the write and the post-write mark can never leave a clean-but-stale
+      // record trusted; the post-write mark below refreshes the marker for any
+      // scan that races this write (commitRebuild only clears markers older
+      // than its scan start).
+      await SessionSearchIndex.markDirty(scopeID, asSessionID(canonical.sessionID))
+      await MessageV2.writeInfo({ scopeID, info: canonical })
+      SessionMessageCache.upsertMessage(canonical.sessionID, canonical)
+      // Flip the rollback projection before publishing the replacement root: the
+      // frontend prefix-cut hides everything after the cut while canUnrollback is
+      // true, so the new branch must never arrive ahead of its invalidation.
+      await publishRollbackInvalidation(canonical, session.history)
+      Bus.publish(MessageV2.Event.Updated, {
+        info: canonical,
+      })
+      await SessionSearchIndex.markDirty(scopeID, asSessionID(canonical.sessionID))
+      return canonical
     })
-    await SessionSearchIndex.markDirty(scopeID, asSessionID(canonical.sessionID))
-    return canonical
   })
 
   export async function updateAssistantContextUsage(input: {
@@ -1228,21 +1413,24 @@ export namespace Session {
     messageID: string
     contextUsage: NonNullable<MessageV2.Assistant["contextUsage"]>
   }) {
-    const session = await SessionManager.requireSession(input.sessionID)
-    const scopeID = asScopeID((session.scope as Scope).id)
-    const result = await Storage.update<MessageV2.Info>(
-      StoragePath.messageInfo(scopeID, asSessionID(input.sessionID), asMessageID(input.messageID)),
-      (draft) => {
-        if (draft.role !== "assistant") throw new Error("Context Usage can only be attached to assistant messages")
-        draft.contextUsage = input.contextUsage
-      },
-    )
-    const canonical = MessageV2.canonicalMessage(result)
-    SessionMessageCache.upsertMessage(canonical.sessionID, canonical)
-    Bus.publish(MessageV2.Event.Updated, {
-      info: canonical,
+    await SessionCompat.requireImported(input.sessionID)
+    return Storage.transaction(async () => {
+      const session = await SessionManager.requireSession(input.sessionID)
+      const scopeID = asScopeID((session.scope as Scope).id)
+      const result = await Storage.update<MessageV2.Info>(
+        StoragePath.messageInfo(scopeID, asSessionID(input.sessionID), asMessageID(input.messageID)),
+        (draft) => {
+          if (draft.role !== "assistant") throw new Error("Context Usage can only be attached to assistant messages")
+          draft.contextUsage = input.contextUsage
+        },
+      )
+      const canonical = MessageV2.canonicalMessage(result)
+      SessionMessageCache.upsertMessage(canonical.sessionID, canonical)
+      Bus.publish(MessageV2.Event.Updated, {
+        info: canonical,
+      })
+      return canonical as MessageV2.Assistant
     })
-    return canonical as MessageV2.Assistant
   }
 
   export const mergeMessageMetadata = fn(
@@ -1252,22 +1440,25 @@ export namespace Session {
       metadata: z.record(z.string(), z.any()),
     }),
     async (input) => {
-      const session = await SessionManager.requireSession(input.sessionID)
-      const scopeID = asScopeID((session.scope as Scope).id)
-      const result = await Storage.update<MessageV2.Info>(
-        StoragePath.messageInfo(scopeID, asSessionID(input.sessionID), asMessageID(input.messageID)),
-        (draft) => {
-          draft.metadata = {
-            ...draft.metadata,
-            ...input.metadata,
-          }
-        },
-      )
-      SessionMessageCache.upsertMessage(result.sessionID, result)
-      Bus.publish(MessageV2.Event.Updated, {
-        info: result,
+      await SessionCompat.requireImported(input.sessionID)
+      return Storage.transaction(async () => {
+        const session = await SessionManager.requireSession(input.sessionID)
+        const scopeID = asScopeID((session.scope as Scope).id)
+        const result = await Storage.update<MessageV2.Info>(
+          StoragePath.messageInfo(scopeID, asSessionID(input.sessionID), asMessageID(input.messageID)),
+          (draft) => {
+            draft.metadata = {
+              ...draft.metadata,
+              ...input.metadata,
+            }
+          },
+        )
+        SessionMessageCache.upsertMessage(result.sessionID, result)
+        Bus.publish(MessageV2.Event.Updated, {
+          info: result,
+        })
+        return result
       })
-      return result
     },
   )
 
@@ -1277,23 +1468,27 @@ export namespace Session {
       messageID: Identifier.schema("message"),
     }),
     async (input) => {
-      const session = await SessionManager.requireSession(input.sessionID)
-      const scopeID = asScopeID((session.scope as Scope).id)
-      // See updateMessage: invalidate before the content write, refresh after.
-      await SessionSearchIndex.markDirty(scopeID, asSessionID(input.sessionID))
-      await MessageV2.removeInfo({
-        scopeID,
-        sessionID: asSessionID(input.sessionID),
-        messageID: asMessageID(input.messageID),
+      await flushPartWrites(input.sessionID)
+      await SessionCompat.requireImported(input.sessionID)
+      return Storage.transaction(async () => {
+        const session = await SessionManager.requireSession(input.sessionID)
+        const scopeID = asScopeID((session.scope as Scope).id)
+        // See updateMessage: invalidate before the content write, refresh after.
+        await SessionSearchIndex.markDirty(scopeID, asSessionID(input.sessionID))
+        await MessageV2.removeInfo({
+          scopeID,
+          sessionID: asSessionID(input.sessionID),
+          messageID: asMessageID(input.messageID),
+        })
+        // Structural change: drop the cache and let the next read repopulate.
+        SessionMessageCache.invalidate(input.sessionID)
+        Bus.publish(MessageV2.Event.Removed, {
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+        })
+        await SessionSearchIndex.markDirty(scopeID, asSessionID(input.sessionID))
+        return input.messageID
       })
-      // Structural change: drop the cache and let the next read repopulate.
-      SessionMessageCache.invalidate(input.sessionID)
-      Bus.publish(MessageV2.Event.Removed, {
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-      })
-      await SessionSearchIndex.markDirty(scopeID, asSessionID(input.sessionID))
-      return input.messageID
     },
   )
 
@@ -1304,26 +1499,30 @@ export namespace Session {
       partID: Identifier.schema("part"),
     }),
     async (input) => {
-      const session = await SessionManager.requireSession(input.sessionID)
-      const scopeID = asScopeID((session.scope as Scope).id)
-      // See updateMessage: invalidate before the content write, refresh after.
-      await SessionSearchIndex.markDirty(scopeID, asSessionID(input.sessionID))
-      await Storage.remove(
-        StoragePath.messagePart(
-          scopeID,
-          asSessionID(input.sessionID),
-          asMessageID(input.messageID),
-          asPartID(input.partID),
-        ),
-      )
-      SessionMessageCache.invalidate(input.sessionID)
-      Bus.publish(MessageV2.Event.PartRemoved, {
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-        partID: input.partID,
+      await flushPartWrites(input.sessionID)
+      await SessionCompat.requireImported(input.sessionID)
+      return Storage.transaction(async () => {
+        const session = await SessionManager.requireSession(input.sessionID)
+        const scopeID = asScopeID((session.scope as Scope).id)
+        // See updateMessage: invalidate before the content write, refresh after.
+        await SessionSearchIndex.markDirty(scopeID, asSessionID(input.sessionID))
+        await Storage.remove(
+          StoragePath.messagePart(
+            scopeID,
+            asSessionID(input.sessionID),
+            asMessageID(input.messageID),
+            asPartID(input.partID),
+          ),
+        )
+        SessionMessageCache.invalidate(input.sessionID)
+        Bus.publish(MessageV2.Event.PartRemoved, {
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          partID: input.partID,
+        })
+        await SessionSearchIndex.markDirty(scopeID, asSessionID(input.sessionID))
+        return input.partID
       })
-      await SessionSearchIndex.markDirty(scopeID, asSessionID(input.sessionID))
-      return input.partID
     },
   )
 
@@ -1346,9 +1545,23 @@ export namespace Session {
   // Part files are the highest-frequency writes and are never hand-edited, so
   // they persist as compact JSON (no pretty-print) to cut serialization and disk
   // bytes on the streaming path.
-  const partWriteBuffer = new PartWriteBuffer<MessageV2.Part, string[]>((path, value) =>
-    Storage.write(path, value, { compact: true }),
-  )
+  const partWriteBuffer = Storage.state(() => {
+    const handle = { store: Storage.current().store, artifactDirectory: Storage.current().artifactDirectory }
+    return new PartWriteBuffer<MessageV2.Part, string[]>((key, value) =>
+      Storage.provide(handle, () =>
+        Storage.transaction(async (tx) => {
+          await assertPartOwner(tx, key)
+          await tx.write(key, value)
+        }),
+      ),
+    )
+  })
+
+  async function assertPartOwner(tx: StoreTransaction, key: string[]) {
+    await tx.read(["sessions", key[1], key[2], "info"])
+    await tx.read(["sessions", key[1], key[2], "messages", key[4], "info"])
+    await tx.assertNotDeleted(key)
+  }
 
   /**
    * Flush all buffered streaming part writes to disk and await them. Called at
@@ -1357,8 +1570,8 @@ export namespace Session {
    * write that normally flushes never fired (issue #327).
    */
   export function flushPartWrites(sessionID?: string) {
-    if (!sessionID) return partWriteBuffer.flushAll()
-    return partWriteBuffer.flushWhere((part) => part.sessionID === sessionID)
+    if (!sessionID) return partWriteBuffer().flushAll()
+    return partWriteBuffer().flushWhere((part) => part.sessionID === sessionID)
   }
 
   type UpdatePartInternalInput =
@@ -1366,14 +1579,9 @@ export namespace Session {
     | { part: MessageV2.TextPart; delta: string }
     | { part: MessageV2.ReasoningPart; delta: string }
 
-  async function updatePartInternal(input: UpdatePartInternalInput) {
-    let part = "delta" in input ? input.part : input
-    const delta = "delta" in input ? input.delta : undefined
-    // Streaming hot path (issue #350 H1): resolve the scopeID from the permanent
-    // sessionID -> scopeID cache instead of loading full session info on every
-    // delta. A session's scope is immutable, so this is safe; on a cold cache it
-    // reads only the small session-index record.
-    const scopeID = asScopeID(await SessionManager.resolveScopeID(part.sessionID))
+  export async function preparePart(input: MessageV2.Part, ownerScopeID?: string): Promise<MessageV2.Part> {
+    let part = input
+    const scopeID = asScopeID(ownerScopeID ?? (await SessionManager.resolveScopeID(part.sessionID)))
     try {
       const owner = { kind: "session" as const, scopeID, sessionID: part.sessionID }
       if (part.type === "attachment") part = await RolloutAttachment.capture(owner, part)
@@ -1415,6 +1623,18 @@ export namespace Session {
       }
       throw error
     }
+    return part
+  }
+
+  async function updatePartInternal(input: UpdatePartInternalInput) {
+    let part = "delta" in input ? input.part : input
+    const delta = "delta" in input ? input.delta : undefined
+    // Streaming hot path (issue #350 H1): resolve the scopeID from the permanent
+    // sessionID -> scopeID cache instead of loading full session info on every
+    // delta. A session's scope is immutable, so this is safe; on a cold cache it
+    // reads only the small session-index record.
+    const scopeID = asScopeID(await SessionManager.resolveScopeID(part.sessionID))
+    part = await preparePart(part)
     if (delta === undefined) part = MessageV2.canonicalPart(part)
     const path = StoragePath.messagePart(
       scopeID,
@@ -1422,36 +1642,26 @@ export namespace Session {
       asMessageID(part.messageID),
       asPartID(part.id),
     )
-    const searchableDiscreteWrite =
-      delta === undefined && (part.type === "text" || part.type === "tool" || part.type === "attachment")
-    // A discrete content-bearing part write is a searchable-content boundary:
-    // user messages persist their parts AFTER Session.updateMessage marks the
-    // session dirty, assistant parts stream before the terminal updateMessage,
-    // and interrupted turns may flush parts with no following message write.
-    // A rebuild that runs in any of those windows must observe the part.
-    //
-    // Invalidate BEFORE the write (crash between write and post-mark cannot
-    // strand a clean-but-stale record) and refresh AFTER it (a scan racing
-    // this write sees a marker newer than its scan start). Streaming deltas
-    // stay unmarked (hot path) because a discrete terminal write always
-    // follows before the message settles.
-    if (searchableDiscreteWrite) {
-      await SessionSearchIndex.markDirty(scopeID, asSessionID(part.sessionID))
-    }
-    if (delta !== undefined) {
-      partWriteBuffer.defer(part.id, path, part)
+    const transactional = Storage.inTransaction()
+    if (delta !== undefined && !transactional) {
+      // The delta is exactly what the streaming producer appended to the part's
+      // text, so the buffer can price this update without re-serializing the
+      // whole accumulated part on every token.
+      partWriteBuffer().defer(part.id, path, part, delta)
     } else {
-      // Discrete/terminal update: cancel any pending streamed write and persist
-      // durably before returning (preserves the original write-through contract).
-      partWriteBuffer.cancel(part.id)
-      await Storage.write(path, part, { compact: true })
-      // Maintain the loop-scoped message cache on durable writes only (#350 D2);
-      // per-delta streamed updates are coalesced by the write-behind buffer and
-      // do not need to advance the cache — the terminal write for each part does.
-      SessionMessageCache.upsertPart(part.sessionID, part)
-    }
-    if (searchableDiscreteWrite) {
-      await SessionSearchIndex.markDirty(scopeID, asSessionID(part.sessionID))
+      const write = (key: string[], value: MessageV2.Part) =>
+        Storage.transaction(async (tx) => {
+          await assertPartOwner(tx, key)
+          await Storage.write(key, value)
+          if (value.type === "text" || value.type === "tool" || value.type === "attachment")
+            await SessionSearchIndex.markDirty(scopeID, asSessionID(value.sessionID))
+          SessionMessageCache.upsertPart(value.sessionID, value)
+          await Bus.publish(MessageV2.Event.PartUpdated, { part: value, delta })
+        })
+      if (transactional) {
+        partWriteBuffer().assertDrained(part.id)
+        await write(path, part)
+      } else await partWriteBuffer().writeNow(part.id, path, part, write)
     }
     if (part.type === "tool") {
       // Tool parts are published as unsequenced streaming events. Keep a
@@ -1468,10 +1678,7 @@ export namespace Session {
         durable: delta === undefined,
       })
     }
-    Bus.publish(MessageV2.Event.PartUpdated, {
-      part,
-      delta,
-    })
+    if (delta !== undefined && !transactional) await Bus.publish(MessageV2.Event.PartUpdated, { part, delta })
     return part
   }
 

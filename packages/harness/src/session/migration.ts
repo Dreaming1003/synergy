@@ -1,3 +1,4 @@
+import { SessionMigrationTarget } from "../migration/session-target"
 import { RolloutContinuationMigration } from "./rollout/continuation-migration"
 import { RolloutMigration } from "./rollout/migration"
 import { $ } from "bun"
@@ -21,7 +22,36 @@ import { Dag } from "./dag"
 import { SessionRootVariant } from "./root-variant"
 
 import { MigrationRegistry } from "../migration/registry"
+import { work } from "../util/queue"
 const log = Log.create({ service: "session.migration" })
+const MIGRATION_CONCURRENCY = 8
+
+function missingHistoricalRecord(error: unknown) {
+  if (error instanceof Storage.NotFoundError) return undefined
+  if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined
+  throw error
+}
+
+function migrationWriter() {
+  let writes: Array<{ key: string[]; value: unknown }> = []
+  let bytes = 0
+  async function flush() {
+    if (!writes.length) return
+    const pending = writes
+    await Storage.transaction((tx) => tx.writeMany(pending))
+    writes = []
+    bytes = 0
+  }
+  return {
+    flush,
+    async write(key: string[], value: unknown) {
+      const size = Buffer.byteLength(JSON.stringify(value))
+      if (writes.length >= 128 || bytes + size > 4 * 1024 * 1024) await flush()
+      writes.push({ key, value })
+      bytes += size
+    },
+  }
+}
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
@@ -56,9 +86,7 @@ async function findWorktreeRegistry(
   for (const entry of entries) {
     if (!entry.endsWith(".json")) continue
     const filepath = path.join(root, entry)
-    const text = await Bun.file(filepath)
-      .text()
-      .catch(() => undefined)
+    const text = await Bun.file(filepath).text().catch(missingHistoricalRecord)
     if (!text) continue
     let parsed: Record<string, unknown>
     try {
@@ -73,12 +101,12 @@ async function findWorktreeRegistry(
 }
 
 async function migrateSessionWorktreeWorkspace(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"]).catch(() => [])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const tasks: Array<{ scopeID: string; sessionID: string; info: any }> = []
 
   for (const scopeID of scopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     const sessions = await Storage.readMany<any>(
       sessionIDs.map((sessionID) => StoragePath.sessionInfo(scope, Identifier.asSessionID(sessionID))),
     )
@@ -401,9 +429,6 @@ function applyPrimaryAttachmentVisibility(
   return { value, changed }
 }
 
-const legacyAttachmentPattern = String.raw`"type"\s*:\s*"file"|"artifact-only"|"attachment-only"|"primaryAttachmentIds"|"kind"\s*:\s*"artifact"|"artifact"\s*:|"mode"\s*:\s*"(inline|card|hidden)"|"primary"\s*:\s*true`
-const legacyToolDisplayPattern = String.raw`"visibility"\s*:\s*"media"|"attachment-only"|"primaryAttachmentIds"`
-const attachmentPartGlob = new Bun.Glob("sessions/**/parts/*.json")
 const legacyAttachmentMarkers = [
   '"type":"file"',
   '"type": "file"',
@@ -461,161 +486,85 @@ function candidateFromRelativePath(relativePath: string, text: string): Attachme
   }
 }
 
-async function existingRipgrepPath() {
-  const system = Bun.which("rg")
-  if (system) return system
-  const bundled = path.join(Global.Path.bin, process.platform === "win32" ? "rg.exe" : "rg")
-  return (await Bun.file(bundled)
-    .exists()
-    .catch(() => false))
-    ? bundled
-    : undefined
+async function collectPartCandidates(predicate: (text: string) => boolean): Promise<AttachmentPartCandidate[]> {
+  const result: AttachmentPartCandidate[] = []
+  for await (const record of SessionMigrationTarget.records<unknown>({ kind: "part" })) {
+    const text = JSON.stringify(record.value)
+    if (!predicate(text)) continue
+    const candidate = candidateFromRelativePath(record.key.join("/"), text)
+    if (candidate) result.push(candidate)
+  }
+  return result
 }
 
-async function readSpawnStdout(stdout: unknown) {
-  if (!stdout || typeof stdout === "string") return undefined
-  if (typeof (stdout as { text?: unknown }).text === "function") {
-    return (stdout as { text: () => Promise<string> }).text()
-  }
-  if (typeof (stdout as { getReader?: unknown }).getReader === "function")
-    return Bun.readableStreamToText(stdout as ReadableStream)
-  return undefined
+function collectLegacyAttachmentPartCandidates() {
+  return collectPartCandidates(needsAttachmentMigration)
+}
+function collectLegacyToolDisplayPartCandidates() {
+  return collectPartCandidates(needsToolDisplayMigration)
 }
 
-async function findLegacyAttachmentPartPaths() {
-  const sessionsRoot = path.join(Global.Path.data, "sessions")
-  if (!(await fs.stat(sessionsRoot).catch(() => undefined))?.isDirectory()) return []
-  const rg = await existingRipgrepPath()
-  if (!rg) return undefined
-
-  const proc = Bun.spawn(
-    [
-      rg,
-      "--files-with-matches",
-      "--hidden",
-      "--follow",
-      "--glob=**/parts/*.json",
-      "--",
-      legacyAttachmentPattern,
-      sessionsRoot,
-    ],
-    {
-      stdout: "pipe",
-      stderr: "ignore",
-      maxBuffer: 1024 * 1024 * 50,
-    },
-  )
-  const [text, exitCode] = await Promise.all([readSpawnStdout(proc.stdout), proc.exited])
-  if (text === undefined) return undefined
-  if (exitCode !== 0 && exitCode !== 1) {
-    log.warn("legacy attachment part candidate search failed", { exitCode })
-    return []
-  }
-  return text.split(/\r?\n/).filter(Boolean)
+/** A tool state still awaiting settlement. Shares MessageV2's classification so
+ * this migration and restore-time repair cannot drift apart. */
+function isNonTerminalToolState(state: unknown): boolean {
+  const status = asRecord(state)?.status
+  return status === "pending" || status === "generating" || status === "running"
 }
 
-async function findLegacyToolDisplayPartPaths() {
-  const sessionsRoot = path.join(Global.Path.data, "sessions")
-  if (!(await fs.stat(sessionsRoot).catch(() => undefined))?.isDirectory()) return []
-  const rg = await existingRipgrepPath()
-  if (!rg) return undefined
-
-  const proc = Bun.spawn(
-    [
-      rg,
-      "--files-with-matches",
-      "--hidden",
-      "--follow",
-      "--glob=**/parts/*.json",
-      "--",
-      legacyToolDisplayPattern,
-      sessionsRoot,
-    ],
-    {
-      stdout: "pipe",
-      stderr: "ignore",
-      maxBuffer: 1024 * 1024 * 50,
-    },
-  )
-  const [text, exitCode] = await Promise.all([readSpawnStdout(proc.stdout), proc.exited])
-  if (text === undefined) return undefined
-  if (exitCode !== 0 && exitCode !== 1) {
-    log.warn("legacy tool display part candidate search failed", { exitCode })
-    return []
-  }
-  return text.split(/\r?\n/).filter(Boolean)
-}
-
-async function collectLegacyAttachmentPartCandidates(): Promise<AttachmentPartCandidate[]> {
-  const candidates: AttachmentPartCandidate[] = []
-  const pending: Promise<void>[] = []
-  const flush = async () => {
-    if (pending.length === 0) return
-    await Promise.all(pending.splice(0))
-  }
-
-  const paths = await findLegacyAttachmentPartPaths()
-  const scan = async function* () {
-    if (paths) {
-      for (const filepath of paths) yield filepath
-      return
+/**
+ * Settle tool parts left non-terminal on an already-terminal assistant message.
+ *
+ * A process that ends mid-call can persist the part in `running` while the
+ * owning message is terminal, leaving a permanent spinner that contradicts the
+ * rollout ledger's interrupted record. Only the contradictory pair is touched:
+ * a non-terminal part on a non-terminal message is a genuinely unfinished turn,
+ * which SessionInvoke repair owns.
+ */
+async function migrateOrphanedToolParts(progress: (current: number, total: number) => void) {
+  let done = 0
+  let settled = 0
+  progress(0, 0)
+  for await (const { key, value } of SessionMigrationTarget.records<unknown>({ kind: "part" })) {
+    const part = asRecord(value)
+    if (!part || part.type !== "tool" || !isNonTerminalToolState(part.state)) continue
+    try {
+      const [, scopeID, sessionID, , messageID] = key
+      const info = await Storage.read<MessageV2.Info>(
+        StoragePath.messageInfo(
+          Identifier.asScopeID(scopeID),
+          Identifier.asSessionID(sessionID),
+          Identifier.asMessageID(messageID),
+        ),
+      ).catch(missingHistoricalRecord)
+      if (info?.role !== "assistant" || !SessionProgress.isTerminalAssistant(info)) {
+        done++
+        progress(done, 0)
+        continue
+      }
+      const state = asRecord(part.state)!
+      const input = asRecord(state.input) ?? {}
+      const metadata = asRecord(state.metadata)
+      const start = typeof asRecord(state.time)?.start === "number" ? (state.time as { start: number }).start : 0
+      await Storage.write(key, {
+        ...part,
+        state: {
+          status: "error",
+          input,
+          error: MessageV2.INTERRUPTED_TOOL_ERROR,
+          ...(metadata ? { metadata } : {}),
+          time: { start: start || info.time.created, end: info.time.completed ?? info.time.created },
+        },
+      })
+      settled++
+    } catch (error) {
+      log.warn("failed to settle orphaned tool part", { key: key.join("/"), error: String(error) })
+      throw error
     }
-    for await (const relativePath of attachmentPartGlob.scan({ cwd: Global.Path.data, onlyFiles: true })) {
-      yield path.join(Global.Path.data, relativePath)
-    }
+    done++
+    progress(done, 0)
   }
-
-  for await (const filepath of scan()) {
-    pending.push(
-      Bun.file(filepath)
-        .text()
-        .then((text) => {
-          if (!needsAttachmentMigration(text)) return
-          const candidate = candidateFromRelativePath(path.relative(Global.Path.data, filepath), text)
-          if (candidate) candidates.push(candidate)
-        })
-        .catch(() => undefined),
-    )
-    if (pending.length >= 64) await flush()
-  }
-  await flush()
-  return candidates.sort((a, b) => a.key.join("/").localeCompare(b.key.join("/")))
-}
-
-async function collectLegacyToolDisplayPartCandidates(): Promise<AttachmentPartCandidate[]> {
-  const candidates: AttachmentPartCandidate[] = []
-  const pending: Promise<void>[] = []
-  const flush = async () => {
-    if (pending.length === 0) return
-    await Promise.all(pending.splice(0))
-  }
-
-  const paths = await findLegacyToolDisplayPartPaths()
-  const scan = async function* () {
-    if (paths) {
-      for (const filepath of paths) yield filepath
-      return
-    }
-    for await (const relativePath of attachmentPartGlob.scan({ cwd: Global.Path.data, onlyFiles: true })) {
-      yield path.join(Global.Path.data, relativePath)
-    }
-  }
-
-  for await (const filepath of scan()) {
-    pending.push(
-      Bun.file(filepath)
-        .text()
-        .then((text) => {
-          if (!needsToolDisplayMigration(text)) return
-          const candidate = candidateFromRelativePath(path.relative(Global.Path.data, filepath), text)
-          if (candidate) candidates.push(candidate)
-        })
-        .catch(() => undefined),
-    )
-    if (pending.length >= 64) await flush()
-  }
-  await flush()
-  return candidates.sort((a, b) => a.key.join("/").localeCompare(b.key.join("/")))
+  progress(done, done)
+  log.info("orphaned tool part migration complete", { candidates: done, settled })
 }
 
 async function migrateSessionAttachmentParts(progress: (current: number, total: number) => void) {
@@ -632,13 +581,16 @@ async function migrateSessionAttachmentParts(progress: (current: number, total: 
     try {
       part = JSON.parse(text)
     } catch {
-      part = await Storage.read<any>(key).catch(() => undefined)
+      part = await Storage.read<any>(key).catch(missingHistoricalRecord)
     }
     if (part) {
       const owner =
         part.type === "file"
-          ? (await Storage.read<MessageV2.Info>(StoragePath.messageInfo(scope, sid, mid)).catch(() => undefined))
-              ?.role === "user"
+          ? (
+              await Storage.read<MessageV2.Info>(StoragePath.messageInfo(scope, sid, mid)).catch(
+                missingHistoricalRecord,
+              )
+            )?.role === "user"
             ? "user"
             : "tool"
           : "tool"
@@ -734,7 +686,7 @@ async function migrateSessionToolDisplayMetadata(progress: (current: number, tot
     try {
       part = JSON.parse(text)
     } catch {
-      part = await Storage.read<any>(key).catch(() => undefined)
+      part = await Storage.read<any>(key).catch(missingHistoricalRecord)
     }
 
     if (part?.type === "tool") {
@@ -813,7 +765,7 @@ async function migrateSynergyLinkToolMetadata(progress: (current: number, total:
     try {
       part = JSON.parse(text)
     } catch {
-      part = await Storage.read<any>(key).catch(() => undefined)
+      part = await Storage.read<any>(key).catch(missingHistoricalRecord)
     }
 
     if (part?.type === "tool") {
@@ -832,11 +784,11 @@ async function migrateSynergyLinkToolMetadata(progress: (current: number, total:
 }
 
 async function migrateBoundedSessionData(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const sessions: Array<{ scopeID: string; sessionID: string }> = []
   for (const scopeID of scopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    for (const sessionID of await Storage.scan(StoragePath.sessionsRoot(scope))) {
+    for (const sessionID of await SessionMigrationTarget.sessions(scope)) {
       sessions.push({ scopeID, sessionID })
     }
   }
@@ -844,21 +796,23 @@ async function migrateBoundedSessionData(progress: (current: number, total: numb
 
   let done = 0
   let changed = 0
-  for (const { scopeID, sessionID } of sessions) {
+  await work(MIGRATION_CONCURRENCY, sessions, async ({ scopeID, sessionID }) => {
     const scope = Identifier.asScopeID(scopeID)
     const sid = Identifier.asSessionID(sessionID)
     try {
       changed += await migrateOneBoundedSession(scope, sid)
     } catch (error) {
       log.warn("failed to migrate bounded session data", { scopeID, sessionID, error: String(error) })
+      throw error
     }
     done++
     progress(done, sessions.length)
-  }
+  })
   log.info("bounded session data migration complete", { sessions: sessions.length, changed })
 }
 
 async function migrateOneBoundedSession(scope: Identifier.ScopeID, sid: Identifier.SessionID): Promise<number> {
+  const writer = migrationWriter()
   let changed = 0
   const messageInfos: MessageV2.Info[] = []
   const infoKey = StoragePath.sessionInfo(scope, sid)
@@ -868,18 +822,18 @@ async function migrateOneBoundedSession(scope: Identifier.ScopeID, sid: Identifi
       sessionID: sid,
       error: String(error),
     })
-    return undefined
+    return missingHistoricalRecord(error)
   })
 
   if (sessionInfo) {
     const next = normalizeSessionInfo(sessionInfo)
     if (JSON.stringify(next) !== JSON.stringify(sessionInfo)) {
-      await Storage.write(infoKey, next)
+      await writer.write(infoKey, next)
       changed++
     }
   }
 
-  const messageIDs = await Storage.scan(StoragePath.sessionMessagesRoot(scope, sid)).catch(() => [])
+  const messageIDs = await Storage.scan(StoragePath.sessionMessagesRoot(scope, sid))
   for (const messageID of messageIDs) {
     const mid = Identifier.asMessageID(messageID)
     const msgKey = StoragePath.messageInfo(scope, sid, mid)
@@ -890,18 +844,18 @@ async function migrateOneBoundedSession(scope: Identifier.ScopeID, sid: Identifi
         messageID,
         error: String(error),
       })
-      return undefined
+      return missingHistoricalRecord(error)
     })
     if (message) {
       const next = normalizeMessageInfo(message)
       if (next) messageInfos.push(next)
       if (JSON.stringify(next) !== JSON.stringify(message)) {
-        await Storage.write(msgKey, next)
+        await writer.write(msgKey, next)
         changed++
       }
     }
 
-    const partIDs = await Storage.scan(StoragePath.messageParts(scope, sid, mid)).catch(() => [])
+    const partIDs = await Storage.scan(StoragePath.messageParts(scope, sid, mid))
     for (const partID of partIDs) {
       const partKey = StoragePath.messagePart(scope, sid, mid, Identifier.asPartID(partID))
       const part = await Storage.read<any>(partKey).catch((error) => {
@@ -912,37 +866,38 @@ async function migrateOneBoundedSession(scope: Identifier.ScopeID, sid: Identifi
           partID,
           error: String(error),
         })
-        return undefined
+        return missingHistoricalRecord(error)
       })
       if (!part) continue
       const next = normalizePart(part)
       if (JSON.stringify(next) !== JSON.stringify(part)) {
-        await Storage.write(partKey, next)
+        await writer.write(partKey, next)
         changed++
       }
     }
   }
 
   const summaryKey = StoragePath.sessionSummary(scope, sid)
-  const summary = await Storage.read<any>(summaryKey).catch(() => undefined)
+  const summary = await Storage.read<any>(summaryKey).catch(missingHistoricalRecord)
   const nextSummary = SnapshotSchema.normalizeArray(summary)
   if (nextSummary && JSON.stringify(nextSummary) !== JSON.stringify(summary)) {
-    await Storage.write(summaryKey, nextSummary)
+    await writer.write(summaryKey, nextSummary)
     changed++
   }
 
   if (sessionInfo) {
     const events = await readHistoryEventsForMigration(scope, sid)
     const history = deriveHistoryForMigration(messageInfos, events)
-    const current = await Storage.read<any>(infoKey).catch(() => sessionInfo)
+    const current = normalizeSessionInfo(sessionInfo)
     const next = { ...current, history }
     if (history === undefined) delete next.history
     if (JSON.stringify(next) !== JSON.stringify(current)) {
-      await Storage.write(infoKey, next)
+      await writer.write(infoKey, next)
       changed++
     }
   }
 
+  await writer.flush()
   return changed
 }
 
@@ -968,7 +923,7 @@ function normalizePart(part: Record<string, unknown>) {
 }
 
 async function readHistoryEventsForMigration(scope: Identifier.ScopeID, sid: Identifier.SessionID) {
-  const ids = await Storage.scan(StoragePath.sessionHistoryRoot(scope, sid)).catch(() => [])
+  const ids = await Storage.scan(StoragePath.sessionHistoryRoot(scope, sid))
   const events = await Storage.readMany<any>(
     ids.map((id) => StoragePath.sessionHistoryEvent(scope, sid, Identifier.asHistoryID(id))),
   )
@@ -1002,12 +957,12 @@ function deriveHistoryForMigration(messages: MessageV2.Info[], events: any[]): I
 }
 
 async function repairPendingReplyFlags(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const tasks: Array<{ scopeID: string; sessionID: string; info: Info }> = []
 
   for (const scopeID of scopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope))
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     const sessions = await Storage.readMany<Info>(
       sessionIDs.map((sessionID) => StoragePath.sessionInfo(scope, Identifier.asSessionID(sessionID))),
     )
@@ -1047,12 +1002,12 @@ async function repairPendingReplyFlags(progress: (current: number, total: number
 }
 
 async function recomputePendingReplyFlags(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"]).catch(() => [])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const tasks: Array<{ scopeID: string; sessionID: string; info: Info }> = []
 
   for (const scopeID of scopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     const sessions = await Storage.readMany<Info>(
       sessionIDs.map((sessionID) => StoragePath.sessionInfo(scope, Identifier.asSessionID(sessionID))),
     )
@@ -1067,7 +1022,7 @@ async function recomputePendingReplyFlags(progress: (current: number, total: num
 
   let done = 0
   let updated = 0
-  for (const { scopeID, sessionID, info } of tasks) {
+  await work(MIGRATION_CONCURRENCY, tasks, async ({ scopeID, sessionID, info }) => {
     const scope = Identifier.asScopeID(scopeID)
     const sid = Identifier.asSessionID(sessionID)
     try {
@@ -1084,21 +1039,20 @@ async function recomputePendingReplyFlags(progress: (current: number, total: num
     } catch (error) {
       log.warn("failed to recompute pendingReply flag", { scopeID, sessionID, error: String(error) })
     }
-
     done++
     progress(done, tasks.length)
-  }
+  })
 
   log.info("pendingReply recompute complete", { checked: tasks.length, updated })
 }
 
 async function migrateActiveRevertState(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"]).catch(() => [])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const tasks: Array<{ scopeID: string; sessionID: string; info: any }> = []
 
   for (const scopeID of scopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     const sessions = await Storage.readMany<any>(
       sessionIDs.map((sessionID) => StoragePath.sessionInfo(scope, Identifier.asSessionID(sessionID))),
     )
@@ -1114,7 +1068,7 @@ async function migrateActiveRevertState(progress: (current: number, total: numbe
   for (const { scopeID, sessionID, info } of tasks) {
     const scope = Identifier.asScopeID(scopeID)
     const sid = Identifier.asSessionID(sessionID)
-    const messageIDs = await Storage.scan(StoragePath.sessionMessagesRoot(scope, sid)).catch(() => [])
+    const messageIDs = await Storage.scan(StoragePath.sessionMessagesRoot(scope, sid))
     const cutoff = messageIDs.findIndex((messageID) => messageID >= info.revert.messageID)
     const droppedIDs = cutoff >= 0 ? messageIDs.slice(cutoff) : []
     const droppedUserIDs: string[] = []
@@ -1123,10 +1077,12 @@ async function migrateActiveRevertState(progress: (current: number, total: numbe
 
     for (const messageID of droppedIDs) {
       const mid = Identifier.asMessageID(messageID)
-      const msg = await Storage.read<MessageV2.Info>(StoragePath.messageInfo(scope, sid, mid)).catch(() => undefined)
+      const msg = await Storage.read<MessageV2.Info>(StoragePath.messageInfo(scope, sid, mid)).catch(
+        missingHistoricalRecord,
+      )
       if (msg?.role === "user" && (msg as MessageV2.User).metadata?.synthetic !== true) droppedUserIDs.push(messageID)
 
-      const partIDs = await Storage.scan(StoragePath.messageParts(scope, sid, mid)).catch(() => [])
+      const partIDs = await Storage.scan(StoragePath.messageParts(scope, sid, mid))
       const parts = await Storage.readMany<MessageV2.Part>(
         partIDs.map((partID) => StoragePath.messagePart(scope, sid, mid, Identifier.asPartID(partID))),
       )
@@ -1185,15 +1141,15 @@ async function migrateActiveRevertState(progress: (current: number, total: numbe
 }
 
 async function migrateSessionChildIndex(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"]).catch(() => [])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   if (scopeIDs.length === 0) return
 
   let done = 0
   for (const scopeID of scopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    await Storage.removeTree(StoragePath.sessionChildIndexRoot(scope)).catch(() => undefined)
+    await Storage.removeTree(StoragePath.sessionChildIndexRoot(scope)).catch(missingHistoricalRecord)
 
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     const sessions = await Storage.readMany<Info>(
       sessionIDs.map((sessionID) => StoragePath.sessionInfo(scope, Identifier.asSessionID(sessionID))),
     )
@@ -1252,12 +1208,12 @@ function normalizeCompletionNotice(value: unknown): { unread: boolean; unreadCou
 }
 
 async function migrateSessionCompletionNotice(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"]).catch(() => [])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const tasks: Array<{ scopeID: string; sessionID: string; info: any }> = []
 
   for (const scopeID of scopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     const sessions = await Storage.readMany<any>(
       sessionIDs.map((sessionID) => StoragePath.sessionInfo(scope, Identifier.asSessionID(sessionID))),
     )
@@ -1379,13 +1335,13 @@ function migrateCortexOutputContract(cortex: Record<string, unknown>): {
 }
 
 async function migrateCortexTaskOutputContract(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"]).catch(() => [] as string[])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const allScopeIDs = Array.from(new Set(["home", ...scopeIDs]))
   const tasks: Array<{ scopeID: string; sessionID: string }> = []
 
   for (const scopeID of allScopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     for (const sessionID of sessionIDs) tasks.push({ scopeID, sessionID })
   }
 
@@ -1396,7 +1352,7 @@ async function migrateCortexTaskOutputContract(progress: (current: number, total
   for (const { scopeID, sessionID } of tasks) {
     const scope = Identifier.asScopeID(scopeID)
     const sid = Identifier.asSessionID(sessionID)
-    const info = await Storage.read<any>(StoragePath.sessionInfo(scope, sid)).catch(() => undefined)
+    const info = await Storage.read<any>(StoragePath.sessionInfo(scope, sid)).catch(missingHistoricalRecord)
     const cortex = asRecord(info?.cortex)
     if (info && cortex) {
       const migrated = migrateCortexOutputContract(cortex)
@@ -1416,13 +1372,13 @@ async function migrateCortexTaskOutputContract(progress: (current: number, total
 }
 
 async function migrateCortexTaskIdentity(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"]).catch(() => [] as string[])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const allScopeIDs = Array.from(new Set(["home", ...scopeIDs]))
   const tasks: Array<{ scopeID: string; sessionID: string }> = []
 
   for (const scopeID of allScopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     for (const sessionID of sessionIDs) tasks.push({ scopeID, sessionID })
   }
 
@@ -1431,7 +1387,7 @@ async function migrateCortexTaskIdentity(progress: (current: number, total: numb
   for (const { scopeID, sessionID } of tasks) {
     const scope = Identifier.asScopeID(scopeID)
     const sid = Identifier.asSessionID(sessionID)
-    const info = await Storage.read<any>(StoragePath.sessionInfo(scope, sid)).catch(() => undefined)
+    const info = await Storage.read<any>(StoragePath.sessionInfo(scope, sid)).catch(missingHistoricalRecord)
     const cortex = asRecord(info?.cortex)
     if (info && cortex && typeof cortex.taskID !== "string") {
       await Storage.write(StoragePath.sessionInfo(scope, sid), {
@@ -1448,11 +1404,11 @@ async function migrateCortexTaskIdentity(progress: (current: number, total: numb
 }
 
 async function migrateBoundedDiffAggregatePreviews(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"]).catch(() => [] as string[])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const sessions: Array<{ scopeID: string; sessionID: string }> = []
   for (const scopeID of scopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     for (const sessionID of sessionIDs) sessions.push({ scopeID, sessionID })
   }
 
@@ -1464,11 +1420,8 @@ async function migrateBoundedDiffAggregatePreviews(progress: (current: number, t
     try {
       changed += await migrateOneBoundedDiffAggregatePreview(scope, sid)
     } catch (error) {
-      log.warn("failed to migrate bounded diff aggregate previews", {
-        scopeID,
-        sessionID,
-        error: String(error),
-      })
+      log.warn("failed to migrate bounded diff aggregate previews", { scopeID, sessionID, error: String(error) })
+      throw error
     }
     done++
     progress(done, sessions.length)
@@ -1483,7 +1436,7 @@ async function migrateOneBoundedDiffAggregatePreview(
 ): Promise<number> {
   let changed = 0
   const infoKey = StoragePath.sessionInfo(scope, sid)
-  const sessionInfo = await Storage.read<Record<string, unknown>>(infoKey).catch(() => undefined)
+  const sessionInfo = await Storage.read<Record<string, unknown>>(infoKey).catch(missingHistoricalRecord)
   if (sessionInfo) {
     const next = normalizeSessionInfo(sessionInfo)
     if (JSON.stringify(next) !== JSON.stringify(sessionInfo)) {
@@ -1492,10 +1445,10 @@ async function migrateOneBoundedDiffAggregatePreview(
     }
   }
 
-  const messageIDs = await Storage.scan(StoragePath.sessionMessagesRoot(scope, sid)).catch(() => [])
+  const messageIDs = await Storage.scan(StoragePath.sessionMessagesRoot(scope, sid))
   for (const messageID of messageIDs) {
     const messageKey = StoragePath.messageInfo(scope, sid, Identifier.asMessageID(messageID))
-    const message = await Storage.read<Record<string, unknown>>(messageKey).catch(() => undefined)
+    const message = await Storage.read<Record<string, unknown>>(messageKey).catch(missingHistoricalRecord)
     if (!message) continue
     const next = normalizeMessageInfo(message)
     if (JSON.stringify(next) !== JSON.stringify(message)) {
@@ -1505,7 +1458,7 @@ async function migrateOneBoundedDiffAggregatePreview(
   }
 
   const summaryKey = StoragePath.sessionSummary(scope, sid)
-  const summary = await Storage.read<unknown>(summaryKey).catch(() => undefined)
+  const summary = await Storage.read<unknown>(summaryKey).catch(missingHistoricalRecord)
   const nextSummary = SnapshotSchema.normalizeArray(summary)
   if (nextSummary && JSON.stringify(nextSummary) !== JSON.stringify(summary)) {
     await Storage.write(summaryKey, nextSummary)
@@ -1516,13 +1469,13 @@ async function migrateOneBoundedDiffAggregatePreview(
 }
 
 async function migrateRetiredIntentAnalystDagAssignments(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"]).catch(() => [] as string[])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const allScopeIDs = Array.from(new Set(["home", ...scopeIDs]))
   const tasks: Array<{ scopeID: string; sessionID: string }> = []
 
   for (const scopeID of allScopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     for (const sessionID of sessionIDs) tasks.push({ scopeID, sessionID })
   }
 
@@ -1532,7 +1485,7 @@ async function migrateRetiredIntentAnalystDagAssignments(progress: (current: num
     const scope = Identifier.asScopeID(scopeID)
     const sid = Identifier.asSessionID(sessionID)
     const key = StoragePath.sessionDag(scope, sid)
-    const nodes = await Storage.read<Dag.Node[]>(key).catch(() => undefined)
+    const nodes = await Storage.read<Dag.Node[]>(key).catch(missingHistoricalRecord)
     if (Array.isArray(nodes)) {
       const normalized = Dag.normalizeRetiredAssignments(nodes)
       if (normalized !== nodes) {
@@ -1548,11 +1501,11 @@ async function migrateRetiredIntentAnalystDagAssignments(progress: (current: num
 }
 
 async function migrateSessionRootVariants(progress: (current: number, total: number) => void) {
-  const scopeIDs = await Storage.scan(["sessions"]).catch(() => [] as string[])
+  const scopeIDs = await SessionMigrationTarget.scopes()
   const tasks: Array<{ scopeID: string; sessionID: string }> = []
   for (const scopeID of scopeIDs) {
     const scope = Identifier.asScopeID(scopeID)
-    const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+    const sessionIDs = await SessionMigrationTarget.sessions(scope)
     for (const sessionID of sessionIDs) tasks.push({ scopeID, sessionID })
   }
 
@@ -1562,7 +1515,7 @@ async function migrateSessionRootVariants(progress: (current: number, total: num
     const scope = Identifier.asScopeID(scopeID)
     const sid = Identifier.asSessionID(sessionID)
     try {
-      const session = await Storage.read<any>(StoragePath.sessionInfo(scope, sid)).catch(() => undefined)
+      const session = await Storage.read<any>(StoragePath.sessionInfo(scope, sid)).catch(missingHistoricalRecord)
       const storedScope = session?.scope as Scope | undefined
       const runtimeScope = (await Scope.fromID(scopeID)) ?? storedScope
       if (!runtimeScope) continue
@@ -1571,11 +1524,11 @@ async function migrateSessionRootVariants(progress: (current: number, total: num
         scope: runtimeScope,
         workspace: session?.workspace,
         fn: async () => {
-          const messageIDs = await Storage.scan(StoragePath.sessionMessagesRoot(scope, sid)).catch(() => [])
+          const messageIDs = await Storage.scan(StoragePath.sessionMessagesRoot(scope, sid))
           for (const messageID of messageIDs) {
             const mid = Identifier.asMessageID(messageID)
             const key = StoragePath.messageInfo(scope, sid, mid)
-            const message = await Storage.read<MessageV2.Info>(key).catch(() => undefined)
+            const message = await Storage.read<MessageV2.Info>(key).catch(missingHistoricalRecord)
             if (!message || message.role !== "user" || message.isRoot !== true || message.variant) continue
             const variant = await SessionRootVariant.resolveLegacyRoot(message)
             if (!variant) continue
@@ -1600,11 +1553,11 @@ export const migrations: Migration[] = [
     id: "20260411-session-endpoint-index",
     description: "Backfill endpoint session index and remove legacy channel index",
     async up(progress) {
-      const scopeIDs = await Storage.scan(["sessions"])
+      const scopeIDs = await SessionMigrationTarget.scopes()
       const tasks: Array<{ scopeID: string; sessionID: string }> = []
 
       for (const scopeID of scopeIDs) {
-        const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(Identifier.asScopeID(scopeID)))
+        const sessionIDs = await SessionMigrationTarget.sessions(scopeID)
         for (const sessionID of sessionIDs) {
           tasks.push({ scopeID, sessionID })
         }
@@ -1616,7 +1569,7 @@ export const migrations: Migration[] = [
       for (const { scopeID, sessionID } of tasks) {
         const scope = Identifier.asScopeID(scopeID)
         const session = Identifier.asSessionID(sessionID)
-        const info = await Storage.read<Info>(StoragePath.sessionInfo(scope, session)).catch(() => undefined)
+        const info = await Storage.read<Info>(StoragePath.sessionInfo(scope, session)).catch(missingHistoricalRecord)
 
         if (info?.endpoint && !info.time.archived) {
           const endpointKey = SessionEndpoint.toKey(info.endpoint)
@@ -1630,7 +1583,7 @@ export const migrations: Migration[] = [
         progress(done, tasks.length)
       }
 
-      await Storage.removeTree(["channel_session"]).catch(() => undefined)
+      await Storage.removeTree(["channel_session"]).catch(missingHistoricalRecord)
       log.info("endpoint session index backfill complete", { total: tasks.length })
     },
   },
@@ -1638,11 +1591,11 @@ export const migrations: Migration[] = [
     id: "20260411-holos-message-metadata-shape",
     description: "Normalize legacy Holos message metadata into grouped fields",
     async up(progress) {
-      const scopeIDs = await Storage.scan(["sessions"])
+      const scopeIDs = await SessionMigrationTarget.scopes()
       const tasks: Array<{ scopeID: string; sessionID: string; messageID: string }> = []
 
       for (const scopeID of scopeIDs) {
-        const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(Identifier.asScopeID(scopeID)))
+        const sessionIDs = await SessionMigrationTarget.sessions(scopeID)
         for (const sessionID of sessionIDs) {
           const messageIDs = await Storage.scan(
             StoragePath.sessionMessagesRoot(Identifier.asScopeID(scopeID), Identifier.asSessionID(sessionID)),
@@ -1685,13 +1638,13 @@ export const migrations: Migration[] = [
     id: "20260423-session-page-index-and-last-exchange",
     description: "Build session page index per scope and backfill lastExchange on session info",
     async up(progress) {
-      const scopeIDs = await Storage.scan(["sessions"])
+      const scopeIDs = await SessionMigrationTarget.scopes()
       if (scopeIDs.length === 0) return
 
       let totalSessions = 0
       const scopeTasks: Array<{ scopeID: string; sessionIDs: string[] }> = []
       for (const scopeID of scopeIDs) {
-        const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(Identifier.asScopeID(scopeID)))
+        const sessionIDs = await SessionMigrationTarget.sessions(scopeID)
         if (sessionIDs.length > 0) {
           scopeTasks.push({ scopeID, sessionIDs })
           totalSessions += sessionIDs.length
@@ -1733,12 +1686,12 @@ export const migrations: Migration[] = [
           if (!session.lastExchange && !session.time.archived) {
             const lastExchange: NonNullable<Info["lastExchange"]> = {}
             const sID = Identifier.asSessionID(session.id)
-            const msgIDs = await Storage.scan(StoragePath.sessionMessagesRoot(scope, sID)).catch(() => [])
+            const msgIDs = await Storage.scan(StoragePath.sessionMessagesRoot(scope, sID))
 
             for (let mi = msgIDs.length - 1; mi >= 0; mi--) {
               const msgInfo = await Storage.read<MessageV2.Info>(
                 StoragePath.messageInfo(scope, sID, Identifier.asMessageID(msgIDs[mi])),
-              ).catch(() => undefined)
+              ).catch(missingHistoricalRecord)
               if (!msgInfo) continue
 
               const partIDs = await Storage.scan(
@@ -1787,7 +1740,7 @@ export const migrations: Migration[] = [
     id: "20260423-session-page-index-parentid",
     description: "Add parentID to session page index entries",
     async up(progress) {
-      const scopeIDs = await Storage.scan(["sessions"]).catch(() => [])
+      const scopeIDs = await SessionMigrationTarget.scopes()
       let done = 0
 
       for (const scopeID of scopeIDs) {
@@ -1831,7 +1784,7 @@ export const migrations: Migration[] = [
     id: "20260617-session-nav-v2-category",
     description: "Build session navigation v2 indexes and backfill session categories",
     async up(progress) {
-      const scopeIDs: string[] = await Storage.scan(["sessions"]).catch(() => [])
+      const scopeIDs: string[] = await SessionMigrationTarget.scopes()
       const allScopeIDs = scopeIDs.includes("home") ? scopeIDs : ["home", ...scopeIDs]
       if (allScopeIDs.length === 0) return
 
@@ -1870,7 +1823,7 @@ export const migrations: Migration[] = [
       const { SnapshotLease } = await import("./snapshot-lease")
       await using snapshots = await SnapshotLease.acquireHome(Global.Path.data)
       const snapshotRoot = Global.Path.snapshot
-      const scopeIDs = await Storage.scan(["sessions"])
+      const scopeIDs = await SessionMigrationTarget.scopes()
       if (scopeIDs.length === 0) return
 
       let done = 0
@@ -1904,15 +1857,15 @@ export const migrations: Migration[] = [
         const hasSharedOld =
           sharedExists || ((await fs.stat(path.join(sharedPath, "HEAD")).catch(() => null))?.isFile() ?? false)
 
-        const sessions = await Storage.scan(StoragePath.sessionsRoot(Identifier.asScopeID(scopeID)))
+        const sessions = await SessionMigrationTarget.sessions(scopeID)
 
-        for (const sessionID of sessions) {
+        await work(MIGRATION_CONCURRENCY, sessions, async (sessionID) => {
           const sessionRepo = path.join(oldSharedPath, sessionID)
 
           // Idempotent: skip if repo already exists
           try {
             await fs.stat(path.join(sessionRepo, "HEAD"))
-            continue
+            return
           } catch {
             // Repo does not exist, create it
           }
@@ -1930,7 +1883,7 @@ export const migrations: Migration[] = [
             await fs.mkdir(infoDir, { recursive: true })
             await fs.writeFile(path.join(infoDir, "alternates"), objectsPath + "\n")
           }
-        }
+        })
 
         done++
         progress(done, scopeIDs.length)
@@ -1944,13 +1897,13 @@ export const migrations: Migration[] = [
     description: "Strip endpoint from home-scope app-channel sessions and rebuild home nav index",
     async up(progress) {
       const scope = Identifier.asScopeID("home")
-      const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+      const sessionIDs = await SessionMigrationTarget.sessions(scope)
       if (sessionIDs.length === 0) return
 
       let done = 0
       for (const sessionID of sessionIDs) {
         const sID = Identifier.asSessionID(sessionID)
-        const info = await Storage.read<any>(StoragePath.sessionInfo(scope, sID)).catch(() => undefined)
+        const info = await Storage.read<any>(StoragePath.sessionInfo(scope, sID)).catch(missingHistoricalRecord)
 
         // Strip endpoint from app-channel sessions
         if (info?.endpoint?.channel?.type === "app") {
@@ -1987,6 +1940,10 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260630-session-attachment-parts",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
     description: "Migrate session file parts and artifact-only media metadata to attachment parts",
     async up(progress) {
       await migrateSessionAttachmentParts(progress)
@@ -1994,6 +1951,10 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260630-session-tool-card-display",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
     description: "Migrate media tool display visibility into explicit tool card display policy",
     async up(progress) {
       await migrateSessionToolDisplayMetadata(progress)
@@ -2001,6 +1962,10 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260701-attachment-presentation-v2",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
     description: "Normalize attachment presentation controls and remove tool-level attachment promotion fields",
     async up(progress) {
       await migrateSessionAttachmentParts(progress)
@@ -2008,6 +1973,10 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260701-bounded-session-data",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
     description: "Canonicalize session history, tool output, and diffs into bounded persistent shapes",
     async up(progress) {
       await migrateBoundedSessionData(progress)
@@ -2049,15 +2018,19 @@ export const migrations: Migration[] = [
     // the read path computes. A new id ensures it applies even where the old one
     // already ran.
     id: "20260705-message-v2-semantics-derive",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
     description:
       "Backfill canonical message semantics (rootID/isRoot/visible/origin, TextPart.origin) via shared derivation",
     async up(progress) {
-      const scopeIDs = await Storage.scan(["sessions"]).catch(() => [])
+      const scopeIDs = await SessionMigrationTarget.scopes()
       const tasks: Array<{ scopeID: string; sessionID: string }> = []
 
       for (const scopeID of scopeIDs) {
         const scope = Identifier.asScopeID(scopeID)
-        const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scope)).catch(() => [])
+        const sessionIDs = await SessionMigrationTarget.sessions(scope)
         for (const sessionID of sessionIDs) {
           tasks.push({ scopeID, sessionID })
         }
@@ -2066,31 +2039,30 @@ export const migrations: Migration[] = [
       if (tasks.length === 0) return
 
       let done = 0
-      for (const { scopeID, sessionID } of tasks) {
+      await work(MIGRATION_CONCURRENCY, tasks, async ({ scopeID, sessionID }) => {
         const scope = Identifier.asScopeID(scopeID)
         const sid = Identifier.asSessionID(sessionID)
-        const messageIDs = (await Storage.scan(StoragePath.sessionMessagesRoot(scope, sid)).catch(() => []))
-          .slice()
-          .sort()
+        const messageIDs = (await Storage.scan(StoragePath.sessionMessagesRoot(scope, sid))).slice().sort()
 
         // Load the whole session (info + parts) in order so deriveSemantics can
         // resolve rootID chains across roots, injected messages, and assistants.
         const withParts: MessageV2.WithParts[] = []
         for (const messageID of messageIDs) {
           const mid = Identifier.asMessageID(messageID)
-          const info = await Storage.read<any>(StoragePath.messageInfo(scope, sid, mid)).catch(() => undefined)
+          const info = await Storage.read<any>(StoragePath.messageInfo(scope, sid, mid)).catch(missingHistoricalRecord)
           if (!info) continue
-          const partIDs = (await Storage.scan(StoragePath.messageParts(scope, sid, mid)).catch(() => [])).slice().sort()
+          const partIDs = (await Storage.scan(StoragePath.messageParts(scope, sid, mid))).slice().sort()
           const parts: any[] = []
           for (const partID of partIDs) {
             const part = await Storage.read<any>(
               StoragePath.messagePart(scope, sid, mid, Identifier.asPartID(partID)),
-            ).catch(() => undefined)
+            ).catch(missingHistoricalRecord)
             if (part) parts.push(part)
           }
           withParts.push({ info, parts })
         }
 
+        const writer = migrationWriter()
         const derived = MessageV2.deriveSemantics(withParts)
 
         for (let i = 0; i < derived.length; i++) {
@@ -2099,7 +2071,7 @@ export const migrations: Migration[] = [
           const mid = Identifier.asMessageID(after.info.id)
 
           if (canonicalFieldsDiffer(before.info, after.info)) {
-            await Storage.write(StoragePath.messageInfo(scope, sid, mid), after.info)
+            await writer.write(StoragePath.messageInfo(scope, sid, mid), after.info)
           }
 
           for (let p = 0; p < after.parts.length; p++) {
@@ -2107,17 +2079,15 @@ export const migrations: Migration[] = [
             const afterPart = after.parts[p]
             if (afterPart.type !== "text") continue
             if (beforePart?.origin !== afterPart.origin) {
-              await Storage.write(
-                StoragePath.messagePart(scope, sid, mid, Identifier.asPartID(afterPart.id)),
-                afterPart,
-              )
+              await writer.write(StoragePath.messagePart(scope, sid, mid, Identifier.asPartID(afterPart.id)), afterPart)
             }
           }
         }
 
+        await writer.flush()
         done++
         progress(done, tasks.length)
-      }
+      })
 
       log.info("message semantics backfill complete", { total: tasks.length })
     },
@@ -2126,7 +2096,7 @@ export const migrations: Migration[] = [
     id: "20260706-session-nav-channel-fields",
     description: "Rebuild session nav indexes to backfill channel grouping fields (chatId, chatName, chatType)",
     async up(progress) {
-      const scopeIDs: string[] = await Storage.scan(["sessions"]).catch(() => [])
+      const scopeIDs: string[] = await SessionMigrationTarget.scopes()
       const allScopeIDs = scopeIDs.includes("home") ? scopeIDs : ["home", ...scopeIDs]
       if (allScopeIDs.length === 0) return
 
@@ -2143,6 +2113,10 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260707-cortex-task-output-contract",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
     description: "Migrate Cortex task metadata to outputConfig/output contract and remove legacy output fields",
     async up(progress) {
       await migrateCortexTaskOutputContract(progress)
@@ -2150,6 +2124,10 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260711-cortex-task-identity",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
     description: "Persist Cortex task IDs for durable delegated-task handles",
     async up(progress) {
       await migrateCortexTaskIdentity(progress)
@@ -2157,6 +2135,10 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260715-retired-intent-analyst-dag-assign",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
     description: "Migrate retired intent-analyst DAG assignments to the primary orchestrator",
     async up(progress) {
       await migrateRetiredIntentAnalystDagAssignments(progress)
@@ -2164,6 +2146,10 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260716-bounded-diff-aggregate-preview",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
     description: "Bound aggregate diff preview bytes in persisted session and message summaries",
     async up(progress) {
       await migrateBoundedDiffAggregatePreviews(progress)
@@ -2185,6 +2171,11 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260730-session-nav-channel-provider-fields",
+    scope: "derived",
+    async upSession(owner) {
+      const { SessionCompat } = await import("./compat-import")
+      await SessionCompat.writeSessionIndexes(owner)
+    },
     description: "Rebuild session nav indexes to backfill Channel provider metadata",
     async up(progress) {
       await SessionNav.rebuildAllNavIndexes(progress)
@@ -2192,7 +2183,25 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260828-session-nav-timestamps",
+    scope: "derived",
+    async upSession(owner) {
+      const { SessionCompat } = await import("./compat-import")
+      await SessionCompat.writeSessionIndexes(owner)
+    },
     description: "Rebuild session nav indexes to backfill created/updated/archived timestamps",
+    async up(progress) {
+      await SessionNav.rebuildAllNavIndexes(progress)
+    },
+  },
+  {
+    id: "20260918-session-nav-identity",
+    scope: "derived",
+    async upSession(owner) {
+      const { SessionCompat } = await import("./compat-import")
+      await SessionCompat.writeSessionIndexes(owner)
+    },
+    description:
+      "Rebuild session nav indexes to backfill session identity (Blueprint phase, workspace type, workflow activity)",
     async up(progress) {
       await SessionNav.rebuildAllNavIndexes(progress)
     },
@@ -2202,6 +2211,12 @@ export const migrations: Migration[] = [
 
   {
     id: "20260907-snapshot-shared-store",
+    scope: "session",
+    execution: "session",
+    async upSession(owner) {
+      const { SnapshotMaintenance } = await import("./snapshot-maintenance")
+      await SnapshotMaintenance.registerLegacy(undefined, owner.scopeID, owner.sessionID)
+    },
     dependsOn: ["20260619-snapshot-per-session"],
     description: "Register legacy snapshot owners before enabling Scope-shared storage",
     async up(progress) {
@@ -2211,11 +2226,116 @@ export const migrations: Migration[] = [
   },
   {
     id: "20260907-snapshot-release-orphan-owners",
+    scope: "global",
+    execution: "after-convergence",
     dependsOn: ["20260907-snapshot-shared-store"],
     description: "Release legacy owner records that the shared-store migration created for orphan directories",
     async up(progress) {
       const { SnapshotMaintenance } = await import("./snapshot-maintenance")
       await SnapshotMaintenance.releaseOrphanOwners(progress)
+    },
+  },
+  {
+    id: "20260914-transactional-session-indexes",
+    scope: "derived",
+    async upSession(owner) {
+      const { SessionCompat } = await import("./compat-import")
+      await SessionCompat.writeSessionIndexes(owner)
+    },
+    description: "Build Session lookup and navigation projections from transactional authority",
+    async up(progress) {
+      const { Session } = await import(".")
+      progress?.(0, 1)
+      await Storage.transaction((tx) => Session.rebuildStorageIndexes(tx))
+      progress?.(1, 1)
+    },
+  },
+  {
+    id: "20260914-inbox-delivery-receipts",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
+    description: "Index historical inbox materializations without replaying deliveries",
+    async up(progress) {
+      const { SessionInbox } = await import("./inbox")
+      let done = 0
+      let batch: Array<{ scopeID: string; message: MessageV2.Info }> = []
+      const flush = async () => {
+        if (!batch.length) return
+        const pending = batch
+        batch = []
+        await Storage.transaction(async () => {
+          for (const { scopeID, message } of pending) {
+            const deliveryKey = message.metadata?.inboxDeliveryKey
+            const itemID =
+              typeof deliveryKey === "string"
+                ? SessionInbox.stableDeliveryItemID(message.sessionID, deliveryKey)
+                : /^msg_[a-f0-9]{26}$/.test(message.id)
+                  ? `inb_${message.id.slice(4)}`
+                  : undefined
+            if (itemID)
+              await Storage.transaction(async () => {
+                const key = ["sessions", scopeID, message.sessionID, "inbox-materialized", itemID]
+                if ((await Storage.readMany([key]))[0] === undefined)
+                  await Storage.write(key, {
+                    itemID,
+                    messageID: message.id,
+                    deliveryKey,
+                    completedAt: message.time.created,
+                  })
+              })
+            done++
+            if (done % 128 === 0) progress?.(0, 0)
+          }
+        })
+      }
+      for await (const record of SessionMigrationTarget.records<MessageV2.Info>({ kind: "message" })) {
+        batch.push({ scopeID: record.key[1], message: record.value })
+        if (batch.length >= 256) await flush()
+      }
+      await flush()
+      progress?.(done, done)
+    },
+  },
+  {
+    id: "20260918-index-continuation-recovery",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
+    description: "Move continuation recovery intents into indexed Session records",
+    async up(progress) {
+      const { RolloutContinuationRecovery } = await import("./rollout/continuation-recovery")
+      let done = 0
+      progress?.(0, 0)
+      for await (const { key } of SessionMigrationTarget.records({ kind: "session" })) {
+        const owner = { kind: "session" as const, scopeID: key[1], sessionID: key[2] }
+        const legacy = [
+          ...StoragePath.sessionRolloutRoot(Identifier.asScopeID(key[1]), Identifier.asSessionID(key[2])),
+          "continuation-recovery",
+        ]
+        for (const runID of await Storage.scan(legacy)) {
+          await Storage.transaction(async () => {
+            await RolloutContinuationRecovery.request(owner, runID)
+            await Storage.remove([...legacy, runID])
+          })
+        }
+        done++
+        if (done % 128 === 0) progress?.(done, 0)
+      }
+      progress?.(done, done)
+    },
+  },
+  {
+    id: "20260919-settle-orphaned-tool-parts",
+    scope: "session",
+    upSession(owner, progress) {
+      return SessionMigrationTarget.provide(owner, () => this.up(progress))
+    },
+    description: "Settle tool parts left running on terminal assistant messages by an interrupted runtime",
+    async up(progress) {
+      await migrateOrphanedToolParts(progress)
     },
   },
 ]

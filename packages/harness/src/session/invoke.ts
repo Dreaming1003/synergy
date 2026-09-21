@@ -74,6 +74,7 @@ import type { ToolDisplay } from "@ericsanchezok/synergy-util/tool"
 import { ObservabilitySpans } from "../observability/spans"
 import { ObservabilityContext } from "../observability/context"
 import { SkillSourceProfile } from "../instruction/source-profile"
+import { SecretVault } from "../secrets/vault"
 
 export { InvokeInput, resolveInputParts } from "./input"
 
@@ -84,6 +85,11 @@ export namespace SessionInvoke {
   const log = Log.create({ service: "session.invoke" })
   const ephemeralToolsByMessage = new Map<string, ToolResolver.EphemeralTool[]>()
   const maxOutputTokensByMessage = new Map<string, number>()
+  // Calibration adds a cheap chars/4 delta to provider-reported input. That is
+  // only trustworthy while the delta stays small relative to the measured
+  // baseline; past this ratio the heuristic's own error dominates and a
+  // full measurement is cheaper than guessing.
+  const CALIBRATION_MAX_DELTA_RATIO = 0.25
 
   function channelDeliveryMetadata(messages: MessageV2.WithParts[], afterIndex: number) {
     let channelPush = false
@@ -141,14 +147,14 @@ export namespace SessionInvoke {
   export function cancel(
     sessionID: string,
     options?: { recoverQueuedTasks?: boolean; fenceQueuedWork?: boolean; fenceQueuedBefore?: number },
-  ) {
+  ): SessionManager.AbortOutcome {
     log.info("cancel", { sessionID })
     evictRecallCache(sessionID)
     PermissionNext.clearForSession(sessionID).catch((err) => {
       log.error("permission cleanup failed", { sessionID, error: err })
     })
     LoopJob.cancelDetached(sessionID)
-    SessionManager.signalAbort(sessionID, options)
+    return SessionManager.signalAbort(sessionID, options)
   }
 
   /**
@@ -158,14 +164,90 @@ export namespace SessionInvoke {
    * @returns Whether an incomplete assistant message was repaired.
    */
   export async function repairAfterAbort(sessionID: string): Promise<boolean> {
+    return (await repairAbortState(sessionID)).repaired
+  }
+
+  export interface AbortRepairState {
+    /** An interrupted turn was terminalized and had non-terminal tool parts
+     * settled, or its stale pendingReply was cleared. */
+    repaired: boolean
+    /** A workflow claiming activity without a durable driver was terminalized. */
+    abandoned: boolean
+    /** Idle was published because this call actually cleared the last work. */
+    settled: boolean
+  }
+
+  export interface AbortRepairOptions {
+    /**
+     * True when the preceding stop signal interrupted a live turn.
+     *
+     * A loop being driven at signal time is not a phantom. Between turns a
+     * healthy BlueprintLoop has no *durable* driver — the continuation kernel
+     * re-drives it in-process when the turn settles — so it is indistinguishable
+     * in storage from a loop orphaned by a dead runtime. Sampling liveness after
+     * the signal is therefore not enough: the release that ends the interrupted
+     * turn clears the owner inside that window, and abandoning on that basis
+     * would silently turn "stop this turn" into "terminate the workflow".
+     * Requiring the session to have been unoccupied *before* the signal keeps
+     * the escape hatch for genuinely driverless loops without racing a healthy
+     * one. An explicit cancel remains the way to end a loop deliberately.
+     */
+    turnWasRunning?: boolean
+  }
+
+  /**
+   * Repair everything a stopped turn can leave behind, and report what changed
+   * so a caller can tell a real stop from a no-op on an already-idle session.
+   */
+  export async function repairAbortState(
+    sessionID: string,
+    options: AbortRepairOptions = {},
+  ): Promise<AbortRepairState> {
     const repaired = await repairIncompleteAssistant(sessionID).catch((err) => {
       log.error("assistant repair after abort failed", { sessionID, error: err })
       return false
     })
-    if (!repaired || SessionManager.isRunning(sessionID)) return repaired
-    if (await SessionWorking.resolve(sessionID)) return repaired
-    await SessionManager.publishStatusOnly(sessionID, { type: "idle" })
-    return repaired
+    if (SessionManager.isRunning(sessionID)) return { repaired, abandoned: false, settled: false }
+    if (options.turnWasRunning) return { repaired, abandoned: false, settled: false }
+
+    // No live loop owns this session, and none was being driven when the stop
+    // was requested. A workflow that still reports activity while nothing
+    // durable will resume it is a phantom: it would pin the session in
+    // `recovering` with no way for the user to clear it. Abandon it so the
+    // derived status can settle. A loop held by real evidence (a stop intent, a
+    // queued drive, a Lattice-owned run, a user pause) is untouched.
+    const abandoned = await abandonPhantomWorkflows(sessionID).catch((err) => {
+      log.error("phantom workflow abandonment failed", { sessionID, error: err })
+      return false
+    })
+
+    // A repeat abort must not republish idle, so only settle status when this
+    // call actually changed durable state.
+    const changed = repaired || abandoned
+    if (!changed) return { repaired, abandoned, settled: false }
+    const settled = await settleIdle(sessionID)
+    return { repaired, abandoned, settled }
+  }
+
+  async function settleIdle(sessionID: string): Promise<boolean> {
+    try {
+      if (await SessionWorking.resolve(sessionID)) return false
+      await SessionManager.publishStatusOnly(sessionID, { type: "idle" })
+      return true
+    } catch (err) {
+      // The turn is already terminalized and any phantom workflow is already
+      // abandoned, so the observable repair succeeded. Reporting a failure here
+      // would invite a retry against state that no longer matches the caller's
+      // assumptions.
+      log.warn("abort idle publication failed", { sessionID, error: err })
+      return false
+    }
+  }
+
+  async function abandonPhantomWorkflows(sessionID: string): Promise<boolean> {
+    const session = await SessionManager.getSession(sessionID)
+    if (!session || session.time.archived) return false
+    return SessionExecutionContributions.abandonPhantom(session)
   }
 
   type InternalInvokeInput = InvokeInput & {
@@ -393,17 +475,18 @@ export namespace SessionInvoke {
     let session = await Session.get(sessionID)
     SessionManager.assertExecutionContext(session, "session loop")
     let scopeID = (session.scope as Scope).id
+    let parkedTask: { itemID: string; reason: string } | undefined
 
     while (true) {
       const root = (await SessionHistory.modelMessages({ sessionID })).findLast(
         (message) => message.info.role === "user" && message.info.isRoot === true,
       )
       if (!root) {
-        const task = await SessionInbox.peekTask(sessionID)
-        if (!task) break
-        if (!(await SessionInbox.materializeItem(task)))
-          throw new Error(`Session inbox task could not be materialized: ${task.id}`)
-        await SessionInbox.commitReady(sessionID, [task.id])
+        // A parked failure stays in the inbox and is skipped by the next peek,
+        // so the loop keeps consuming runnable tasks until none remain.
+        const result = await SessionInbox.materializeNextTask(sessionID)
+        if (result.status === "empty") break
+        if (result.status === "failed") parkedTask = { itemID: result.itemID, reason: result.reason }
         continue
       }
       const configuration = await RolloutLifecycle.configuration(session, root.info.id)
@@ -469,7 +552,7 @@ export namespace SessionInvoke {
                 // so they can trigger a model call in this iteration. Context items follow
                 // in ② after the predicate confirms a call is needed (piggyback).
                 if (!rollbackActive) {
-                  const steerItems = await SessionInbox.drainSteer(sessionID)
+                  const steerItems = await SessionInbox.peekSteer(sessionID)
                   if (steerItems.length > 0) {
                     log.info("drained steer items into session", { sessionID, count: steerItems.length })
                     for (const item of steerItems) {
@@ -530,7 +613,7 @@ export namespace SessionInvoke {
               // Mode-based drain ②: context items piggyback on confirmed model call.
               // Materialized after needsModelCall is true; do NOT wake idle sessions.
               if (!rollbackActive) {
-                const contextItems = await SessionInbox.drainContext(sessionID)
+                const contextItems = await SessionInbox.peekContext(sessionID)
                 if (contextItems.length > 0) {
                   log.info("drained context items (piggyback)", { sessionID, count: contextItems.length })
                   for (const item of contextItems) {
@@ -720,7 +803,7 @@ export namespace SessionInvoke {
               const isTopSession = !session.parentID
 
               const turnPreparation = await Promise.all([
-                ToolResolver.definitions({
+                ToolResolver.availability({
                   agent,
                   model,
                   sessionID,
@@ -744,13 +827,14 @@ export namespace SessionInvoke {
               if (!turnPreparation) break
 
               let [
-                toolDefinitions,
+                toolAvailability,
                 [envParts, customParts],
                 cortexExecutionContext,
                 cortexReminder,
                 advisoryParts,
                 memoryResult,
               ] = turnPreparation
+              let toolDefinitions = toolAvailability.visible
 
               for (const def of toolDefinitions) {
                 if (def.display) toolDisplayByName.set(def.id, def.display)
@@ -846,6 +930,20 @@ export namespace SessionInvoke {
               // Domain advisories share the turn cancellation signal.
               lateSystemParts.push(...advisoryParts)
 
+              // Secret token semantics — present only when the vault is in
+              // use, so installs that never register secrets see no extra
+              // prompt bytes.
+              if (await SecretVault.hasAny()) {
+                lateSystemParts.push(
+                  "<secret-tokens>\n" +
+                    "Registered secrets appear in this conversation only as ⟦sec:<id>⟧ references. " +
+                    "Synergy resolves them to the real values automatically when a tool call executes; " +
+                    "never ask the user to paste the plaintext. Restating or writing a token is safe — " +
+                    "it resolves at execution time.\n" +
+                    "</secret-tokens>",
+                )
+              }
+
               // Layer 6: Dynamic advisory context — cortex reminders and time context
               if (cortexReminder) lateSystemParts.push(cortexReminder)
 
@@ -920,7 +1018,7 @@ export namespace SessionInvoke {
               promptPlanTimer.stop()
               if (!promptPlan) break
 
-              const calibration = buildCalibration(msgs)
+              const calibration = buildCalibration(msgs, model)
               const requestedMaxOutputTokens = maxOutputTokensByMessage.get(R.id)
               const promptDecideTimer = log.time("promptBudgeter.decide")
               let promptDecision = await PromptBudgeter.decide(promptPlan, model.limit, model.id, {
@@ -979,16 +1077,19 @@ export namespace SessionInvoke {
               }
 
               const toolResolveTimer = log.time("toolResolver.resolve")
-              let resolvedTools = await ToolResolver.resolveWithAvailability({
-                agent,
-                model,
-                sessionID,
-                processor,
-                session,
-                userTools: R.tools,
-                ephemeralTools: ephemeralToolsByMessage.get(R.id),
-                includeMCP: true,
-              }).catch(async (error) => {
+              let resolvedTools = await ToolResolver.resolveWithAvailability(
+                {
+                  agent,
+                  model,
+                  sessionID,
+                  processor,
+                  session,
+                  userTools: R.tools,
+                  ephemeralTools: ephemeralToolsByMessage.get(R.id),
+                  includeMCP: true,
+                },
+                toolAvailability,
+              ).catch(async (error) => {
                 await completeAssistantWithError({ sessionID, processor, model, error })
                 return undefined
               })
@@ -1149,6 +1250,7 @@ export namespace SessionInvoke {
                 contextUsageProvenance,
                 maxOutputTokens: promptDecision.maxOutputTokens,
                 memoryTurn,
+                lane: session.parentID ? "background" : "interactive",
               }
               try {
                 const currentStreamInput = streamInput
@@ -1322,21 +1424,20 @@ export namespace SessionInvoke {
               }
             }
 
-            const taskItem = await SessionInbox.peekTask(sessionID)
-            if (taskItem) {
-              log.info("next task found, materializing", { sessionID, itemID: taskItem.id })
-              const materialized = await SessionInbox.materializeItem(taskItem)
-              if (!materialized) {
-                throw new Error(`Session inbox task could not be materialized: ${taskItem.id}`)
-              }
-              await SessionInbox.commitReady(sessionID, [taskItem.id])
+            const nextTask = await SessionInbox.materializeNextTask(sessionID)
+            if (nextTask.status === "materialized") {
               log.info("materialized durable task", {
                 sessionID,
-                itemID: taskItem.id,
-                messageID: taskItem.messageID,
-                queuedForMs: Math.max(0, Date.now() - taskItem.time.created),
+                itemID: nextTask.itemID,
+                messageID: nextTask.messageID,
               })
               return true
+            }
+            if (nextTask.status === "failed") {
+              log.warn("parked inbox task blocked task materialization", {
+                sessionID,
+                itemID: nextTask.itemID,
+              })
             }
 
             const rollbackActive = (await SessionHistory.storedInfo(sessionID))?.rollback?.canUnrollback === true
@@ -1360,6 +1461,12 @@ export namespace SessionInvoke {
     })
 
     let resultMessage = selectResultMessage(await SessionHistory.modelMessages({ sessionID }))
+    // A session whose only queued task is parked never produced a transcript;
+    // surface the parked failure instead of synthesizing an aborted assistant
+    // message with fabricated lineage.
+    if (!resultMessage && parkedTask && !abort.aborted) {
+      throw new Error(`Session inbox task could not be materialized: ${parkedTask.itemID} (${parkedTask.reason})`)
+    }
     if (!resultMessage) {
       resultMessage = await writeAbortedAssistantMessage(sessionID, scopeID)
     }
@@ -1403,6 +1510,52 @@ export namespace SessionInvoke {
   // --- Helpers ---
 
   /**
+   * Settle every unsettled tool part in the session whose owning assistant
+   * message is already terminal.
+   *
+   * A part is only ever left in `running`/`pending`/`generating` by a process
+   * that died mid-call, and session turns are serialized, so an unsettled part
+   * on a terminal message can never be settled by anything else. The existing
+   * in-process path (SessionProcessor.resolveUnsettledParts) already
+   * terminalizes such parts as `error`, so this reuses that state rather than
+   * inventing a new one.
+   *
+   * The sweep covers the whole session rather than only the newest reply: if a
+   * repair is lost after the message is superseded by a later turn, a
+   * latest-message-only repair never revisits it and the part would render as a
+   * permanent spinner forever.
+   */
+  async function settleOrphanedToolParts(input: { sessionID: string }): Promise<number> {
+    const messages = await SessionHistory.modelMessages({ sessionID: input.sessionID }).catch(() => [])
+    let settled = 0
+    for (const message of messages) {
+      if (message.info.role !== "assistant") continue
+      const assistant = message.info as MessageV2.Assistant
+      if (!SessionProgress.isTerminalAssistant(assistant)) continue
+      for (const part of message.parts) {
+        if (part.type !== "tool") continue
+        if (!MessageV2.isUnsettledToolState(part.state)) continue
+        const state = part.state
+        await Session.updatePart({
+          ...part,
+          state: {
+            status: "error",
+            input: state.input,
+            error: MessageV2.INTERRUPTED_TOOL_ERROR,
+            ...(state.metadata ? { metadata: state.metadata } : {}),
+            time: {
+              start: state.status === "running" ? state.time.start : assistant.time.created,
+              end: Date.now(),
+            },
+          },
+        })
+        settled++
+      }
+    }
+    return settled
+  }
+
+  /**
    * Terminalize the latest reply-required root after an interrupted turn.
    * The repair is root-anchored and serialized per session so startup, Abort,
    * and pre-wake callers can safely share the same idempotent operation.
@@ -1443,7 +1596,11 @@ export namespace SessionInvoke {
     if (!latestRoot && !latestAssistant) return false
 
     if (latestAssistant && SessionProgress.isTerminalAssistant(latestAssistant)) {
-      if (!session.pendingReply) return false
+      // The message is already terminal, but a process that died mid-turn can
+      // still have left its tool parts non-terminal. Settle them here rather
+      // than returning early, or they stay `running` forever.
+      const settled = await settleOrphanedToolParts({ sessionID })
+      if (!session.pendingReply) return settled > 0
       await Session.update(sessionID, (draft) => {
         draft.pendingReply = undefined
       })
@@ -1469,6 +1626,7 @@ export namespace SessionInvoke {
                 message: "Session aborted during turn — assistant response was not completed",
               }).toObject(),
       })
+      await settleOrphanedToolParts({ sessionID })
     } else if (latestRoot) {
       log.info("creating aborted assistant for pending root", {
         sessionID,
@@ -2288,7 +2446,10 @@ export namespace SessionInvoke {
    * new messages, rather than re-tokenizing the entire conversation through
    * a mismatched tokenizer (o200k_base can overestimate by ~2x for Claude).
    */
-  function buildCalibration(msgs: MessageV2.WithParts[]): PromptBudgeter.Calibration | undefined {
+  export function buildCalibration(
+    msgs: MessageV2.WithParts[],
+    model: Provider.Model,
+  ): PromptBudgeter.Calibration | undefined {
     let calibrationIdx = -1
     let calibrationTokens: MessageV2.Assistant["tokens"] | undefined
     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -2299,6 +2460,11 @@ export namespace SessionInvoke {
         if (assistant.finish) break
         continue
       }
+      // Provider-reported input is only a valid baseline for the same model: a
+      // model switch changes the system prompt, the tool set, and the
+      // tokenizer, so another model's count is not a starting point for this
+      // prompt. Skipping it falls back to a full measurement instead.
+      if (assistant.providerID !== model.providerID || assistant.modelID !== model.id) continue
       const tokens = assistant.tokens
       if (ModelLimit.actualInput(tokens) > 0) {
         calibrationIdx = i
@@ -2311,12 +2477,21 @@ export namespace SessionInvoke {
     const actualInput = ModelLimit.actualInput(calibrationTokens)
     const outputTokens = calibrationTokens.output
 
+    // Reasoning traces are part of the outgoing prompt: the model projection
+    // keeps `reasoning` parts on the assistant messages, and the compatible SDK
+    // serializes them back to the provider (verified against a recorded request
+    // body, where the provider-reported input only reconciles when reasoning is
+    // counted). They are large and accumulate every turn, so omitting them
+    // under-counts the prompt by an amount that grows with conversation length.
     let deltaChars = 0
     for (let i = calibrationIdx + 1; i < msgs.length; i++) {
       for (const part of msgs[i].parts) {
         switch (part.type) {
           case "text":
             deltaChars += part.text?.length ?? 0
+            break
+          case "reasoning":
+            deltaChars += part.text.length
             break
           case "tool":
             if (part.state.status === "completed") {
@@ -2335,6 +2510,10 @@ export namespace SessionInvoke {
     // between tool steps and starts from provider-reported actual input tokens,
     // so only the small post-calibration delta is approximate.
     const deltaTokens = Math.ceil(deltaChars / 4)
+    // The heuristic is only trustworthy while the delta stays small next to the
+    // baseline it is added to. Once the delta dominates, its error does too;
+    // re-measuring costs a tokenizer pass and removes the guesswork.
+    if (deltaTokens > actualInput * CALIBRATION_MAX_DELTA_RATIO) return undefined
 
     return { actualInput, outputTokens, deltaTokens }
   }

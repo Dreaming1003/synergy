@@ -2,14 +2,41 @@ import {
   RUNTIME_STARTUP_MAX_LINE_LENGTH,
   RUNTIME_STARTUP_PREFIX,
   RuntimeStartupProgress,
+  type StorageMaintenanceEvent,
+  type StorageMaintenanceOperation,
+  type StorageMaintenanceStage,
 } from "@ericsanchezok/synergy-util/runtime-startup"
 import type { DesktopStartupStatus } from "./startup-page.js"
+
+type Maintenance = {
+  operation: StorageMaintenanceOperation
+  stage?: StorageMaintenanceStage
+  startedAt: number
+  deadline: number
+  timeoutMs: number
+}
+const maintenanceLabels: Record<StorageMaintenanceOperation, string> = {
+  vacuum: "Rebuilding the database.",
+  reclaim: "Reclaiming database space.",
+  "integrity-check": "Checking database integrity.",
+  "create-index": "Building a database index.",
+  "drop-index": "Removing a retired database index.",
+}
+const maintenanceStages: Record<StorageMaintenanceStage, string> = {
+  "checkpoint-before": "Preparing the database journal.",
+  rewrite: "Rebuilding the database.",
+  "checkpoint-after": "Finishing the database journal.",
+}
 
 export class DesktopServerStartup {
   private buffer = ""
   private discarded = false
-  private progress: RuntimeStartupProgress | undefined
+  private progress: Exclude<RuntimeStartupProgress, StorageMaintenanceEvent> | undefined
+  private readonly maintenance = new Map<number, Maintenance>()
+  private maintenanceSequence = 0
+  private failure?: Error
   private recoveryCompleted = false
+  private storageStep = 0
   private deadline: number
   private readonly now: () => number
   private readonly healthTimeoutMs: number
@@ -23,7 +50,7 @@ export class DesktopServerStartup {
       onStatus?: (status: DesktopStartupStatus) => void
     } = {},
   ) {
-    this.now = options.now ?? Date.now
+    this.now = options.now ?? (() => performance.now())
     this.healthTimeoutMs = options.healthTimeoutMs ?? 30_000
     this.migrationIdleMs = options.migrationIdleMs ?? 5 * 60_000
     this.deadline = this.now() + this.healthTimeoutMs
@@ -53,10 +80,23 @@ export class DesktopServerStartup {
       return
     }
     const parsed = RuntimeStartupProgress.safeParse(value)
-    if (!parsed.success || this.recoveryCompleted) return
+    if (!parsed.success || this.failure) return
     const next = parsed.data
+    if (next.phase === "maintenance") {
+      this.receiveMaintenance(next)
+      return
+    }
+    if (this.recoveryCompleted) return
     const previous = this.progress
-    if (next.phase === "migration" && previous && previous.phase !== "migration") return
+    if (next.phase === "storage") {
+      if (previous?.phase === "recovery" || next.step < this.storageStep) return
+      if (next.step === this.storageStep) {
+        if (previous?.phase !== "storage" || next.stage !== previous.stage) return
+        if (next.current <= previous.current && next.bytes <= previous.bytes) return
+      }
+      this.storageStep = next.step
+    }
+    if (next.phase === "migration" && previous && previous.phase !== "migration" && previous.phase !== "storage") return
     if (next.phase === "starting" && previous?.phase === "starting") return
     if (next.phase === "recovery" && previous?.phase === "recovery" && next.current <= previous.current) return
     if (next.phase === "migration" && previous?.phase === "migration") {
@@ -66,16 +106,93 @@ export class DesktopServerStartup {
     }
     this.progress = next
     if (next.phase === "starting" && previous?.phase === "recovery") this.recoveryCompleted = true
-    this.deadline = this.now() + (next.phase === "starting" ? this.healthTimeoutMs : this.migrationIdleMs)
+    const complete = next.phase === "starting" || (next.phase === "storage" && next.stage === "complete")
+    const timeout =
+      next.phase === "storage" && next.stage === "validate-engine" ? next.timeoutMs! : this.migrationIdleMs
+    this.deadline = this.now() + (complete ? this.healthTimeoutMs : timeout)
     this.options.onStatus?.(this.status())
   }
 
   remainingMs(): number {
-    return this.deadline - this.now()
+    if (this.failure) return 0
+    return (this.currentMaintenance()?.deadline ?? this.deadline) - this.now()
+  }
+
+  private currentMaintenance(): Maintenance | undefined {
+    let current: Maintenance | undefined
+    for (const entry of this.maintenance.values()) if (!current || entry.deadline < current.deadline) current = entry
+    return current
+  }
+
+  private receiveMaintenance(event: StorageMaintenanceEvent) {
+    if (event.state === "started") {
+      if (event.id <= this.maintenanceSequence) return
+      this.maintenanceSequence = event.id
+      if (this.maintenance.size >= 1024) {
+        this.failure = new Error("Too many concurrent startup maintenance operations")
+        return
+      }
+      const startedAt = this.now()
+      this.maintenance.set(event.id, {
+        operation: event.operation,
+        startedAt,
+        timeoutMs: event.timeoutMs,
+        deadline: startedAt + event.timeoutMs + 5000,
+      })
+    } else {
+      const current = this.maintenance.get(event.id)
+      if (!current) return
+      if (event.state === "stage") current.stage = event.stage
+      else {
+        this.maintenance.delete(event.id)
+        if (event.state === "failed")
+          this.failure = new Error(
+            `Synergy database maintenance ${current.operation} failed after ${event.elapsedMs}ms`,
+          )
+        this.deadline =
+          this.now() +
+          (this.progress &&
+          this.progress.phase !== "starting" &&
+          !(this.progress.phase === "storage" && this.progress.stage === "complete")
+            ? this.migrationIdleMs
+            : this.healthTimeoutMs)
+      }
+    }
+    this.options.onStatus?.(this.status())
   }
 
   status(): DesktopStartupStatus {
+    const maintenance = this.currentMaintenance()
+    if (maintenance)
+      return {
+        title: "Updating saved data",
+        detail: maintenance.stage ? maintenanceStages[maintenance.stage] : maintenanceLabels[maintenance.operation],
+        elapsedMs: Math.max(0, this.now() - maintenance.startedAt),
+      }
     const progress = this.progress
+    if (progress?.phase === "storage" && progress.stage !== "complete") {
+      if (progress.stage === "validate-engine")
+        return { title: "Updating saved data", detail: "Checking database integrity." }
+      const labels = {
+        prepare: "Preparing storage",
+        scan: "Scanning saved files",
+        backup: "Backing up saved files",
+        inventory: "Recording the backup inventory",
+        owners: "Checking saved sessions",
+        import: "Importing saved records",
+        verify: "Verifying the import",
+        "archive-verify": "Verifying the saved archive",
+        "archive-import": "Importing the saved archive",
+        validate: "Verifying saved records",
+        activate: "Activating saved records",
+        check: "Checking storage ownership",
+      }
+      return {
+        title: "Updating saved data",
+        detail: labels[progress.stage] + ". " + progress.current + " items checked.",
+        progress: progress.total > 0 ? { current: progress.current, total: progress.total } : undefined,
+      }
+    }
     if (progress?.phase === "recovery")
       return {
         title: "Restoring saved work",
@@ -94,7 +211,19 @@ export class DesktopServerStartup {
   }
 
   timeoutError(): Error {
+    if (this.failure) return this.failure
+    const maintenance = this.currentMaintenance()
+    if (maintenance)
+      return new Error(
+        `Synergy database maintenance ${maintenance.operation}${maintenance.stage ? ` (${maintenance.stage})` : ""} exceeded its ${maintenance.timeoutMs}ms waiting budget after ${Math.floor(this.now() - maintenance.startedAt)}ms`,
+      )
     const progress = this.progress
+    if (progress?.phase === "storage" && progress.stage === "validate-engine")
+      return new Error(`Synergy database integrity check exceeded its ${progress.timeoutMs}ms budget`)
+    if (progress?.phase === "storage" && progress.stage !== "complete")
+      return new Error(
+        `Synergy storage update made no progress for ${this.migrationIdleMs}ms (stage ${progress.stage}, ${progress.current} items checked)`,
+      )
     if (progress?.phase === "recovery")
       return new Error(
         `Synergy recovery made no progress for ${this.migrationIdleMs}ms (${progress.current} items checked)`,

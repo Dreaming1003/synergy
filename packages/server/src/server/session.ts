@@ -619,10 +619,10 @@ export const SessionRoute = new Hono()
       operationId: "session.abort",
       responses: {
         200: {
-          description: "Aborted session",
+          description: "Abort result",
           content: {
             "application/json": {
-              schema: resolver(z.boolean()),
+              schema: resolver(SessionAbort.Result),
             },
           },
         },
@@ -636,8 +636,8 @@ export const SessionRoute = new Hono()
       }),
     ),
     async (c) => {
-      await SessionAbort.abort(c.req.valid("param").sessionID, { recoverQueuedTasks: true })
-      return c.json(true)
+      const result = await SessionAbort.abort(c.req.valid("param").sessionID, { recoverQueuedTasks: true })
+      return c.json(result)
     },
   )
 
@@ -746,7 +746,11 @@ export const SessionRoute = new Hono()
     async (c) => {
       const params = c.req.valid("param")
       await assertSessionWorkspaceAvailable(params.sessionID)
-      const item = await SessionInbox.get(params.sessionID, params.itemID)
+      // A parked failure must be cleared before the wake, or the loop would
+      // peek past the failed item and report nothing to do. A failed rearm
+      // write propagates: the endpoint must not report accepted retry work
+      // it did not perform.
+      const item = await SessionInbox.rearm(params)
       await SessionDrive.request(params.sessionID, "user-input-retry")
       return c.json(item)
     },
@@ -768,10 +772,12 @@ export const SessionRoute = new Hono()
         },
         ...errors(400, 404),
         409: {
-          description: "First task is locked until its root is ready",
+          description: "First task is locked until its root is ready, or the item is parked as failed",
           content: {
             "application/json": {
-              schema: resolver(SessionInbox.FirstTaskLockedError.Schema),
+              schema: resolver(
+                z.union([SessionInbox.FirstTaskLockedError.Schema, SessionInbox.ItemFailedError.Schema]),
+              ),
             },
           },
         },
@@ -789,7 +795,9 @@ export const SessionRoute = new Hono()
       try {
         return c.json(await SessionInbox.guide(params))
       } catch (error) {
-        if (error instanceof SessionInbox.FirstTaskLockedError) return c.json(error.toObject(), 409)
+        if (error instanceof SessionInbox.FirstTaskLockedError || error instanceof SessionInbox.ItemFailedError) {
+          return c.json(error.toObject(), 409)
+        }
         throw error
       }
     },

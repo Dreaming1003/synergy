@@ -37,6 +37,7 @@ import {
   DesktopWindowChrome,
   MobileDrawer,
   MobileToolsDrawer,
+  ModelUnavailableBanner,
   desktopWindowNativeChromeActive,
 } from "@/components/app-shell"
 import { useProjectDirectoryPicker } from "@/components/dialog/project-directory-picker"
@@ -189,29 +190,6 @@ export default function Layout(props: ParentProps) {
     params.dir
     globalSDK.url
     layout.nav.resetPrefetch()
-  })
-
-  // Auto-prefetch adjacent sessions
-  createEffect(() => {
-    const sessions = currentSessions()
-    const id = params.id
-
-    if (!id) {
-      const first = sessions[0]
-      if (first) layout.nav.prefetchSession(first)
-      const second = sessions[1]
-      if (second) layout.nav.prefetchSession(second)
-      return
-    }
-
-    const index = sessions.findIndex((s) => s.id === id)
-    if (index === -1) return
-
-    const next = sessions[index + 1]
-    if (next) layout.nav.prefetchSession(next)
-
-    const prev = sessions[index - 1]
-    if (prev) layout.nav.prefetchSession(prev)
   })
 
   // Session navigation by offset (for keyboard shortcuts)
@@ -482,6 +460,7 @@ function LayoutContent(
       <MobileToolsDrawer />
       <DesktopWindowChrome />
       <DesktopNativeTitlebar />
+      <ModelUnavailableBanner />
       <ConnectionBanner />
       <SkinRoot>
         <ShellOutlet shell={shell} workbench={workbench} />

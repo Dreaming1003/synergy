@@ -18,6 +18,7 @@ import { Popover } from "@ericsanchezok/synergy-ui/popover"
 import { base64Decode } from "@ericsanchezok/synergy-util/encode"
 import { useLocale } from "@/context/locale"
 import { getScopeLabel } from "@/utils/scope"
+import { isWorkingStatus } from "@/utils/session-status"
 import { relativeTime } from "@/utils/time"
 import { getSemanticIcon } from "@ericsanchezok/synergy-ui/semantic-icon"
 import type { Session, SessionStatus } from "@ericsanchezok/synergy-sdk/client"
@@ -32,6 +33,7 @@ import {
   type SubsessionCursor,
 } from "./subsession"
 import { createSubsessionController } from "./subsession-controller"
+import { UpgradeStatus } from "./upgrade-status"
 
 function statusDotClass(status: "success" | "danger" | "muted" | "active") {
   return {
@@ -602,7 +604,7 @@ export function StatusBar() {
     const waiting = view().permissionsFor(sessionID).length > 0 || view().questionsFor(sessionID).length > 0
     const state = resolveSubsessionStatus({
       waiting,
-      running: status?.type === "busy" || status?.type === "retry" || status?.type === "recovering",
+      running: isWorkingStatus(status),
     })
     if (state === "waiting")
       return { label: i18n._(copy.waiting), icon: getSemanticIcon("session.waiting"), tone: "danger" as const }
@@ -695,6 +697,7 @@ export function StatusBar() {
 
   return (
     <div class="flex flex-col items-center gap-1 pt-3 pb-1 min-w-0 w-full">
+      <UpgradeStatus />
       <div class="statusbar-glass flex items-center gap-1.5 min-w-0 max-w-full overflow-hidden px-2 py-1.5 rounded-full">
         <HolosIconButton />
 

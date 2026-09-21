@@ -28,6 +28,8 @@ import { SessionUserMessageMaterialization } from "./user-message-materializatio
 import { SessionRootVariant } from "./root-variant"
 import { Experiment } from "../config/experiment"
 import { RolloutContext } from "./rollout/context"
+import { Storage } from "../storage/storage"
+import { StorageBusyError, StorageClosedError } from "../storage/errors"
 import { RolloutLedger } from "./rollout/ledger"
 
 const log = Log.create({ service: "session.input" })
@@ -183,34 +185,55 @@ export type CreateUserMessageInput = InvokeInput & {
   origin?: MessageV2.OriginUser
 }
 
-export async function createUserMessage(input: CreateUserMessageInput, rootIDOverride?: string) {
+export async function createUserMessage(
+  input: CreateUserMessageInput,
+  rootIDOverride?: string,
+  commitOptions?: SessionUserMessageMaterialization.CommitOptions,
+) {
   if (input.noReply === true) {
     if (input.experiment) throw new Error("Experiment configuration requires a new root task")
-    return materializeUserMessage(input, rootIDOverride)
+    return materializeUserMessage(input, rootIDOverride, commitOptions)
   }
   const { Session } = await import(".")
   const { RolloutLifecycle } = await import("./rollout/lifecycle")
   const session = await Session.get(input.sessionID)
   const messageID = input.messageID ?? Identifier.ascending("message")
-  const configuration = await RolloutLifecycle.configuration(
-    session,
-    rootIDOverride ?? messageID,
-    input.experiment,
-    input.model,
-  )
+  const runID = rootIDOverride ?? messageID
   try {
+    const configuration = await RolloutLifecycle.configuration(session, runID, input.experiment, input.model)
     return await Experiment.provide(configuration, () =>
-      RolloutContext.provide({ owner: RolloutLifecycle.owner(session), runID: rootIDOverride ?? messageID }, () =>
-        materializeUserMessage({ ...input, messageID }, rootIDOverride),
+      RolloutContext.provide({ owner: RolloutLifecycle.owner(session), runID }, () =>
+        materializeUserMessage({ ...input, messageID }, rootIDOverride, commitOptions),
       ),
     )
   } catch (error) {
-    await RolloutLedger.finishRun(RolloutLifecycle.owner(session), rootIDOverride ?? messageID, "failed")
+    if (
+      error instanceof StorageBusyError ||
+      error instanceof StorageClosedError ||
+      (error instanceof DOMException && error.name !== "AbortError")
+    )
+      throw error
+    // Terminalize the run so the failure is visible and retryable (rearm
+    // reopens it); a cancelled run settles as cancelled via its marker. The
+    // enqueue shell is best-effort, so a run that never landed stays absent
+    // without masking the materialization error.
+    await RolloutLedger.finishRun(RolloutLifecycle.owner(session), runID, "failed").catch((finishError) => {
+      if (!(finishError instanceof Storage.NotFoundError))
+        log.warn("failed to terminalize run after materialization error", {
+          sessionID: input.sessionID,
+          runID,
+          error: finishError,
+        })
+    })
     throw error
   }
 }
 
-async function materializeUserMessage(input: CreateUserMessageInput, rootIDOverride?: string) {
+async function materializeUserMessage(
+  input: CreateUserMessageInput,
+  rootIDOverride?: string,
+  commitOptions?: SessionUserMessageMaterialization.CommitOptions,
+) {
   const { Session } = await import(".")
   const { Agent } = await import("../agent/agent")
   const session = await Session.get(input.sessionID).catch(() => undefined)
@@ -757,7 +780,7 @@ async function materializeUserMessage(input: CreateUserMessageInput, rootIDOverr
       ;(part as MessageV2.TextPart).origin = "user"
     }
   }
-  return SessionUserMessageMaterialization.write({ info, parts })
+  return SessionUserMessageMaterialization.write({ info, parts }, commitOptions)
 }
 
 async function effectiveMessages(sessionID: string) {

@@ -1,3 +1,5 @@
+import { Log } from "../../util/log"
+import { ProviderRetryCoordinator, providerRetryKey } from "../../provider/retry-coordinator"
 import { LLM } from "../llm"
 import { ToolCatalog } from "../tool-catalog"
 import {
@@ -21,15 +23,18 @@ export namespace AgentTurn {
   export type Stream = AgentTurnStream
   export type InProcessStream = (input: Input) => Promise<Stream>
 
+  let recovery = new ProviderRetryCoordinator()
   let pool: AgentWorkerPool | undefined
   let options = DEFAULT_AGENT_WORKER_POOL_OPTIONS
   let accepting = true
   let stopPromise: Promise<void> | undefined
   let inProcessStream: InProcessStream | undefined
 
+  const log = Log.create({ service: "agent.turn" })
   export function configure(input: Partial<AgentWorkerPoolOptions> = {}): void {
     if (pool) throw new Error("Agent worker pool cannot be reconfigured after it has started")
     accepting = true
+    recovery = new ProviderRetryCoordinator()
     options = {
       ...DEFAULT_AGENT_WORKER_POOL_OPTIONS,
       ...Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)),
@@ -41,14 +46,26 @@ export namespace AgentTurn {
 
   export function closeAdmission(): void {
     accepting = false
+    recovery.close()
   }
 
-  export function resize(size = DEFAULT_AGENT_WORKER_POOL_OPTIONS.size): void {
+  export function resize(size: number): void {
     if (!Number.isInteger(size) || size <= 0) {
       throw new Error("Agent worker pool size must be a positive integer")
     }
     options = { ...options, size }
     pool?.resize(size)
+  }
+
+  export function prewarm(): void {
+    if (!accepting || stopPromise || inProcessStream) return
+    try {
+      pool ??= new AgentWorkerPool(options)
+    } catch (error) {
+      // Option validation cannot succeed in any later attempt either; log it
+      // and let the first turn surface the failure through lazy creation.
+      log.warn("agent worker pool prewarm rejected the configured options", { error })
+    }
   }
 
   export async function stream(input: Input): Promise<Stream> {
@@ -72,39 +89,42 @@ export namespace AgentTurn {
           tools: ToolCatalog.modelTools(input.toolDefinitions ?? []),
         })
     try {
-      return await RolloutCall.stream(
-        {
-          ...attribution,
-          agent: input.agent.name,
-          model: {
-            providerID: input.model.providerID,
-            modelID: input.model.id,
-            sdk: input.model.api?.npm ?? "unknown",
-            pricing: input.model.pricing ?? null,
+      return await recovery.stream(providerRetryKey(input.model, prepared?.provider), input.abort, () =>
+        RolloutCall.stream(
+          {
+            ...attribution,
+            agent: input.agent.name,
+            model: {
+              providerID: input.model.providerID,
+              modelID: input.model.id,
+              sdk: input.model.api?.npm ?? "unknown",
+              pricing: input.model.pricing ?? null,
+            },
+            request: JSON.parse(
+              JSON.stringify({
+                messages: input.messages,
+                system: prepared?.system ?? input.system,
+                tools: input.toolDefinitions,
+                params: prepared
+                  ? { temperature: prepared.params.temperature, topP: prepared.params.topP, topK: prepared.params.topK }
+                  : undefined,
+                maxOutputTokens: input.maxOutputTokens,
+              }),
+            ),
           },
-          request: JSON.parse(
-            JSON.stringify({
-              messages: input.messages,
-              system: prepared?.system ?? input.system,
-              tools: input.toolDefinitions,
-              params: prepared
-                ? { temperature: prepared.params.temperature, topP: prepared.params.topP, topK: prepared.params.topK }
-                : undefined,
-              maxOutputTokens: input.maxOutputTokens,
-            }),
-          ),
-        },
-        async (archive) => {
-          if (inProcessStream) return RolloutTransport.provide(archive, () => inProcessStream!(input))
-          pool ??= new AgentWorkerPool(options)
-          const result = await pool.run({ ...turnInput, prepared: prepared!, archive })
-          const contextUsageDraft = startContextUsageDraft(input, prepared!.system, contextUsageProvenance)
-          return { ...result, contextUsageDraft }
-        },
-        () => {
-          if (attribution.owner.kind === "session")
-            SessionManager.signalAbort(attribution.owner.sessionID, { rootID: attribution.runID })
-        },
+          async (archive) => {
+            if (!accepting || stopPromise) throw new Error("Agent worker pool is stopping")
+            if (inProcessStream) return RolloutTransport.provide(archive, () => inProcessStream!(input))
+            pool ??= new AgentWorkerPool(options)
+            const result = await pool.run({ ...turnInput, prepared: prepared!, archive })
+            const contextUsageDraft = startContextUsageDraft(input, prepared!.system, contextUsageProvenance)
+            return { ...result, contextUsageDraft }
+          },
+          () => {
+            if (attribution.owner.kind === "session")
+              SessionManager.signalAbort(attribution.owner.sessionID, { rootID: attribution.runID })
+          },
+        ),
       )
     } catch (error) {
       if (RolloutRecordingError.isInstance(error) && attribution.owner.kind === "session") {

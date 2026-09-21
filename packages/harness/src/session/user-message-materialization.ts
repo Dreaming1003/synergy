@@ -1,6 +1,8 @@
+import { Storage } from "../storage/storage"
 import { SessionPluginHooks } from "./plugin-hooks"
 import { Log } from "../util/log"
 import { MessageV2 } from "./message-v2"
+import { SecretMask } from "../secrets/mask"
 
 const log = Log.create({ service: "session.user-message-materialization" })
 
@@ -26,16 +28,44 @@ function observerInput(message: MessageV2.WithParts) {
 }
 
 export namespace SessionUserMessageMaterialization {
+  export interface CommitOptions {
+    commit?(message: MessageV2.WithParts): Promise<void>
+  }
   export const input = observerInput
-  export async function write<Info extends MessageV2.Info>(message: {
-    info: Info
-    parts: MessageV2.Part[]
-  }): Promise<{ info: Info; parts: MessageV2.Part[] }> {
+  export async function write<Info extends MessageV2.Info>(
+    message: {
+      info: Info
+      parts: MessageV2.Part[]
+    },
+    options: CommitOptions = {},
+  ): Promise<{ info: Info; parts: MessageV2.Part[] }> {
     const { Session } = await import(".")
-    const info = (await Session.updateMessage(message.info)) as Info
-    for (const part of message.parts) await Session.updatePart(part)
-    after({ info, parts: message.parts })
-    return { info, parts: message.parts }
+    const prepared: MessageV2.Part[] = []
+    for (const part of message.parts) {
+      const normalized = await Session.preparePart(part)
+      // Ingress masking: a pasted secret persists as its stable token so the
+      // durable record never holds the plaintext.
+      prepared.push(await SecretMask.maskPart(normalized))
+    }
+    return Storage.transaction(async () => {
+      const existing = await MessageV2.get({ sessionID: message.info.sessionID, messageID: message.info.id }).catch(
+        (error) => {
+          if (error instanceof Storage.NotFoundError) return
+          throw error
+        },
+      )
+      if (existing) {
+        await options.commit?.(existing)
+        return existing as { info: Info; parts: MessageV2.Part[] }
+      }
+      const info = (await Session.updateMessage(message.info)) as Info
+      const parts = []
+      for (const part of prepared) parts.push(await Session.updatePart(part))
+      const result = { info, parts }
+      await options.commit?.(result)
+      Storage.afterCommit(() => after(result))
+      return result
+    })
   }
 
   export function after(message: MessageV2.WithParts) {

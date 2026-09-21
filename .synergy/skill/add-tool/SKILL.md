@@ -20,6 +20,8 @@ description: Add or modify a first-party Synergy tool, its Zod parameters, execu
 5. Add an exact `tool/taxonomy.ts` entry with the correct domain kind and `stateful` / `externalIO` traits. Verify enforcement classification when arguments change the operation, such as local versus remote execution.
 6. Add persisted-state migrations in the owning domain when the tool changes stored data shape.
 7. Bound subprocess output while reading it: stream records, cap individual records and retained bytes, drain stderr concurrently, honor cancellation, and terminate the child when the consumer has enough results. Never call `text()` on potentially unbounded output and truncate only afterward.
+8. Name time-budget parameters in seconds with a `Seconds` suffix (`timeoutSeconds`, `yieldSeconds`) and give second-valued bounds and defaults. Seconds are the unit at the agent- and human-facing boundary; convert to milliseconds at the single point of use, and keep internal persisted fields (for example `displayMs`) in milliseconds because renaming them would strand the observation on stored parts. State the unit and range in the parameter description. A budget window that hands work to the background is not a timeout: report it through `source` and label it for what it does, and read only argument names the model-facing schema actually exposes.
+9. Never fabricate a time anchor. Render an elapsed-time or countdown display only from a server-provided timestamp (`time.start`, `createdAt`); mounting the component is not an anchor, because a remount would restart the display. Render nothing when the anchor is absent rather than substituting local time, and show a terminal label once the window closes instead of a live-looking zero.
 
 ### Channel-owned delivery tools
 
@@ -54,6 +56,8 @@ The tool icon registry is separate from the product semantic-token registry. Loa
 4. Check the new tool against the consolidation principle: if a human cannot definitively say which tool to use for a given situation, the agent cannot either. Merge narrow overlapping tools unless independent invocation is required, and do not over-consolidate past roughly 8-10 parameters.
 
 ## Verify
+
+For external reads with automatic retries, reuse the shared network classifier and cancellable backoff, verify that the operation is safe to replay, and put all attempts, body reads, and waits under one caller deadline. Keep one permission and deduplication admission per tool invocation. Test transient recovery, permanent rejection, cancelled backoff, body failure and size limits; do not turn a generic tool or MCP failure into automatic side-effect replay.
 
 From the tool’s owning package, run the narrow tool test first. Add taxonomy, permission, migration, and server/UI tests when those contracts changed. Then run from the root:
 

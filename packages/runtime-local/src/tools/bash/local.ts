@@ -11,8 +11,10 @@ import { ScopeContext } from "@ericsanchezok/synergy-harness/scope/context"
 import { ProcessRegistry } from "@ericsanchezok/synergy-harness/process/registry"
 import { truncateMetadataOutput } from "@ericsanchezok/synergy-harness/tool/bash-contract"
 import { SandboxBackend } from "../../sandbox/backend"
+import { EnforcementError } from "@ericsanchezok/synergy-harness/enforcement/errors"
+import { SandboxDetector } from "../../enforcement/sandbox-detector"
+import { startDenialLogger, type DenialLoggerSession } from "../../sandbox/macos-diagnostics"
 import { controlledTempRoot } from "@ericsanchezok/synergy-harness/sandbox/policy"
-import { ShellSafety } from "@ericsanchezok/synergy-harness/enforcement/shell-safety"
 import { AttachmentDiscovery } from "../attachment-discovery"
 import type { MessageV2 } from "@ericsanchezok/synergy-harness/session/message-v2"
 import type { BashParams } from "@ericsanchezok/synergy-harness/tool/bash-contract"
@@ -275,17 +277,18 @@ export const LocalBashBackend = {
       throw new Error(detachedDaemonBlockMessage(detachedRisk))
     }
 
-    if (patterns.size > 0 && (ctx.extra as any)?.shellBypassSandbox !== true) {
+    // The resolver already authorized this call. Asking again here would make
+    // authorization depend on the tool rather than on containment, and would
+    // double-prompt every contained command.
+    const authorizationResolved = (ctx.extra as any)?.shellAuthorizationResolved === true
+    if (patterns.size > 0 && !authorizationResolved) {
       await trace("bash.permission.ask", {
         patternCount: patterns.size,
-        capability: ShellSafety.capability(params.command),
       })
       await ctx.ask({
         permission: "bash",
         patterns: Array.from(patterns),
-        metadata: {
-          capability: ShellSafety.capability(params.command),
-        },
+        metadata: {},
       })
       await trace("bash.permission.resolved", {
         patternCount: patterns.size,
@@ -353,6 +356,12 @@ export const LocalBashBackend = {
       }
     }
 
+    // Secret boundary: resolved mask tokens arrive as SYNERGY_SEC_* environment
+    // variables from the resolver; the command references them via
+    // ${SYNERGY_SEC_*} so plaintext never appears in argv or process listings.
+    const secretEnv = (ctx.extra as { secretEnv?: Record<string, string> } | undefined)?.secretEnv
+    if (secretEnv) Object.assign(sandboxEnv, secretEnv)
+
     // Autonomous (and any gate-sandboxed) execution: point TMPDIR/TMP/TEMP at
     // the workspace-controlled temporary root so tools that honor TMPDIR write
     // inside the workspace boundary instead of the host's shared temporary
@@ -410,6 +419,11 @@ export const LocalBashBackend = {
     executionCommand = withLinuxChildOomPreference(executionCommand)
     const sandboxPrepare = (ctx.extra as { sandboxPrepare?: BashSandboxPrepare } | undefined)?.sandboxPrepare
     let sandboxWrapper: Awaited<ReturnType<BashSandboxPrepare>> | undefined
+    // macOS sandboxd audit stream for this child. Seatbelt reports denials to
+    // the system log rather than to the child's stderr, so this is the only
+    // source of the denied path that the structured explanation needs.
+    let denialSession: DenialLoggerSession | null = null
+    using denialCleanup = { [Symbol.dispose]: () => denialSession?.stop() }
     let windowsProcessJob: WindowsProcessJob.Prepared | undefined
     let windowsProcessOwner: WindowsProcessJob.Owner | undefined
     let ownsUnixProcessGroup = false
@@ -417,6 +431,7 @@ export const LocalBashBackend = {
     const cleanupExecutionArtifacts = () => {
       if (artifactsCleaned) return
       artifactsCleaned = true
+      // Audit drainage remains owned by the foreground execution scope, including early returns.
       windowsProcessJob?.cleanup()
       if (sandboxWrapper?.tempPath) {
         SandboxBackend.cleanupTemp(sandboxWrapper.tempPath)
@@ -440,6 +455,14 @@ export const LocalBashBackend = {
     } catch (error) {
       cleanupExecutionArtifacts()
       throw error
+    }
+
+    // macOS Seatbelt reports a denial to the system log rather than to the
+    // child's stderr, and a fast command's denial is emitted microseconds after
+    // spawn — so the audit stream must already be live before the child runs.
+    // Bind it to the pid once the child exists.
+    if (sandboxWrapper && !sandboxWrapper.skipReason && process.platform === "darwin") {
+      denialSession = startDenialLogger()
     }
 
     // ── ProcessRegistry setup (shared across both paths) ──────────
@@ -540,6 +563,7 @@ export const LocalBashBackend = {
             cwd,
             env: windowsProcessJob.env,
             stdio: ["pipe", "pipe", "pipe"],
+            windowsVerbatimArguments: windowsProcessJob.verbatimCommandLine,
           })
         } else if (process.platform === "win32") {
           child = spawn(executionCommand, {
@@ -592,14 +616,17 @@ export const LocalBashBackend = {
       }
     }
 
+    if (denialSession && child.pid) {
+      denialSession.adoptPid(child.pid)
+    }
+
     let aborted = false
     let timedOut = false
     let timeoutMarkerAdded = false
-    let hardCeilingReached = false
     let exited = false
     let finalized = false
     let childError: Error | undefined
-    const backgroundAfterSeconds = params.backgroundAfterSeconds ?? 30
+    const yieldSeconds = params.yieldSeconds ?? ToolTimeout.DEFAULTS.bashAutoBackgroundMs / 1_000
     let resolveChildFinished: (result: "exited" | "error") => void = () => {}
     const childFinished = new Promise<"exited" | "error">((resolve) => {
       resolveChildFinished = resolve
@@ -621,12 +648,7 @@ export const LocalBashBackend = {
     const kill = () => ProcessRegistry.terminate(regProc)
 
     let hardCeilingTimer: ReturnType<typeof setTimeout> | undefined
-    let commandTimeoutTimer: ReturnType<typeof setTimeout> | undefined
     let autoBackgroundTimer: ReturnType<typeof setTimeout> | undefined
-    let resolveTimeout: (() => void) | undefined
-    const commandTimeout = new Promise<"timeout">((resolve) => {
-      resolveTimeout = () => resolve("timeout")
-    })
 
     const cleanupForegroundWait = () => {
       if (autoBackgroundTimer) {
@@ -642,16 +664,9 @@ export const LocalBashBackend = {
         clearTimeout(hardCeilingTimer)
         hardCeilingTimer = undefined
       }
-      if (commandTimeoutTimer) {
-        clearTimeout(commandTimeoutTimer)
-        commandTimeoutTimer = undefined
-      }
     }
 
-    const timeoutMessage = () =>
-      hardCeilingReached
-        ? "The command was interrupted: bash hard ceiling timed out."
-        : `The command was interrupted: command timed out after ${params.timeoutSeconds}s.`
+    const timeoutMessage = "The command was interrupted: bash hard ceiling timed out."
 
     const releaseChildReferences = () => {
       child.stdout?.off("data", appendStdout)
@@ -743,7 +758,7 @@ export const LocalBashBackend = {
       ProcessRegistry.markStdioClosed(regProc, { drainTimedOut })
       if (regProc.backgrounded) {
         ProcessRegistry.markExited(regProc, code, exitSignal)
-      } else if (backgroundAfterSeconds > 0) {
+      } else if (yieldSeconds > 0) {
         // Process finished before the auto-background timer fired; still
         // persist through markExited so tests and callers can find it.
         ProcessRegistry.markExited(regProc, code, exitSignal)
@@ -806,33 +821,17 @@ export const LocalBashBackend = {
       pid: child.pid,
       command: ObservabilityRedaction.commandSummary(params.command),
       sandboxed: Boolean(sandboxWrapper && !sandboxWrapper.skipReason),
-      backgroundAfterSeconds,
-      timeoutSeconds: params.timeoutSeconds,
+      yieldSeconds,
     })
     if (childError) throw childError
 
     hardCeilingTimer = setTimeout(() => {
       if (exited) return
-      hardCeilingReached = true
       timedOut = true
       log.warn("bash hard ceiling reached, killing", { description: params.description })
-      appendTimeoutMarker(timeoutMessage())
+      appendTimeoutMarker(timeoutMessage)
       void kill()
-      resolveTimeout?.()
     }, ToolTimeout.DEFAULTS.bashHardCeilingMs)
-
-    if (params.timeoutSeconds !== undefined) {
-      commandTimeoutTimer = setTimeout(() => {
-        if (exited) return
-        timedOut = true
-        appendTimeoutMarker(timeoutMessage())
-        void trace("bash.command.timeout", {
-          timeoutSeconds: params.timeoutSeconds,
-        })
-        void kill()
-        resolveTimeout?.()
-      }, params.timeoutSeconds * 1000)
-    }
 
     if (ctx.abort.aborted) {
       aborted = true
@@ -855,21 +854,16 @@ export const LocalBashBackend = {
     ctx.abort.addEventListener("abort", abortHandler, { once: true })
 
     const autoBackground = new Promise<"background">((resolve) => {
-      if (backgroundAfterSeconds <= 0) return
+      if (yieldSeconds <= 0) return
       autoBackgroundTimer = setTimeout(() => {
         if (!exited) resolve("background")
-      }, backgroundAfterSeconds * 1000)
+      }, yieldSeconds * 1000)
     })
 
-    const waitResult = await Promise.race([childFinished.then((result) => result), autoBackground, commandTimeout])
+    const waitResult = await Promise.race([childFinished.then((result) => result), autoBackground])
 
     if (waitResult === "error") {
       throw childError ?? new Error("Bash child process failed")
-    }
-
-    if (waitResult === "timeout") {
-      cleanupForegroundWait()
-      await childFinished
     }
 
     if (waitResult === "background") {
@@ -886,7 +880,7 @@ export const LocalBashBackend = {
             backend: "local",
           },
           output: warnOutput(
-            `Command auto-backgrounded after ${backgroundAfterSeconds}s.\n\n` +
+            `Command auto-backgrounded after ${yieldSeconds}s.\n\n` +
               `Process ID: ${regProc.id}\n` +
               `Command: ${params.command}\n` +
               `Status: running\n\n` +
@@ -930,6 +924,28 @@ export const LocalBashBackend = {
       }
     }
 
+    // A sandbox denial is an execution-time boundary, not an ordinary non-zero
+    // exit. Surfacing it as `SandboxBlocked` is what gives the model the denied
+    // path and the recovery step, and what lets `guarded` approve that exact
+    // path and retry. Without this the child's raw "Operation not permitted"
+    // reached the model with no path and no route into the approval flow.
+    //
+    // The non-zero test is part of that contract rather than a convenience: a
+    // command that survives a refused redirection and goes on to finish still
+    // reports its own exit status, and the plugin path has always surfaced a
+    // denial only when the child failed. Without the test a partially denied
+    // command that completed would be reported to the model as blocked.
+    if (sandboxWrapper && !sandboxWrapper.skipReason && child.exitCode !== 0) {
+      await denialSession?.flush()
+      const denial = deriveSandboxDenial({
+        output,
+        auditRecords: denialSession?.output ?? [],
+        command: params.command,
+        sandboxMode: sandboxWrapper.command === "sandbox-exec" ? "workspace_write" : undefined,
+      })
+      if (denial) throw denial
+    }
+
     return withAttachments({
       title: params.description,
       metadata: {
@@ -941,4 +957,43 @@ export const LocalBashBackend = {
       output: warnOutput(output),
     })
   },
+}
+
+/**
+ * Turn a sandbox denial observed in a finished child's output into an
+ * actionable `SandboxBlocked` error, or return undefined when nothing was
+ * denied.
+ *
+ * Seatbelt reports the denial in the child's own output — `<path>: Operation
+ * not permitted` for a write, `<path>: Permission denied` for a read, from
+ * `cat`/`head`/`mkdir` and the shell's own redirect. That text names the path
+ * but not the access, so the kernel audit records (when the platform provides
+ * them) are preferred: they carry `deny(1) file-write-create <path>`, which
+ * names both. Only macOS produces either shape today; Linux has no equivalent
+ * audit stream, so this returns undefined there rather than guessing from a
+ * non-zero exit.
+ */
+export function deriveSandboxDenial(input: {
+  output: string
+  auditRecords: string[]
+  command: string
+  sandboxMode?: "read_only" | "workspace_write"
+}): EnforcementError.SandboxBlocked | undefined {
+  if (process.platform !== "darwin") return undefined
+  const evidence = [input.output, ...input.auditRecords].join("\n")
+  const matches = SandboxDetector.scan(evidence)
+  if (matches.length === 0) return undefined
+  const info = SandboxBackend.platformInfo()
+  const profile = { command: input.command, backend: info.backend, profileMode: input.sandboxMode }
+  const explanation = SandboxDetector.buildBlockExplanation(matches, profile)
+  const message = explanation
+    ? SandboxDetector.formatBlockExplanation(matches, profile)
+    : SandboxDetector.explain(matches)
+  return new EnforcementError.SandboxBlocked(
+    message,
+    null,
+    matches[0]?.label ?? null,
+    evidence,
+    explanation ?? undefined,
+  )
 }

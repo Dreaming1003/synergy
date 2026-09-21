@@ -17,6 +17,7 @@ import { parsePartialJson } from "@ericsanchezok/synergy-util/json"
 import { ProviderTransform } from "../provider/transform"
 import { PromptCachePolicy } from "../provider/prompt-cache-policy"
 import { ProviderSessionHeader } from "../provider/session-header"
+import { normalizeProviderError } from "../provider/retry"
 import type { Agent } from "../agent/agent"
 import type { MessageV2 } from "./message-v2"
 import { ObservabilitySpans } from "../observability/spans"
@@ -25,6 +26,7 @@ import { SessionRootVariant } from "./root-variant"
 import { SessionPluginHooks } from "./plugin-hooks"
 import { reasoningStreamGuardMiddleware } from "./reasoning-stream-guard"
 import { CODEX_PROVIDER_ID, setReplayPlan, type CodexReplayPlan } from "../provider/codex-compaction"
+import { SecretMask } from "../secrets/mask"
 
 export namespace LLM {
   const log = Log.create({ service: "llm" })
@@ -402,6 +404,10 @@ export namespace LLM {
     if (process.env.SYNERGY_AGENT_WORKER && !input.prepared) {
       throw new Error("Agent worker requires a Control Plane-prepared provider request")
     }
+    // Provider-payload safety net: the vault masks registered values in the
+    // per-turn projection and the late-system strings before any downstream
+    // consumer (prepare, plugin hooks, serialization) observes them.
+    await SecretMask.maskMessages(input.messages as unknown[], input.lateSystem)
     const l = log
       .clone()
       .tag("providerID", input.model.providerID)
@@ -528,6 +534,14 @@ export namespace LLM {
           model: language,
           middleware: [
             {
+              async wrapStream({ doStream }) {
+                try {
+                  return await doStream()
+                } catch (error) {
+                  if (input.abort.aborted) throw error
+                  throw normalizeProviderError(error)
+                }
+              },
               async transformParams(args) {
                 if (args.type === "stream") {
                   // @ts-expect-error

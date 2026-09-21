@@ -1,162 +1,23 @@
-import {
-  extractShellHeredocBodies,
-  lexCompoundCommands,
-  stripWrappers,
-  walkShellChars,
-  type ShellHeredocBody,
-} from "./shell-command"
-
-/**
- * Closed-world catalog of read-only utilities: stdin→stdout/stderr transforms
- * that never mutate files by themselves. It is the single source shared by
- * compound-segment classification (isSafeSimpleCommand) and find/fd
- * -exec/-execdir inspection, so a utility trusted in one context cannot stay
- * untrusted in the other. Utilities able to write through a flag are gated
- * by READ_ONLY_ARG_BLOCKERS.
- */
-const READ_ONLY_COMMANDS = new Set([
-  "basename",
-  "bzcat",
-  "cat",
-  "cksum",
-  "cmp",
-  "column",
-  "comm",
-  "cut",
-  "diff",
-  "dirname",
-  "du",
-  "echo",
-  "egrep",
-  "expand",
-  "false",
-  "fgrep",
-  "file",
-  "fmt",
-  "fold",
-  "grep",
-  "head",
-  "hexdump",
-  "join",
-  "jq",
-  "ls",
-  "md5sum",
-  "nl",
-  "od",
-  "paste",
-  "pr",
-  "printf",
-  "pwd",
-  "readlink",
-  "rg",
-  "seq",
-  "sha1sum",
-  "sha224sum",
-  "sha256sum",
-  "sha384sum",
-  "sha512sum",
-  "shasum",
-  "sort",
-  "stat",
-  "sum",
-  "tail",
-  "tr",
-  "true",
-  "uniq",
-  "unexpand",
-  "wc",
-  "xxd",
-  "xzcat",
-  "zcat",
-])
-
-/**
- * Flag-level write exclusions for catalog utilities that can still produce
- * files: `sort -o`, `diff -o/--output`, and `file -C/--compile` (magic
- * database compilation). A matching argument makes the invocation NOT
- * read-only even though redirect extraction never sees the target.
- */
-const READ_ONLY_ARG_BLOCKERS: Record<string, RegExp[]> = {
-  diff: [/^--output(=.+)?$/, /^-[^-]*o/],
-  file: [/^--compile$/, /^-[^-]*C/],
-  sort: [/^--output(=.+)?$/, /^-[^-]*[oT]/],
-  rg: [/^--(?:pre|hostname-bin)(?:=|$)/],
-  printf: [/^-[^-]*v/],
-}
-
-const READ_ONLY_LONG_ARG_BLOCKERS: Record<string, string[]> = {
-  diff: ["--output"],
-  file: ["--compile"],
-  sort: ["--output", "--compress-program", "--temporary-directory"],
-}
-
-/**
- * Whether one resolved invocation is read-only: catalog membership plus the
- * utility's flag-level write exclusions. Shared by compound-segment
- * classification and find/fd exec-target inspection.
- */
-function isReadOnlyInvocation(name: string, args: string[]): boolean {
-  if (!READ_ONLY_COMMANDS.has(name)) return false
-  const blockers = READ_ONLY_ARG_BLOCKERS[name]
-  if (blockers && args.some((arg) => /[$`]/.test(arg) || blockers.some((pattern) => pattern.test(arg)))) return false
-  if (
-    args.some(
-      (arg) =>
-        arg.startsWith("--") &&
-        arg !== "--" &&
-        READ_ONLY_LONG_ARG_BLOCKERS[name]?.some((option) => option.startsWith(arg.split("=", 1)[0]!)),
-    )
-  )
-    return false
-  if (name !== "uniq" && name !== "xxd") return true
-  if (args.some((arg) => /[$`*?\[]|\{[^}]*[,][^}]*\}|\{[^}]*\.\.[^}]*\}/.test(arg))) return false
-  let operands = 0
-  let options = true
-  const valueOptions =
-    name === "uniq"
-      ? new Set(["-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"])
-      : new Set(["-c", "-cols", "-g", "-groupsize", "-l", "-len", "-o", "-s", "-seek", "-n", "-name"])
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index]!
-    if (options && arg === "--") {
-      options = false
-      continue
-    }
-    if (options && valueOptions.has(arg)) {
-      if (++index >= args.length) return false
-      continue
-    }
-    if (options && arg.startsWith("-") && arg !== "-") {
-      const safe =
-        name === "uniq"
-          ? /^(?:-[cduizD]+|-[fsw]\d+|--(?:count|repeated|unique|ignore-case|zero-terminated|all-repeated(?:=.*)?|group(?:=.*)?|skip-fields=\d+|skip-chars=\d+|check-chars=\d+))$/
-          : /^(?:-[abCeEipPru]+|-(?:c|g|l|o|s)[+\-]?(?:0x)?[\da-fA-F]+)$/
-      if (!safe.test(arg)) return false
-      continue
-    }
-    if (++operands > 1) return false
-  }
-  return true
-}
+import { extractShellHeredocBodies, lexCompoundCommands, walkShellChars, type ShellHeredocBody } from "./shell-command"
 
 const GIT_TAXONOMY: Map<string, BashRisk> = new Map([
   // ── read_only ──────────────────────────────────────────────
-  ["blame", "shell_read"],
-  ["bisect", "shell_read"],
-  ["describe", "shell_read"],
-  ["diff", "shell_read"],
-  ["fetch", "shell_read"],
-  ["fsck", "shell_read"],
-  ["grep", "shell_read"],
-  ["log", "shell_read"],
-  ["ls-files", "shell_read"],
-  ["ls-tree", "shell_read"],
-  ["name-rev", "shell_read"],
-  ["rev-list", "shell_read"],
-  ["rev-parse", "shell_read"],
-  ["shortlog", "shell_read"],
-  ["show", "shell_read"],
-  ["status", "shell_read"],
+  ["blame", "shell"],
+  ["bisect", "shell"],
+  ["describe", "shell"],
+  ["diff", "shell"],
+  ["fetch", "shell"],
+  ["fsck", "shell"],
+  ["grep", "shell"],
+  ["log", "shell"],
+  ["ls-files", "shell"],
+  ["ls-tree", "shell"],
+  ["name-rev", "shell"],
+  ["rev-list", "shell"],
+  ["rev-parse", "shell"],
+  ["shortlog", "shell"],
+  ["show", "shell"],
+  ["status", "shell"],
   // ── safe_write ────────────────────────────────────────────
   ["add", "shell"],
   ["clone", "shell"],
@@ -190,30 +51,48 @@ function pushTargetBranchName(target: string): string | null {
   return target || null
 }
 
+/** One resolved refspec destination, used to decide remote irreversibility. */
+interface PushTarget {
+  protected: boolean
+  /** Source is a symbolic ref (HEAD/@) with no explicit destination. */
+  runtimeResolved: boolean
+  /** Destination is a concrete, non-protected branch this push can publish. */
+  publishable: boolean
+}
+
+/** Symbolic refspec sources whose concrete branch is only known at runtime. */
+const RUNTIME_RESOLVED_REFS = new Set(["head", "@"])
+
 function analyzePushTargets(
   words: string[],
   subIndex: number,
-): { destructive: boolean; protected: boolean; explicitPublish: boolean } {
+): {
+  targets: PushTarget[]
+} {
   const positionals = words.slice(subIndex + 1).filter((word) => word && !word.startsWith("-") && !word.includes("="))
-  // Bare push or push with only remote (no refspec) — equivalent to
-  // explicit feature-branch push via push.default (typically "simple").
-  if (positionals.length <= 1) return { destructive: false, protected: false, explicitPublish: true }
-  return positionals.slice(1).reduce<{ destructive: boolean; protected: boolean; explicitPublish: boolean }>(
-    (result, refspec) => {
-      const force = refspec.startsWith("+")
-      const target = refspec.replace(/^\+/, "").split(":").pop() ?? refspec
-      const deletesRef = target.length === 0 || refspec.startsWith(":")
-      const branchName = pushTargetBranchName(target)
+  // Bare push or push with only remote (no refspec): the destination comes from
+  // push.default at runtime and is reclassified by the gate.
+  if (positionals.length <= 1) return { targets: [] }
+  return {
+    targets: positionals.slice(1).map((refspec) => {
+      const parts = refspec.replace(/^\+/, "").split(":")
+      const source = parts[0] ?? ""
+      const destination = parts.length > 1 ? (parts[1] ?? "") : source
+      // Delete forms: `:dst` deletes the destination, `src:` deletes the
+      // source. Either way the affected remote branch is the named side.
+      const deletesDestination = refspec.replace(/^\+/, "").startsWith(":")
+      const deletesSource = !deletesDestination && destination === ""
+      const branch = deletesDestination ? destination : deletesSource ? source : destination
+      const branchName = branch ? pushTargetBranchName(branch) : null
+      const runtimeResolved = RUNTIME_RESOLVED_REFS.has(source.toLowerCase()) && parts.length === 1
       const protectedTarget = branchName !== null && PROTECTED_PUSH_TARGETS.has(branchName)
-      const publishableBranch = !force && !deletesRef && branchName !== null && !protectedTarget
       return {
-        destructive: result.destructive || force || deletesRef,
-        protected: result.protected || protectedTarget,
-        explicitPublish: result.explicitPublish || publishableBranch,
+        protected: protectedTarget,
+        runtimeResolved,
+        publishable: branchName !== null && !protectedTarget && !runtimeResolved,
       }
-    },
-    { destructive: false, protected: false, explicitPublish: false },
-  )
+    }),
+  }
 }
 
 function isGitRepoSelectorAssignment(word: string | undefined): boolean {
@@ -372,52 +251,80 @@ function classifyGitCommand(words: string[]): BashRisk | null {
   }
 
   // ── clean ──────────────────────────────────────────────────
+  // Removing ignored files (`-x`) can delete build outputs and credentials
+  // that no VCS operation can restore. Removing only untracked files (`-f`,
+  // `-fd`) is an ordinary development reset inside the workspace.
   if (sub === "clean") {
-    if (hasExact("-n") || flags.some((f) => f.startsWith("--dry-run"))) return "shell_read"
+    if (hasExact("-n") || flags.some((f) => f.startsWith("--dry-run"))) return "shell"
     const shortChars = flags.filter((f) => f.startsWith("-") && !f.startsWith("--")).join("")
-    if (shortChars.includes("x") && shortChars.includes("f") && shortChars.includes("d")) return "shell_destructive"
-    if (shortChars.includes("f") && shortChars.includes("d")) return "shell_destructive"
-    return null // unrecognized clean flags — fall through to isReadOnly
+    if (shortChars.includes("f") && shortChars.includes("x")) return "shell_destructive"
+    if (shortChars.includes("f")) return "shell"
+    return null // unrecognized clean flags — no specific risk found
   }
 
   // ── commit ─────────────────────────────────────────────────
+  // `--amend` rewrites the tip, which the reflog still references; the message
+  // and tree are recoverable until gc. Not an irreversible boundary.
   if (sub === "commit") {
-    if (hasExact("--amend") || flags.some((f) => f.startsWith("--amend"))) return "shell_destructive"
-    return "shell" // safe_write
+    return "shell"
   }
 
   // ── pull ──────────────────────────────────────────────────
+  // `--rebase` is a local reapplication of commits and is recoverable through
+  // the reflog; it is not a remote-irreversible operation.
   if (sub === "pull") {
-    if (flags.some((f) => f.startsWith("--rebase") || f === "-r")) return "shell_destructive"
-    return "shell" // plain pull → warn
+    return "shell"
   }
 
   // ── push ───────────────────────────────────────────────────
+  // Remote irreversibility follows the *target branch*, not the flag spelling.
+  // `--force-with-lease` is git's recommended safe alternative to `--force`,
+  // and both are ordinary when the destination is a non-protected branch; the
+  // loss is recoverable precisely when the destination is not shared history.
   if (sub === "push") {
-    const hasForce =
+    const { targets } = analyzePushTargets(words, subIndex)
+    const forcedRefspec = words.slice(subIndex + 1).some((word) => word.startsWith("+"))
+    const destructiveFlags =
       hasExact("--force") ||
       hasExact("-f") ||
       hasExact("--mirror") ||
-      flags.some((f) => f.startsWith("--force-with-lease"))
-    const hasDelete = hasExact("--delete") || hasExact("-d")
-    const targetRisk = analyzePushTargets(words, subIndex)
-    if (hasForce || hasDelete || targetRisk.destructive) return "shell_destructive"
-    if (
-      hasRepoSelector ||
-      hasExact("--all") ||
-      hasExact("--tags") ||
-      targetRisk.protected ||
-      !targetRisk.explicitPublish
-    )
-      return "shell_remote_write"
-    // Bare push (no refspec, explicitPublish: true from analyzePushTargets) or
-    // explicit non-protected feature-branch push — safe for automation.
+      hasExact("-d") ||
+      hasExact("--delete") ||
+      forcedRefspec ||
+      flags.some((f) => f.startsWith("--force-with-lease") || f.startsWith("--force-if-includes"))
+
+    // Repository-selecting flags and all-ref pushes bypass the refspec analysis:
+    // their destination set is not bounded by one named branch.
+    const unboundedTarget = hasRepoSelector || hasExact("--all") || hasExact("--tags") || hasExact("--mirror")
+    if (unboundedTarget) return "shell_remote_write"
+
+    // Remote irreversibility is decided by the destination branch: a force or
+    // delete against shared history cannot be undone, while the same operation
+    // on a non-protected branch only loses that branch's own commits.
+    const boundTargets = targets.filter((target) => !target.runtimeResolved)
+    const allPublishable = boundTargets.length > 0 && boundTargets.every((target) => target.publishable)
+    if (destructiveFlags) return allPublishable ? "shell_remote_publish" : "shell_remote_write"
+
+    // Non-forced push: protected destinations and non-branch refs (tags, notes)
+    // mutate shared state, everything else publishes a branch.
+    if (targets.some((target) => target.protected)) return "shell_remote_write"
+    if (targets.length > 0 && !allPublishable) return "shell_remote_write"
+
+    // Bare push and explicit non-protected feature-branch push are publishable
+    // for automation.
     return "shell_remote_publish"
   }
 
   // ── reset ──────────────────────────────────────────────────
+  // `--soft`/`--mixed`/`--keep` move only the ref and index; the working tree
+  // and the reflog keep the previous commit reachable. `--hard`/`--merge`
+  // discard uncommitted work irrecoverably.
   if (sub === "reset") {
-    return "shell_destructive" // all forms → destructive
+    const hard = hasExact("--hard") || hasExact("--merge")
+    const soft = hasExact("--soft") || hasExact("--mixed") || hasExact("--keep")
+    if (hard) return "shell_destructive"
+    if (soft) return "shell"
+    return "shell" // bare reset is --mixed
   }
 
   // ── restore ────────────────────────────────────────────────
@@ -431,22 +338,21 @@ function classifyGitCommand(words: string[]): BashRisk | null {
   }
 
   // ── stash ──────────────────────────────────────────────────
+  // `drop`/`clear` destroy a stash that has no other ref; `pop`/`apply` move
+  // the changes back into the working tree and are recoverable.
   if (sub === "stash") {
     const subsub = words.find((w, i) => i > subIndex && !w.startsWith("-"))
     if (subsub === "clear") return "shell_destructive"
     if (subsub === "drop") return "shell_destructive"
-    if (subsub === "pop") return "shell_destructive"
-    if (subsub === "apply" || subsub === "push" || subsub === "save" || subsub === "branch") return "shell" // safe_write
-    if (subsub === "list" || subsub === "show") return "shell_read"
-    return "shell" // stash without subcommand → safe_write
+    if (subsub === "list" || subsub === "show") return "shell"
+    return "shell"
   }
 
   // ── rebase ─────────────────────────────────────────────────
+  // A local reapplication of commits. The pre-rebase tip stays in the reflog
+  // and `--abort` returns to it, so this is not an irreversible boundary.
   if (sub === "rebase") {
-    if (hasExact("--abort")) return "shell"
-    if (hasExact("--continue")) return "shell"
-    if (hasExact("-i") || hasExact("--interactive")) return "shell_destructive"
-    return "shell_destructive" // rebase without abort/continue → destructive
+    return "shell"
   }
 
   // ── reflog ─────────────────────────────────────────────────
@@ -454,7 +360,7 @@ function classifyGitCommand(words: string[]): BashRisk | null {
     const subsub = words.find((w, i) => i > subIndex && !w.startsWith("-"))
     if (subsub === "delete") return "shell_destructive"
     if (subsub === "expire") return "shell_destructive"
-    return "shell_read" // show (default) → read_only
+    return "shell" // show (default) → read_only
   }
 
   // ── remote ─────────────────────────────────────────────────
@@ -462,16 +368,16 @@ function classifyGitCommand(words: string[]): BashRisk | null {
     const subsub = words.find((w, i) => i > subIndex && !w.startsWith("-"))
     if (subsub === "add" || subsub === "set-url") return "shell"
     if (subsub === "remove") return "shell" // warn
-    return "shell_read" // show / -v → read_only
+    return "shell" // show / -v → read_only
   }
 
   // ── tag ────────────────────────────────────────────────────
   if (sub === "tag") {
     if (hasExact("-d") || hasExact("--delete")) return "shell"
-    if (hasExact("-l") || hasExact("--list")) return "shell_read"
+    if (hasExact("-l") || hasExact("--list")) return "shell"
     const tagArg = words.find((w, i) => i > subIndex && !w.startsWith("-"))
     if (tagArg && tagArg !== "tag") return "shell"
-    return "shell_read"
+    return "shell"
   }
 
   // ── worktree ───────────────────────────────────────────────
@@ -480,7 +386,7 @@ function classifyGitCommand(words: string[]): BashRisk | null {
     if (subsub === "remove" && (hasExact("--force") || hasExact("-f"))) return "shell_destructive"
     if (subsub === "remove") return "shell" // warn
     if (subsub === "add") return "shell"
-    return "shell_read" // list → read_only
+    return "shell" // list → read_only
   }
 
   // ── gc ─────────────────────────────────────────────────────
@@ -494,18 +400,22 @@ function classifyGitCommand(words: string[]): BashRisk | null {
   if (sub === "bisect") {
     const subsub = words.find((w, i) => i > subIndex && !w.startsWith("-"))
     if (subsub === "run") return "shell_destructive"
-    return "shell_read"
+    return "shell"
   }
 
   // ── fall-through to taxonomy map ───────────────────────────
+  // `revert` records an inverse commit and `rm` deletes a working-tree path;
+  // both leave the original object reachable, and whether the path is inside
+  // the workspace is the sandbox's decision.
+  if (sub === "revert" || sub === "rm") return "shell"
   return GIT_TAXONOMY.get(sub) ?? null
 }
 
 /** Classify GitHub CLI (gh) commands into BashRisk categories.
- *  gh pr view/list/status/checks/diff → shell_read
+ *  gh pr view/list/status/checks/diff → shell
  *  gh pr create → shell_remote_publish
  *  gh pr edit/ready/comment/review → shell_remote_write
- *  gh issue view/list/status → shell_read
+ *  gh issue view/list/status → shell
  *  gh issue create/edit/comment/close/reopen → shell_remote_write */
 function classifyGitHubCommand(words: string[]): BashRisk | null {
   let idx = 0
@@ -520,7 +430,7 @@ function classifyGitHubCommand(words: string[]): BashRisk | null {
     const subsub = words[idx + 2]
     // Read-only PR operations
     if (subsub === "view" || subsub === "list" || subsub === "status" || subsub === "checks" || subsub === "diff") {
-      return "shell_read"
+      return "shell"
     }
     // PR creation is the normal end of an autonomous worktree-to-PR workflow.
     if (subsub === "create") {
@@ -587,14 +497,14 @@ function classifyGitHubCommand(words: string[]): BashRisk | null {
       (explicitMethod === "GET" ||
         explicitMethod === "HEAD" ||
         (explicitMethod === undefined && !hasFields && !hasInput))
-    return readOnly ? "shell_read" : "shell_remote_write"
+    return readOnly ? "shell" : "shell_remote_write"
   }
 
   // ── gh issue ───────────────────────────────────────────────
   if (sub === "issue") {
     const subsub = words[idx + 2]
     if (subsub === "view" || subsub === "list" || subsub === "status") {
-      return "shell_read"
+      return "shell"
     }
     // Issue creation and comments are non-destructive communication.
     if (subsub === "create" || subsub === "comment") {
@@ -611,7 +521,7 @@ function classifyGitHubCommand(words: string[]): BashRisk | null {
   if (sub === "repo") {
     const subsub = words[idx + 2]
     if (subsub === "view" || subsub === "list" || subsub === "browse") {
-      return "shell_read"
+      return "shell"
     }
     return "shell_remote_write"
   }
@@ -620,7 +530,7 @@ function classifyGitHubCommand(words: string[]): BashRisk | null {
   if (sub === "release") {
     const subsub = words[idx + 2]
     if (subsub === "view" || subsub === "list" || subsub === "download") {
-      return "shell_read"
+      return "shell"
     }
     return "shell_remote_write"
   }
@@ -629,7 +539,7 @@ function classifyGitHubCommand(words: string[]): BashRisk | null {
   if (sub === "auth") {
     const subsub = words[idx + 2]
     if (subsub === "status" || subsub === "token") {
-      return "shell_read"
+      return "shell"
     }
     return "shell_remote_write" // auth login, logout, etc
   }
@@ -638,9 +548,9 @@ function classifyGitHubCommand(words: string[]): BashRisk | null {
   if (sub === "workflow") {
     const subsub = words[idx + 2]
     if (subsub === "view" || subsub === "list" || subsub === "run") {
-      if (subsub === "run" && words[idx + 3] === "list") return "shell_read"
-      if (subsub === "run" && words[idx + 3] === "view") return "shell_read"
-      return "shell_read"
+      if (subsub === "run" && words[idx + 3] === "list") return "shell"
+      if (subsub === "run" && words[idx + 3] === "view") return "shell"
+      return "shell"
     }
     return "shell_remote_write" // workflow enable/disable/run/dispatch
   }
@@ -649,32 +559,32 @@ function classifyGitHubCommand(words: string[]): BashRisk | null {
   if (sub === "run") {
     const subsub = words[idx + 2]
     if (subsub === "list" || subsub === "view" || subsub === "watch") {
-      return "shell_read"
+      return "shell"
     }
     if (subsub === "rerun" || subsub === "cancel") {
       return "shell_remote_write"
     }
-    return "shell_read" // default: read
+    return "shell" // default: read
   }
 
   // ── gh gist ────────────────────────────────────────────────
   if (sub === "gist") {
     const subsub = words[idx + 2]
     if (subsub === "view" || subsub === "list" || subsub === "clone") {
-      return "shell_read"
+      return "shell"
     }
     return "shell_remote_write"
   }
 
   // ── gh search ──────────────────────────────────────────────
   if (sub === "search") {
-    return "shell_read"
+    return "shell"
   }
 
   // ── gh alias ──────────────────────────────────────────────────
   if (sub === "alias") {
     const subsub = words[idx + 2]
-    if (subsub === "list") return "shell_read"
+    if (subsub === "list") return "shell"
     return "shell" // alias set/delete → local write
   }
 
@@ -683,130 +593,15 @@ function classifyGitHubCommand(words: string[]): BashRisk | null {
     const codespaceSub = words[idx + 2]
     if (sub === "codespace" && codespaceSub) {
       if (codespaceSub === "list" || codespaceSub === "logs" || codespaceSub === "view" || codespaceSub === "ports") {
-        return "shell_read"
+        return "shell"
       }
       return "shell_remote_write"
     }
-    return "shell_read"
+    return "shell"
   }
 
   // Default: unknown gh command → shell_remote_write
   return "shell_remote_write"
-}
-
-const UNSAFE_SHELL_TOKENS = [
-  "`",
-  "$(",
-  " >",
-  "\t>",
-  ">>",
-  "1>",
-  ">|",
-  "<(",
-  "<<<",
-  "sudo ",
-  "rm ",
-  "mv ",
-  "cp ",
-  "mkdir ",
-  "touch ",
-  "chmod ",
-  "chown ",
-  "curl ",
-  "wget ",
-  "bun ",
-  "npm ",
-  "pnpm ",
-  "yarn ",
-
-  // Shell builtins — critical gap (Cursor CVE-2026-22708)
-  "export ",
-  "eval ",
-  "exec ",
-  "source ",
-  "typeset ",
-  "declare ",
-  "alias ",
-  "unalias ",
-  "trap ",
-  "set ",
-  "shopt ",
-  "ulimit ",
-  "readonly ",
-  "unset ",
-
-  // Shell escape
-  ". ",
-  "read ",
-
-  // Redirect operators (missing)
-  "&>",
-  "|&",
-  "<>",
-  ">(",
-  "<<",
-
-  // Language interpreters (-c/-e inline execution)
-  "python3 ",
-  "python2 ",
-  "ruby ",
-  "perl ",
-  "node ",
-  "php ",
-
-  // Package managers (supply-chain attack surface)
-  "pip ",
-  "pip3 ",
-  "gem ",
-  "cargo ",
-  "brew ",
-
-  // Network tools (exfiltration)
-  "socat ",
-  "ssh ",
-  "scp ",
-  "rsync ",
-  "dig ",
-  "nslookup ",
-  "openssl ",
-  "telnet ",
-  "ftp ",
-  "sftp ",
-  "aria2c ",
-
-  // Process & persistence
-  "kill ",
-  "nohup ",
-  "disown",
-  "screen ",
-  "tmux ",
-  " at ",
-  "crontab ",
-  "launchctl ",
-  "xargs ",
-
-  // Filesystem manipulation
-  "mkfifo ",
-  "mount ",
-  "umount ",
-  "chattr ",
-  "setfacl ",
-  "truncate ",
-  "fallocate ",
-  "ln ",
-  "install ",
-  "tee ",
-]
-
-function stripAllowedRedirects(command: string): string {
-  // Null-device sinks are not write targets. Recognize stdout/stderr and
-  // combined spellings (`>`, `1>`, `2>`, `&>`, `>>`), optional whitespace
-  // after the operator, and a glued closing paren/brace (`2>/dev/null)`).
-  return command
-    .replace(/\s+[12]?&?>>?\s*\/dev\/null(?=[\s;&|(){}]|$)/g, " ")
-    .replace(/\s+2>\s*\/dev\/null/g, " ")
-    .replace(/\s+2>&1/g, " ")
-    .replace(/\s+1>&2/g, " ")
 }
 
 function shellWords(segment: string): string[] {
@@ -966,31 +761,341 @@ function simpleCommandParts(segment: string): { name?: string; args: string[] } 
   return { name: words[index], args: words.slice(index + 1) }
 }
 
-function isSafeSimpleCommand(segment: string): boolean {
-  const { name, args } = simpleCommandParts(segment)
-  if (!name || name === "cd") return true
-  return isReadOnlyInvocation(name, args)
-}
-
 // Patterns for commands that can NEVER be executed regardless of profile.
 const FORK_BOMB_RE = /:\(\)\s*\{?\s*:\s*\|[^}]*&\s*}?\s*;:/
 const DEVICE_WRITE_RE = /(?:^|[\s;&|])(?:dd|mkfs|fdisk|parted)\s.*\/dev\/(sd|xvd|nvme|hd)/
-const RECURSIVE_ROOT_RM_RE = /rm\s+(?:-[a-zA-Z]*[rR][a-zA-Z]*\s+)/
-
-const HARDLINE_PREFIXES = [
-  "mkfs ",
-  "fdisk ",
-  "parted ",
-  "lvremove ",
-  "pvremove ",
-  "vgremove ",
-  "shutdown ",
-  "reboot ",
-  "halt ",
-  "poweroff ",
-]
 
 const HARDLINE_EXACTS = ["init 0", "init 6", "telinit 0", "telinit 6"]
+
+/**
+ * Targets whose destruction is unrecoverable for the whole machine rather than
+ * for one workspace subtree: filesystem root, home directory, and the wildcard
+ * forms of either. Anything deeper (`./dist`, `/tmp/scratch`) belongs to the
+ * OS sandbox, which decides it from the real syscall instead of from argument
+ * text.
+ */
+const HOST_LEVEL_TARGETS = new Set([
+  "/",
+  "/*",
+  "//",
+  "~",
+  "~/",
+  "~/*",
+  "$home",
+  "${home}",
+  "$home/",
+  "$home/*",
+  "${home}/",
+  "${home}/*",
+  ".",
+  "./",
+  "./*",
+  "..",
+  "../",
+  "*",
+])
+
+/** System locations where irreversible data destruction is never acceptable. */
+const CRITICAL_SYSTEM_PREFIXES = [
+  "/etc",
+  "/usr",
+  "/bin",
+  "/sbin",
+  "/lib",
+  "/lib64",
+  "/boot",
+  "/var",
+  "/dev",
+  "/System",
+  "/Applications",
+  "/Library",
+  "/private",
+]
+
+/** Tools that reformat, repartition, or power down the machine. */
+const HOST_DESTRUCTIVE_TOOLS = new Set([
+  "fdisk",
+  "parted",
+  "lvremove",
+  "pvremove",
+  "vgremove",
+  "shutdown",
+  "reboot",
+  "halt",
+  "poweroff",
+])
+
+function isHostLevelTarget(raw: string): boolean {
+  const token = raw.trim().toLowerCase()
+  if (!token) return false
+  if (HOST_LEVEL_TARGETS.has(token)) return true
+  const stripped = token.replace(/\/+$/, "")
+  return stripped !== token && HOST_LEVEL_TARGETS.has(stripped)
+}
+
+function isCriticalSystemPath(raw: string): boolean {
+  const token = raw.trim()
+  if (!token) return false
+  if (token === "/") return true
+  return CRITICAL_SYSTEM_PREFIXES.some((prefix) => token === prefix || token.startsWith(`${prefix}/`))
+}
+
+function isFilesystemFormatTool(executable: string): boolean {
+  return executable === "mkfs" || executable.startsWith("mkfs.")
+}
+
+/**
+ * Whether the invocation only inspects the tool (`-l`/`--list`) or asks for
+ * help. `-h` is excluded for the power tools, where it means "halt" rather
+ * than "help".
+ */
+function isToolHelpOrListingForm(executable: string, args: string[]): boolean {
+  const has = (flag: string) => args.some((arg) => arg === flag)
+  if (has("--help") || has("--version") || has("--usage")) return true
+  if (executable === "shutdown" || executable === "reboot" || executable === "halt" || executable === "poweroff") {
+    return false
+  }
+  if (has("-h")) return true
+  if ((executable === "fdisk" || executable === "parted") && (has("-l") || has("--list"))) return true
+  return false
+}
+
+function isHostDestructiveInvocation(executable: string, args: string[]): boolean {
+  const hostTool = HOST_DESTRUCTIVE_TOOLS.has(executable) || isFilesystemFormatTool(executable)
+  if (!hostTool) return false
+  return !isToolHelpOrListingForm(executable, args)
+}
+
+function isHostLevelRemoval(executable: string, args: string[]): boolean {
+  if (executable !== "rm") return false
+  return args.filter((arg) => !arg.startsWith("-")).some(isHostLevelTarget)
+}
+
+function isRecursivePermissionChangeOnHost(executable: string, args: string[]): boolean {
+  if (executable !== "chmod" && executable !== "chown" && executable !== "chgrp") return false
+  const recursive = args.some((arg) => arg === "--recursive" || /^-[^-]*[rR]/.test(arg))
+  if (!recursive) return false
+  return args.filter((arg) => !arg.startsWith("-")).some(isHostLevelTarget)
+}
+
+function isIrreversibleCriticalWrite(executable: string, args: string[]): boolean {
+  if (executable !== "shred" && executable !== "truncate") return false
+  return args.filter((arg) => !arg.startsWith("-")).some((arg) => isCriticalSystemPath(arg) || isHostLevelTarget(arg))
+}
+
+/** Leading simple command of every compound segment, with argv[0] normalized. */
+function leadingInvocations(command: string): Array<{ name: string; args: string[] }> {
+  const compound = lexCompoundCommands(command)
+  const segments = compound.segments.length > 0 ? compound.segments : [command]
+  const invocations: Array<{ name: string; args: string[] }> = []
+  for (const segment of segments) {
+    const { name, args } = simpleCommandParts(controlCommandSegment(segment))
+    const executable = commandBasename(name ?? "")
+    if (executable) invocations.push({ name: executable, args })
+  }
+  return invocations
+}
+
+/**
+ * Tools whose invocation opens a network connection on its own. Argument text
+ * that merely mentions one of these names is not a network operation, which is
+ * why this is a closed set over the resolved command name rather than a
+ * substring scan.
+ */
+const NETWORK_TOOLS = new Set([
+  "curl",
+  "wget",
+  "nc",
+  "ncat",
+  "netcat",
+  "socat",
+  "ssh",
+  "scp",
+  "sftp",
+  "telnet",
+  "ftp",
+  "dig",
+  "nslookup",
+  "host",
+  "aria2c",
+  "axel",
+  "mosh",
+  "ping",
+  "traceroute",
+  "whois",
+])
+
+/** Git subcommands that contact a remote. */
+const NETWORK_GIT_SUBCOMMANDS = new Set(["fetch", "pull", "push", "clone", "ls-remote", "submodule"])
+
+/** Package managers and the subcommands that reach a registry. */
+const NETWORK_PACKAGE_SUBCOMMANDS: Record<string, Set<string>> = {
+  npm: new Set(["install", "i", "ci", "add", "update", "publish", "exec", "x", "create"]),
+  npx: new Set(["*"]),
+  bun: new Set(["install", "i", "add", "update", "publish", "x", "create"]),
+  pnpm: new Set(["install", "i", "add", "update", "publish", "dlx", "create"]),
+  yarn: new Set(["install", "add", "up", "upgrade", "publish", "dlx", "create"]),
+  pip: new Set(["install", "download"]),
+  pip3: new Set(["install", "download"]),
+  gem: new Set(["install", "update", "fetch"]),
+  cargo: new Set(["install", "add", "update", "publish"]),
+  go: new Set(["get"]),
+  brew: new Set(["install", "upgrade", "update", "fetch"]),
+  apt: new Set(["install", "update", "upgrade"]),
+  "apt-get": new Set(["install", "update", "upgrade"]),
+  docker: new Set(["pull", "push", "login"]),
+  podman: new Set(["pull", "push", "login"]),
+  kubectl: new Set(["apply", "delete", "create", "exec", "port-forward"]),
+  gh: new Set(["*"]),
+}
+
+const NETWORK_OPENSSL_SUBCOMMANDS = new Set(["s_client", "s_server"])
+
+function invocationReachesNetwork(name: string, args: string[]): boolean {
+  if (NETWORK_TOOLS.has(name)) return true
+
+  if (name === "git" || name === "go") {
+    const valued =
+      name === "git"
+        ? new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"])
+        : new Set(["-C"])
+    let index = 0
+    while (args[index]?.startsWith("-")) {
+      const flag = args[index++]!
+      if (flag === "--") break
+      if (valued.has(flag)) index++
+    }
+    const sub = args[index]
+    if (name === "git") return sub !== undefined && NETWORK_GIT_SUBCOMMANDS.has(sub)
+    return sub === "get" || (sub === "mod" && ["download", "tidy", "vendor"].includes(args[index + 1] ?? ""))
+  }
+  if (name === "rsync") {
+    // A remote operand carries a colon separator (`user@host:/path`).
+    return args.some((arg) => !arg.startsWith("-") && /^[^/\s][^:\s]*:/.test(arg))
+  }
+  if (name === "openssl") {
+    const sub = args.find((arg) => !arg.startsWith("-"))
+    return sub !== undefined && NETWORK_OPENSSL_SUBCOMMANDS.has(sub.toLowerCase())
+  }
+
+  const subcommands = NETWORK_PACKAGE_SUBCOMMANDS[name]
+  if (subcommands) {
+    if (subcommands.has("*")) return true
+    const sub = args.find((arg) => !arg.startsWith("-"))
+    return sub !== undefined && subcommands.has(sub.toLowerCase())
+  }
+
+  return false
+}
+
+/** Walk wrappers and command substitutions for a network-bearing invocation. */
+function networkInvocationIn(command: string, state: ClassificationState, depth = 0): boolean {
+  // Budget or depth exhaustion fails closed: an unanalyzable command reports
+  // the capability rather than silently passing as inert.
+  if (classificationExhausted(state, command) || depth > DIRECTORY_CHANGE_MAX_DEPTH) return true
+  // Bash builtin network redirects are matched on unquoted text at every
+  // recursion level: a redirect buried inside a quoted `bash -c`/`eval`
+  // payload is invisible to the top-level mask, but fully visible once the
+  // payload is unwrapped and re-scanned as its own command text.
+  if (command.includes("/dev/") && /\/dev\/(?:tcp|udp)\//.test(literalMaskedShellText(normalizeCommand(command)))) {
+    return true
+  }
+
+  const compound = lexCompoundCommands(command)
+  const segments = compound.segments.length > 0 ? compound.segments : [command]
+  for (const segment of segments) {
+    const body = functionDefinitionBody(segment)
+    if (body !== undefined) {
+      if (body && networkInvocationIn(body, state, depth + 1)) return true
+      continue
+    }
+    const commandSegment = controlCommandSegment(segment)
+    const words = shellWords(commandSegment)
+    let first = 0
+    while (words[first]?.includes("=") && !words[first]?.startsWith("-")) first++
+    if (words[first] === "command") {
+      let flag = first + 1
+      let lookup = false
+      while (words[flag]?.startsWith("-") && words[flag] !== "--") {
+        if (/^-[pPvV]*[vV][pPvV]*$/.test(words[flag]!)) lookup = true
+        flag++
+      }
+      if (lookup) continue
+    }
+    let { name, args } = simpleCommandParts(commandSegment)
+    let executable = commandBasename(name ?? "")
+    if (!executable) continue
+
+    // Unwrap directory wrappers (`timeout 5 curl …`) before deciding.
+    let wrappers = 0
+    while (DIRECTORY_WRAPPER_COMMANDS.has(executable) || executable === "env") {
+      if (++wrappers > DIRECTORY_CHANGE_MAX_DEPTH || classificationExhausted(state)) return true
+      const wrapped = (() => {
+        if (executable !== "env") return wrapperCommandParts(executable, args)
+        const words = [executable, ...args]
+        const expanded = expandEnvSplitString(words, 0)
+        const tokens = expanded ?? words
+        const index = expanded ? 0 : skipEnvWrapper(tokens, 0).idx
+        return { name: tokens[index], args: tokens.slice(index + 1) }
+      })()
+      const nextName = commandBasename(wrapped.name ?? "")
+      if (!nextName) break
+      executable = nextName
+      args = wrapped.args
+    }
+
+    if (invocationReachesNetwork(executable, args)) return true
+    // Opaque interpreter code (`-c`/`-e`/`--eval` payloads) can open sockets
+    // with no static tell, and the sandbox network relaxation is driven by
+    // this very capability — fail closed here like budget exhaustion does,
+    // instead of failing at runtime after the sandbox stayed restricted.
+    if (isInlineInterpreterCommand(executable) && hasInlineInterpreterPayload(executable, args)) return true
+
+    // A shell or interpreter re-parse payload carries its own command text.
+    if (isShellPayloadCommand(executable)) {
+      const payload = shellPayload(args) ?? shellHerestringPayload(args)
+      if (payload && networkInvocationIn(payload, state, depth + 1)) return true
+      continue
+    }
+    if (executable === "eval" && args.length > 0) {
+      if (networkInvocationIn(args.join(" "), state, depth + 1)) return true
+      continue
+    }
+    if (executable === "trap") {
+      const payload = trapPayload(args)
+      if (payload && networkInvocationIn(payload, state, depth + 1)) return true
+      continue
+    }
+  }
+
+  // A heredoc whose header executes stdin as code (`bash <<EOF`) runs the
+  // body as commands; `cat <<EOF` merely reads data and stays unwalked,
+  // matching the sudo path's gate.
+  for (const heredoc of extractShellHeredocBodies(command)) {
+    if (!heredoc.effective || normalizeFileDescriptor(heredoc.fd) !== "0") continue
+    if (!heredocHeaderExecutesStdin(heredoc.header)) continue
+    if (heredoc.body && networkInvocationIn(heredoc.body, state, depth + 1)) return true
+  }
+
+  const payloads = commandSubstitutionPayloads(command, state)
+  if (payloads === undefined) return true
+  if (payloads.some((payload) => networkInvocationIn(payload, state, depth + 1))) return true
+
+  return false
+}
+
+/**
+ * Whether a shell command performs a network operation. Bash builtin network
+ * redirects (`/dev/tcp`, `/dev/udp`) are matched on unquoted executable text
+ * at every command level — including unwrapped shell/interpreter payloads,
+ * eval bodies, and code-executing heredocs — because they only function as
+ * redirect targets; every other case is decided from the resolved command
+ * name and its subcommand, so documentation and commit-message text that
+ * happens to contain a URL or a tool name stays inert.
+ */
+function commandReachesNetwork(command: string): boolean {
+  return networkInvocationIn(command, newClassificationState())
+}
 
 const ARGUMENT_INJECTION_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /\b(?:rg|ripgrep)\b.*--pre(?:-glob)?\b/, reason: "ripgrep with preprocessor execution" },
@@ -1015,64 +1120,16 @@ const ARGUMENT_INJECTION_PATTERNS: Array<{ pattern: RegExp; reason: string }> = 
   },
 ]
 
-const FIND_FD_EXEC_OPTIONS = new Set(["-exec", "-execdir", "-ok", "-okdir", "-x", "-X", "--exec", "--exec-batch"])
-
-/**
- * Scan quote-masked executable text for find/fd command executions whose
- * utility is not in the closed read-only whitelist (-exec/-execdir/-x/-X/
- * --exec/--exec-batch), plus -delete, -ok, and -okdir which are always
- * destructive. Operates on one executable region (substitutions and shell
- * re-parse payloads handled by the caller).
- */
-function findFdExecTextUnsafe(executable: string): boolean {
-  const compound = lexCompoundCommands(executable)
-  const segments = compound.segments.length > 0 ? compound.segments : [executable]
-  for (const segment of segments) {
-    const words = shellWords(normalizeCommand(segment))
-    for (let index = 0; index < words.length; index++) {
-      const word = commandBasename(words[index] ?? "")
-      if (word !== "find" && word !== "fd") continue
-      for (let optionIndex = index + 1; optionIndex < words.length; optionIndex++) {
-        const option = words[optionIndex]!
-        if (!option.startsWith("-")) continue
-        if (option === "-delete") return true
-        if (!FIND_FD_EXEC_OPTIONS.has(option)) continue
-        if (option === "-ok" || option === "-okdir") return true
-        const rawUtility = words[optionIndex + 1]
-        if (rawUtility === undefined || rawUtility === "{}") return true
-        if (/[$`\\]/.test(rawUtility)) return true
-        const utility = commandBasename(rawUtility)
-        if (!utility) return true
-        const utilityArgs: string[] = []
-        let batch = option === "-X" || option === "--exec-batch"
-        for (let argIndex = optionIndex + 2; argIndex < words.length; argIndex++) {
-          const arg = words[argIndex]!
-          if (word === "find" && (arg === "\\;" || arg === ";")) break
-          if (word === "find" && arg === "+" && words[argIndex - 1] === "{}") {
-            batch = true
-            break
-          }
-          utilityArgs.push(arg)
-        }
-        if (batch && (utility === "uniq" || utility === "xxd")) return true
-        if (!isReadOnlyInvocation(utility, utilityArgs)) return true
-      }
-    }
-  }
-  return false
-}
-
 /**
  * Recursively inspect every executable region (top level, command and
- * process substitutions, backticks, and shell re-parse payloads) for an
- * unsafe find/fd exec target. Quoted payload text is masked at the top
- * level, so payload-bearing commands are unwrapped and rescanned like sudo
- * classification does. Budget or depth exhaustion fails closed (treated as
- * unsafe).
+ * process substitutions, backticks, and shell re-parse payloads) for a
+ * re-parse payload that invokes its own command text. Quoted payload text is
+ * masked at the top level, so payload-bearing commands are unwrapped and
+ * rescanned like sudo classification does. Budget or depth exhaustion fails
+ * closed (treated as unsafe).
  */
 function hasUnsafeExecTarget(command: string, state: ClassificationState, depth = 0): boolean {
   if (classificationExhausted(state, command) || depth > DIRECTORY_CHANGE_MAX_DEPTH) return true
-  if (findFdExecTextUnsafe(command)) return true
   const payloads = commandSubstitutionPayloads(command, state)
   if (payloads === undefined) return true
   if (payloads.some((payload) => hasUnsafeExecTarget(payload, state, depth + 1))) return true
@@ -1084,8 +1141,7 @@ function hasUnsafeExecTarget(command: string, state: ClassificationState, depth 
 /**
  * Unwrap one compound segment's re-parse payload (shell `-c`, `eval`, `trap`
  * payload, function body, multicall applet, or directory wrapper payload)
- * and rescan it for an unsafe find/fd exec target, mirroring the payload
- * traversal of sudo classification.
+ * and rescan it, mirroring the payload traversal of sudo classification.
  */
 function execPayloadTargetUnsafe(segment: string, state: ClassificationState, depth: number): boolean {
   const functionBody = functionDefinitionBody(segment)
@@ -1175,20 +1231,12 @@ function checkHardline(command: string): boolean {
 
   if (FORK_BOMB_RE.test(lower) || lower.includes(":() {")) return true
   if (DEVICE_WRITE_RE.test(lower)) return true
-  if (HARDLINE_PREFIXES.some((p) => lower.startsWith(p))) return true
   if (HARDLINE_EXACTS.some((e) => lower === e)) return true
 
-  if (RECURSIVE_ROOT_RM_RE.test(lower)) {
-    if (
-      lower.includes("/ ") ||
-      lower.includes("/* ") ||
-      lower.includes("/\t") ||
-      lower.includes("/*\t") ||
-      lower.includes(" ~ ") ||
-      lower.includes(" $HOME")
-    ) {
-      return true
-    }
+  for (const invocation of leadingInvocations(command)) {
+    if (isHostDestructiveInvocation(invocation.name, invocation.args)) return true
+    if (isHostLevelRemoval(invocation.name, invocation.args)) return true
+    if (isRecursivePermissionChangeOnHost(invocation.name, invocation.args)) return true
   }
 
   if (lower.startsWith("dd ") && /of=\/dev\//.test(lower)) return true
@@ -1196,64 +1244,16 @@ function checkHardline(command: string): boolean {
   return false
 }
 
-export interface DirectoryChangeAnalysis {
-  targets: string[]
-  opaque: boolean
-}
-
-export interface DirectoryChangeOptions {
-  /**
-   * When true, a relative cd target that contains a slash (e.g.
-   * `cd packages/harness/src`) is statically resolved against the current
-   * working directory instead of treated as CDPATH-dependent opaque — unless
-   * the command text itself defines CDPATH (assignment or export), in which
-   * case the target stays opaque. Bare names (`cd node_modules`) stay opaque
-   * because CDPATH can redirect them even without an in-command definition
-   * (the parent environment may still define CDPATH).
-   */
-  resolveSlashRelativeCd?: boolean
-}
-
 /**
- * Detection context threaded through recursive directory-change analysis.
- * Slash-containing relative cd targets are resolvable only when the caller
- * opted in and no enclosing command text defines CDPATH (execution
- * environments built from SANDBOX_ENV_ALLOWLIST never carry a parent CDPATH,
- * so only an in-command definition can redirect them).
+ * Irreversible data destruction on a system location, or privilege escalation.
+ * Both stay `shell_destructive` (refused under `autonomous`) without becoming
+ * a machine-wide hardline rule.
  */
-interface DirectoryChangeContext {
-  options: DirectoryChangeOptions
-  /** True when this scope or an enclosing scope defines/mutates CDPATH. */
-  cdpathDefined: boolean
-}
-
-/**
- * Whether a cd/pushd positional target may be statically resolved given the
- * directory-change context. Bare names stay opaque (CDPATH can redirect them
- * even without an in-command definition) and dynamic ($ or backtick) targets
- * stay opaque because their resolved value is unknowable statically;
- * dot-prefixed and absolute targets are already resolved by the caller's own
- * branch.
- */
-function slashRelativeCdResolvable(target: string | undefined, ctx: DirectoryChangeContext): boolean {
-  return Boolean(
-    ctx.options.resolveSlashRelativeCd &&
-      target &&
-      !dynamicDirectoryTarget(target) &&
-      !target.startsWith("/") &&
-      !target.startsWith("~") &&
-      !target.startsWith(".") &&
-      target.includes("/") &&
-      !ctx.cdpathDefined,
-  )
-}
-
-/**
- * Detect whether a command text defines or mutates CDPATH, which would make
- * even a slash-containing relative cd target dependent on that search path.
- */
-function commandDefinesCdpath(command: string): boolean {
-  return /\b(?:export\s+CDPATH|CDPATH=)/.test(unquotedShellText(normalizeCommand(command)))
+function isIrreversibleDestruction(command: string): boolean {
+  for (const invocation of leadingInvocations(command)) {
+    if (isIrreversibleCriticalWrite(invocation.name, invocation.args)) return true
+  }
+  return false
 }
 
 const CLASSIFICATION_BUDGET_MS = 200
@@ -1428,73 +1428,6 @@ const WRAPPER_VALUE_OPTIONS: Record<string, Set<string>> = {
   ]),
 }
 
-function mergeDirectoryChangeAnalysis(
-  target: DirectoryChangeAnalysis,
-  source: DirectoryChangeAnalysis,
-): DirectoryChangeAnalysis {
-  target.targets.push(...source.targets.filter((path) => !target.targets.includes(path)))
-  target.opaque ||= source.opaque
-  return target
-}
-
-function dynamicDirectoryTarget(target: string | undefined): boolean {
-  return !target || target === "-" || target.includes("$") || target.includes("`")
-}
-
-function cdpathDependentDirectoryTarget(target: string | undefined): boolean {
-  return Boolean(target && !target.startsWith("/") && !target.startsWith("~") && !target.startsWith("."))
-}
-function hasEscapedAnsiCQuote(command: string): boolean {
-  let quote: "'" | '"' | undefined
-  for (let index = 0; index < command.length; index++) {
-    const char = command[index]
-    if (char === "\\" && quote !== "'") {
-      index++
-      continue
-    }
-    if (quote) {
-      if (char === quote) quote = undefined
-      continue
-    }
-    if (char === '"' || (char === "'" && command[index - 1] !== "$")) {
-      quote = char
-      continue
-    }
-    if (char !== "$" || command[index + 1] !== "'") continue
-    for (index += 2; index < command.length; index++) {
-      if (command[index] === "'") break
-      if (command[index] === "\\" && index + 1 < command.length) return true
-    }
-  }
-  return false
-}
-
-function hasReparsedEscapedAnsiCQuote(command: string): boolean {
-  const compound = lexCompoundCommands(command)
-  const segments = compound.segments.length > 0 ? compound.segments : [command]
-  return segments.some((segment) => {
-    if (!hasAnsiCEscapeSyntax(segment)) return false
-    const text = unquotedShellText(segment)
-    return (
-      /(?:^|[^A-Za-z0-9_])(?:[^\s;&|()]+\/)?(?!(?:ssh|mosh)(?:\.exe)?\b)(?:[A-Za-z0-9_.-]*sh|fish|nu|rc|es)(?:\.exe)?\b[^;&|]*\s-[^-]*c\b/.test(
-        text,
-      ) ||
-      /\b(?:eval|trap)\b/.test(text) ||
-      /\benv\b[^;&|]*(?:\s-S\b|--split-string)/.test(text)
-    )
-  })
-}
-
-function hasAnsiCEscapeSyntax(command: string): boolean {
-  for (let start = command.indexOf("$'"); start !== -1; start = command.indexOf("$'", start + 2)) {
-    for (let index = start + 2; index < command.length; index++) {
-      if (command[index] === "'") break
-      if (command[index] === "\\" && index + 1 < command.length) return true
-    }
-  }
-  return false
-}
-
 const FUNCTION_NAME_PATTERN = "[A-Za-z_][A-Za-z0-9_.:-]*"
 const FUNCTION_PREFIX_PATTERN = "(?:^|[;&|(){}\\n]|\\b(?:if|then|elif|else|do|while|until)\\b\\s+)"
 
@@ -1504,10 +1437,6 @@ function functionDefinitionBody(command: string): string | undefined {
   ).exec(executableShellSyntaxText(command))
   if (!match) return
   return command.slice(match.index + match[0].length).trim()
-}
-
-function hasFunctionDefinition(command: string): boolean {
-  return functionDefinitionBody(command) !== undefined
 }
 
 function commandBasename(name: string): string {
@@ -1529,27 +1458,6 @@ function isInlineInterpreterCommand(command: string): boolean {
     command === "deno" ||
     command === "bun" ||
     /^(?:awk|gawk|mawk|nawk)$/.test(command)
-  )
-}
-
-function hasOpaqueCaseDirectorySyntax(command: string): boolean {
-  const text = unquotedShellText(command)
-  if (!/\bcase\b[\s\S]*\bin\b/.test(text)) return false
-  return (
-    /\b(?:cd|pushd|popd|eval|trap)\b/.test(text) ||
-    /\benv\b[\s\S]*(?:\s-C\b|--chdir|\s-S\b|--split-string)/.test(text) ||
-    /\b(?:(?!(?:ssh|mosh)\b)[A-Za-z0-9_.-]*sh|fish|nu|rc|es)\b[\s\S]*\s-[^-]*c\b/.test(text) ||
-    /\b(?:busybox|toybox)\b[\s\S]*\b(?:(?!(?:ssh|mosh)\b)[A-Za-z0-9_.-]*sh|fish|nu|rc|es)\b[\s\S]*\s-[^-]*c\b/.test(
-      text,
-    ) ||
-    /\b(?:python|pypy)(?:\d+(?:\.\d+)*)?\b[\s\S]*\s-[^-]*c\b/.test(text) ||
-    /\b(?:node|nodejs|ruby|perl|bun|lua|luajit|groovy|swift|r|rscript)\b[\s\S]*(?:\s-[^-]*e\b|\s--eval\b|\s--print\b)/.test(
-      text,
-    ) ||
-    /\bphp\b[\s\S]*(?:\s-[^-]*[rBRE]\b|\s--(?:run|process-begin|process-code|process-end)\b)/.test(text) ||
-    /\b(?:pwsh|powershell)(?:\.exe)?\b[\s\S]*\s-(?:c|command|commandwithargs|e|ec|enc|encodedcommand)\b/i.test(text) ||
-    /\bdeno\b[\s\S]*\beval\b/.test(text) ||
-    /\b(?:awk|gawk|mawk|nawk)\b[\s\S]*\bsystem\s*\(/.test(text)
   )
 }
 
@@ -1634,28 +1542,10 @@ function remoteCommandPayload(args: string[]): string | undefined {
   const remote = args.slice(index + 1)
   if (remote.length === 0) return
   return remote.join(" ")
-}
-
-function xargsReplacementToken(args: string[]): string | undefined {
-  for (let index = 0; index < args.length; index++) {
-    const word = args[index]
-    if (word === "-I" || word === "--replace") return args[index + 1] ?? "{}"
-    if (word.startsWith("-I") && word.length > 2) return word.slice(2)
-    if (word.startsWith("--replace=")) return word.slice("--replace=".length) || "{}"
-  }
-}
-
-function positionalDirectoryTarget(args: string[]): string | undefined {
-  let index = 0
-  while (args[index]?.startsWith("-") && args[index] !== "-") {
-    if (args[index++] === "--") break
-  }
-  return args[index]
-}
-
-function envDirectoryChange(args: string[]): { target?: string; commandIndex: number; opaque: boolean } {
-  let target: string | undefined
-  let opaque = false
+} /** Index of the command `env` wraps: skips assignments, `--`, and env's own
+ *  value-taking options, so callers resolve the wrapped executable rather than
+ *  env's flags. */
+function envWrappedCommandIndex(args: string[]): number {
   let index = 0
   let options = true
   while (index < args.length) {
@@ -1670,26 +1560,15 @@ function envDirectoryChange(args: string[]): { target?: string; commandIndex: nu
       index++
       continue
     }
-    if (options && (word === "-C" || word === "--chdir")) {
-      target = args[index + 1]
-      opaque ||= dynamicDirectoryTarget(target)
+    if (options && (word === "-u" || word === "--unset" || word === "-C" || word === "--chdir")) {
       index += 2
       continue
     }
-    if (options && word.startsWith("--chdir=")) {
-      target = word.slice("--chdir=".length)
-      opaque ||= dynamicDirectoryTarget(target)
+    if (
+      options &&
+      (word.startsWith("--unset=") || word.startsWith("--chdir=") || word.startsWith("-u") || word.startsWith("-C"))
+    ) {
       index++
-      continue
-    }
-    if (options && word.startsWith("-C") && word.length > 2) {
-      target = word.slice(2)
-      opaque ||= dynamicDirectoryTarget(target)
-      index++
-      continue
-    }
-    if (options && (word === "-u" || word === "--unset")) {
-      index += 2
       continue
     }
     if (options && word.startsWith("-")) {
@@ -1698,45 +1577,7 @@ function envDirectoryChange(args: string[]): { target?: string; commandIndex: nu
     }
     break
   }
-  return { target, commandIndex: index, opaque }
-}
-
-function sudoDirectoryChange(args: string[]): { target?: string; opaque: boolean } {
-  let target: string | undefined
-  let opaque = false
-  let index = 0
-  while (index < args.length) {
-    const word = args[index]
-    if (!word || word === "--") break
-    if (word === "-D" || word === "--chdir") {
-      target = args[index + 1]
-      opaque ||= dynamicDirectoryTarget(target)
-      index += 2
-      continue
-    }
-    if (word.startsWith("--chdir=")) {
-      target = word.slice("--chdir=".length)
-      opaque ||= dynamicDirectoryTarget(target)
-      index++
-      continue
-    }
-    if (word.startsWith("-D") && word.length > 2) {
-      target = word.slice(2)
-      opaque ||= dynamicDirectoryTarget(target)
-      index++
-      continue
-    }
-    if (WRAPPER_VALUE_OPTIONS.sudo.has(word)) {
-      index += 2
-      continue
-    }
-    if (word.startsWith("-")) {
-      index++
-      continue
-    }
-    break
-  }
-  return { target, opaque }
+  return index
 }
 
 function shellPayload(args: string[]): string | undefined {
@@ -1940,7 +1781,7 @@ function commandExecutesStdinAsCode(name: string | undefined, args: string[], de
   if (command === "env") {
     const expanded = expandEnvSplitString([command, ...args], 0)
     if (expanded) return commandExecutesStdinAsCode(expanded[0], expanded.slice(1), depth + 1)
-    const commandIndex = envDirectoryChange(args).commandIndex
+    const commandIndex = envWrappedCommandIndex(args)
     return commandExecutesStdinAsCode(args[commandIndex], args.slice(commandIndex + 1), depth + 1)
   }
   if (MULTICALL_COMMANDS.has(command)) {
@@ -2047,7 +1888,7 @@ function shellConsumesProcessSubstitution(
   if (command === "env") {
     const expanded = expandEnvSplitString([command, ...args], 0)
     if (expanded) return shellConsumesProcessSubstitution(expanded[0], expanded.slice(1), target, depth + 1)
-    const commandIndex = envDirectoryChange(args).commandIndex
+    const commandIndex = envWrappedCommandIndex(args)
     return shellConsumesProcessSubstitution(args[commandIndex], args.slice(commandIndex + 1), target, depth + 1)
   }
   if (MULTICALL_COMMANDS.has(command)) {
@@ -2160,7 +2001,7 @@ function commandConsumesFdAsCode(name: string | undefined, args: string[], fd: s
     const expanded = expandEnvSplitString([command, ...args], 0)
     if (expanded)
       return [...aliases].some((alias) => commandConsumesFdAsCode(expanded[0], expanded.slice(1), alias, depth + 1))
-    const commandIndex = envDirectoryChange(args).commandIndex
+    const commandIndex = envWrappedCommandIndex(args)
     return [...aliases].some((alias) =>
       commandConsumesFdAsCode(args[commandIndex], args.slice(commandIndex + 1), alias, depth + 1),
     )
@@ -2184,7 +2025,7 @@ function commandExecutesFileAsCode(name: string | undefined, args: string[], tar
   if (command === "env") {
     const expanded = expandEnvSplitString([command, ...args], 0)
     if (expanded) return commandExecutesFileAsCode(expanded[0], expanded.slice(1), target, depth + 1)
-    const commandIndex = envDirectoryChange(args).commandIndex
+    const commandIndex = envWrappedCommandIndex(args)
     return commandExecutesFileAsCode(args[commandIndex], args.slice(commandIndex + 1), target, depth + 1)
   }
   if (MULTICALL_COMMANDS.has(command)) {
@@ -2594,50 +2435,6 @@ function literalMaskedShellText(command: string): string {
   return result.join("")
 }
 
-function unquotedShellText(command: string): string {
-  let result = ""
-  let quote: "'" | '"' | undefined
-  for (let index = 0; index < command.length; index++) {
-    const char = command[index]
-    if (char === "\\" && quote !== "'") {
-      result += quote ? "  " : command.slice(index, index + 2)
-      index++
-      continue
-    }
-    if ((char === "'" || char === '"') && (!quote || quote === char)) {
-      quote = quote ? undefined : char
-      result += " "
-      continue
-    }
-    result += quote ? " " : char
-  }
-  return result
-}
-
-function hasLastArgumentReference(command: string): boolean {
-  let found = false
-  walkShellChars(
-    command,
-    (char, index, quote) => {
-      if (quote === "'" || char !== "$") return
-      if (command.startsWith("${_", index)) {
-        const following = command[index + 3]
-        if (!following || following === "}" || !/[A-Za-z0-9_]/.test(following)) {
-          found = true
-          return false
-        }
-      }
-      if (command[index + 1] !== "_") return
-      const following = command[index + 2]
-      if (following && /[A-Za-z0-9_]/.test(following)) return
-      found = true
-      return false
-    },
-    { comments: true },
-  )
-  return found
-}
-
 function parenthesizedShellPayload(
   command: string,
   start: number,
@@ -2713,202 +2510,6 @@ function commandSubstitutionPayloads(command: string, state: ClassificationState
   )
   if (exhausted) return
   return payloads
-}
-
-const DISPLAY_ONLY_LAST_ARGUMENT_COMMANDS = new Set(["echo", "printf"])
-
-function hasReparsedLastArgumentReference(command: string, state: ClassificationState, depth: number): boolean {
-  if (classificationExhausted(state, command) || depth > DIRECTORY_CHANGE_MAX_DEPTH) return true
-
-  const normalized = normalizeCommand(command)
-  if (state.activeInputs.has(normalized)) return true
-  state.activeInputs.add(normalized)
-  try {
-    const substitutions = commandSubstitutionPayloads(normalized, state)
-    if (!substitutions) return true
-    if (substitutions.some((payload) => hasReparsedLastArgumentReference(payload, state, depth + 1))) return true
-
-    const compound = lexCompoundCommands(normalized)
-    const segments = compound.segments.length > 0 ? compound.segments : [normalized]
-    return segments.some((segment) => {
-      const parsed = simpleCommandParts(controlCommandSegment(segment))
-      const name = commandBasename(parsed.name ?? "")
-      const payload = name === "eval" ? parsed.args.join(" ") : name === "trap" ? trapPayload(parsed.args) : undefined
-      if (payload && hasReparsedLastArgumentReference(payload, state, depth + 1)) return true
-      return hasLastArgumentReference(segment) && !DISPLAY_ONLY_LAST_ARGUMENT_COMMANDS.has(name)
-    })
-  } finally {
-    state.activeInputs.delete(normalized)
-  }
-}
-
-function analyzeDirectoryCommandParts(
-  name: string | undefined,
-  args: string[],
-  state: ClassificationState,
-  depth: number,
-  ctx: DirectoryChangeContext,
-): DirectoryChangeAnalysis {
-  const result: DirectoryChangeAnalysis = { targets: [], opaque: false }
-  if (classificationExhausted(state)) return { targets: [], opaque: true }
-  if (!name) return result
-  if (dynamicCommandName(name)) return { targets: [], opaque: true }
-
-  const command = commandBasename(name)
-  if (depth > DIRECTORY_CHANGE_MAX_DEPTH) {
-    return {
-      targets: [],
-      opaque:
-        command === "cd" ||
-        command === "pushd" ||
-        command === "popd" ||
-        command === "env" ||
-        command === "eval" ||
-        command === "trap" ||
-        isShellPayloadCommand(command) ||
-        hasInlineInterpreterPayload(command, args) ||
-        MULTICALL_COMMANDS.has(command) ||
-        DIRECTORY_WRAPPER_COMMANDS.has(command),
-    }
-  }
-  if (command === "cd" || command === "pushd") {
-    const target = positionalDirectoryTarget(args)
-    if (slashRelativeCdResolvable(target, ctx)) {
-      result.targets.push(target!)
-    } else if (
-      dynamicDirectoryTarget(target) ||
-      cdpathDependentDirectoryTarget(target) ||
-      (command === "pushd" && /^[+-]\d+$/.test(target ?? ""))
-    ) {
-      result.opaque = true
-    } else {
-      result.targets.push(target!)
-    }
-    return result
-  }
-  if (command === "popd") {
-    result.opaque = true
-    return result
-  }
-  if (command === "env") {
-    const env = envDirectoryChange(args)
-    if (env.target && !dynamicDirectoryTarget(env.target)) result.targets.push(env.target)
-    result.opaque ||= env.opaque
-    const expanded = expandEnvSplitString([command, ...args], 0)
-    if (expanded) {
-      mergeDirectoryChangeAnalysis(
-        result,
-        analyzeDirectoryCommandParts(expanded[0], expanded.slice(1), state, depth + 1, ctx),
-      )
-    } else if (env.commandIndex < args.length) {
-      mergeDirectoryChangeAnalysis(
-        result,
-        analyzeDirectoryCommandParts(args[env.commandIndex], args.slice(env.commandIndex + 1), state, depth + 1, ctx),
-      )
-    }
-    return result
-  }
-  if (MULTICALL_COMMANDS.has(command)) {
-    const applet = multicallCommandParts(args)
-    mergeDirectoryChangeAnalysis(result, analyzeDirectoryCommandParts(applet.name, applet.args, state, depth + 1, ctx))
-    return result
-  }
-  if (hasInlineInterpreterPayload(command, args)) return { targets: [], opaque: true }
-  if (isShellPayloadCommand(command)) {
-    const payload = shellPayload(args)
-    if (payload) mergeDirectoryChangeAnalysis(result, analyzeDirectoryChangesRecursive(payload, state, depth + 1, ctx))
-    return result
-  }
-  if (command === "eval" && args.length > 0) {
-    mergeDirectoryChangeAnalysis(result, analyzeDirectoryChangesRecursive(args.join(" "), state, depth + 1, ctx))
-  }
-  if (command === "trap") {
-    const payload = trapPayload(args)
-    if (payload) mergeDirectoryChangeAnalysis(result, analyzeDirectoryChangesRecursive(payload, state, depth + 1, ctx))
-    return result
-  }
-  if (DIRECTORY_WRAPPER_COMMANDS.has(command)) {
-    if (command === "sudo") {
-      const directoryChange = sudoDirectoryChange(args)
-      if (directoryChange.target && !dynamicDirectoryTarget(directoryChange.target)) {
-        result.targets.push(directoryChange.target)
-      }
-      result.opaque ||= directoryChange.opaque
-    }
-    const replacement = command === "xargs" ? xargsReplacementToken(args) : undefined
-    const wrapped = wrapperCommandParts(command, args)
-    const wrappedAnalysis = analyzeDirectoryCommandParts(wrapped.name, wrapped.args, state, depth + 1, ctx)
-    if (replacement && wrappedAnalysis.targets.some((target) => target.includes(replacement))) {
-      wrappedAnalysis.opaque = true
-    }
-    mergeDirectoryChangeAnalysis(result, wrappedAnalysis)
-    return result
-  }
-  return result
-}
-
-function analyzeDirectoryChangesRecursive(
-  command: string,
-  state: ClassificationState,
-  depth: number,
-  ctx: DirectoryChangeContext,
-): DirectoryChangeAnalysis {
-  const childCtx: DirectoryChangeContext = {
-    options: ctx.options,
-    cdpathDefined: ctx.cdpathDefined || commandDefinesCdpath(normalizeCommand(command)),
-  }
-  if (classificationExhausted(state, command)) return { targets: [], opaque: true }
-
-  const normalized = normalizeCommand(command)
-  if (state.activeInputs.has(normalized)) return { targets: [], opaque: true }
-  state.activeInputs.add(normalized)
-
-  try {
-    const result: DirectoryChangeAnalysis = { targets: [], opaque: false }
-    if (hasEscapedAnsiCQuote(command) || hasReparsedEscapedAnsiCQuote(command)) result.opaque = true
-
-    const potentialChange = /\b(?:cd|pushd|popd)\b|\benv\b[^\n]*(?:\s-C\b|--chdir)/.test(unquotedShellText(normalized))
-    if (depth > DIRECTORY_CHANGE_MAX_DEPTH) return { targets: [], opaque: potentialChange || result.opaque }
-    if (normalized.includes("\n") && potentialChange) result.opaque = true
-    if (hasFunctionDefinition(normalized) || hasOpaqueCaseDirectorySyntax(normalized)) result.opaque = true
-
-    const payloads = commandSubstitutionPayloads(normalized, state)
-    if (!payloads) return { targets: result.targets, opaque: true }
-    for (const payload of payloads) {
-      if (classificationExhausted(state)) return { targets: result.targets, opaque: true }
-      mergeDirectoryChangeAnalysis(result, analyzeDirectoryChangesRecursive(payload, state, depth + 1, childCtx))
-    }
-
-    const compound = lexCompoundCommands(normalized)
-    const segments = compound.segments.length > 0 ? compound.segments : [normalized]
-    for (const segment of segments) {
-      if (classificationExhausted(state)) return { targets: result.targets, opaque: true }
-      if (commandLookupOnly(segment)) continue
-      const controlled = controlCommandSegment(segment)
-      const parsed = simpleCommandParts(controlled)
-      const direct = analyzeDirectoryCommandParts(parsed.name, parsed.args, state, depth, childCtx)
-      mergeDirectoryChangeAnalysis(result, direct)
-
-      if (direct.targets.length === 0 && !direct.opaque) {
-        const stripped = stripWrappers(controlled)
-        if (stripped !== controlled) {
-          const wrapped = simpleCommandParts(stripped)
-          mergeDirectoryChangeAnalysis(
-            result,
-            analyzeDirectoryCommandParts(wrapped.name, wrapped.args, state, depth, childCtx),
-          )
-        }
-      }
-
-      const hidden = unquotedShellText(segment)
-      if (/(?:^|[({)]|\b(?:if|then|elif|else|do|while|until)\b)\s*(?:cd|pushd|popd)\b/.test(hidden)) {
-        if (direct.targets.length === 0 && !direct.opaque) result.opaque = true
-      }
-    }
-    return result
-  } finally {
-    state.activeInputs.delete(normalized)
-  }
 }
 
 function commandNameWithoutEmptySubstitutions(name: string | undefined): string | undefined {
@@ -3298,7 +2899,7 @@ function shellPayloadWithEnabledExecfail(segment: string): string | undefined {
         continue
       }
       const envArgs = words.slice(index + 1)
-      const commandIndex = envDirectoryChange(envArgs).commandIndex
+      const commandIndex = envWrappedCommandIndex(envArgs)
       inspectAssignments(envArgs.slice(0, commandIndex))
       index += commandIndex + 1
       continue
@@ -3360,7 +2961,7 @@ function hasSudoCommandParts(
   if (command === "env") {
     const expanded = expandEnvSplitString([command, ...args], 0)
     if (expanded) return hasSudoCommandParts(expanded[0], expanded.slice(1), state, depth + 1)
-    const commandIndex = envDirectoryChange(args).commandIndex
+    const commandIndex = envWrappedCommandIndex(args)
     return hasSudoCommandParts(args[commandIndex], args.slice(commandIndex + 1), state, depth + 1)
   }
   if (MULTICALL_COMMANDS.has(command)) {
@@ -3440,7 +3041,6 @@ function hasSudoInvocationRecursive(command: string, state: ClassificationState,
 }
 
 export type BashRisk =
-  | "shell_read"
   | "shell"
   | "shell_branch_mutation"
   | "shell_remote_publish"
@@ -3448,53 +3048,12 @@ export type BashRisk =
   | "shell_destructive"
   | "shell_hardline"
 export namespace ShellSafety {
-  export function isReadOnly(command: string): boolean {
-    const padded = " " + normalizeCommand(command) + " "
-    const masked = literalMaskedShellText(padded)
-    const lower = stripAllowedRedirects(masked).toLowerCase()
-    const normalized = stripAllowedRedirects(padded)
-    if (UNSAFE_SHELL_TOKENS.some((token) => lower.includes(token))) return false
-
-    const segments = lexCompoundCommands(normalized.trim()).segments
-
-    if (segments.length === 0) return true
-    return segments.every(isSafeSimpleCommand)
-  }
-
-  export function analyzeDirectoryChanges(
-    command: string,
-    options: DirectoryChangeOptions = {},
-  ): DirectoryChangeAnalysis {
-    const ctx: DirectoryChangeContext = {
-      options,
-      cdpathDefined: commandDefinesCdpath(command),
-    }
-    return analyzeDirectoryChangesRecursive(command, newClassificationState(), 0, ctx)
-  }
-
-  export function hasCompoundShellStateDependency(command: string): boolean {
-    const compound = lexCompoundCommands(normalizeCommand(command))
-    const state = newClassificationState()
-    return compound.segments.some((segment, index) => {
-      if (index > 0) return hasReparsedLastArgumentReference(segment, state, 0)
-      if (compound.segments.length < 2) return false
-
-      const parsed = simpleCommandParts(controlCommandSegment(segment))
-      if (commandBasename(parsed.name ?? "") !== "trap") return false
-      const payload = trapPayload(parsed.args)
-      return Boolean(payload && hasReparsedLastArgumentReference(payload, state, 0))
-    })
-  }
-
   export function hasSudoInvocation(command: string): boolean {
     return hasSudoInvocationRecursive(command, newClassificationState(), 0)
   }
 
-  export function capability(command: string): "shell_read" | "shell" {
-    return isReadOnly(command) ? "shell_read" : "shell"
-  }
-
   export const isHardline = checkHardline
+  export const reachesNetwork = commandReachesNetwork
   /** Returns true when the command is a bare git push (no refspec, no repo selector, no flags).
    *  Bare push uses push.default to determine the destination at runtime — typically it pushes
    *  the current branch to its tracked upstream. This is reclassified at the enforcement gate
@@ -3534,13 +3093,12 @@ export namespace ShellSafety {
 
   // ── compound command recursion ───────────────────────────────────────
   const RISK_ORDER: Record<BashRisk, number> = {
-    shell_read: 0,
-    shell: 1,
-    shell_branch_mutation: 2,
-    shell_remote_publish: 3,
-    shell_remote_write: 4,
-    shell_destructive: 5,
-    shell_hardline: 6,
+    shell: 0,
+    shell_branch_mutation: 1,
+    shell_remote_publish: 2,
+    shell_remote_write: 3,
+    shell_destructive: 4,
+    shell_hardline: 5,
   }
 
   function maxRisk(a: BashRisk, b: BashRisk): BashRisk {
@@ -3570,9 +3128,18 @@ export namespace ShellSafety {
         continue
 
       const bodyRisk = depth >= MAX_COMPOUND_DEPTH ? conservativeRisk() : classifyRisk(heredoc.body, state, depth + 1)
-      if (bodyRisk !== "shell_read") {
-        return bodyRisk === "shell_hardline" ? "shell_hardline" : "shell_destructive"
+      // Executable heredoc input is a re-parse boundary, so it is promoted when
+      // the body reaches a boundary the OS sandbox cannot express. A body whose
+      // only reach is the filesystem stays at the risk floor and is owned by the
+      // sandbox. Escalation and irreversible system writes are top-level
+      // detectors upstream, so they run here explicitly for the body; without
+      // this a payload classifies differently by heredoc than by "-c".
+      if (bodyRisk === "shell") {
+        if (hasSudoInvocationRecursive(heredoc.body, state, depth + 1)) return "shell_destructive"
+        if (isIrreversibleDestruction(heredoc.body)) return "shell_destructive"
+        continue
       }
+      return bodyRisk === "shell_hardline" ? "shell_hardline" : "shell_destructive"
     }
     return null
   }
@@ -3588,6 +3155,17 @@ export namespace ShellSafety {
     const normalized = normalizeCommand(command)
 
     if (checkHardline(normalized)) return "shell_hardline"
+
+    // Privilege escalation and irreversible destruction of system locations are
+    // boundaries the OS sandbox cannot express: once a command re-executes as
+    // root, or overwrites a system path, the containment decision was already
+    // made inside the sandbox. Both detectors walk the whole command
+    // themselves (substitutions, heredocs, wrappers, fd replay), so they run
+    // once at the top level and share this classification budget.
+    if (depth === 0) {
+      if (hasSudoInvocationRecursive(command, state, 0)) return "shell_destructive"
+      if (isIrreversibleDestruction(command)) return "shell_destructive"
+    }
 
     if (hasPipeToShell(normalized)) return "shell_destructive"
     if (hasUnsafeExecTarget(normalized, state)) return "shell_destructive"
@@ -3608,7 +3186,7 @@ export namespace ShellSafety {
           return conservativeRisk()
         }
 
-        let highest: BashRisk = "shell_read"
+        let highest: BashRisk = "shell"
         for (const segment of compound.segments) {
           if (Date.now() > state.deadline) return conservativeRisk()
           highest = maxRisk(highest, classifyRisk(segment, state, depth + 1))
@@ -3627,7 +3205,6 @@ export namespace ShellSafety {
       const ghRisk = classifyGitHubCommand(words)
       if (ghRisk !== null) return ghRisk
 
-      if (isReadOnly(command)) return "shell_read"
       return "shell"
     } finally {
       state.activeInputs.delete(normalized)

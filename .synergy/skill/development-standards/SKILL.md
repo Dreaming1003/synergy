@@ -21,6 +21,7 @@ description: Route a Synergy source change to the current repository development
    - plugin manifest, installation, runtime, bridge, marketplace, or UI host: `change-plugin-runtime`
    - built-in agent, CLI command, or first-party tool: `add-agent`, `add-cli-command`, or `add-tool`
    - tests or manual runtime validation: `testing-guide` and `develop-synergy`
+   - benchmark evaluator, native harnesses, accounting, cache or resource scheduling: `develop-benchmark`
    - Git/worktree/PR operations: `git-guide`
    - broad simplification audits or decision-record coalescing: `find-simplifications`
 5. Use canonical product, architecture, reference, plugin, and operations documents for system truth. Keep Skills procedural; do not copy whole architecture descriptions into them.
@@ -31,6 +32,7 @@ description: Route a Synergy source change to the current repository development
 2. State the behavioral invariant and write the failing test first for new behavior or bug fixes.
 3. Change the smallest coherent set of owners. Include migrations, events, SDK generation, UI registration, or docs only when the contract crosses them.
 4. Run the narrowest verification first, then expand according to the affected workflow.
+5. When a regression repeats after earlier fixes, trace the common owner across every producer and consumer before adding another special case. For startup/persistence changes, load both `change-persistence` and `develop-synergy`; verify real driver operations as well as parsed progress records.
 
 ## Capture New Rules
 
@@ -71,4 +73,4 @@ Report the owning workflows loaded, invariant changed, focused checks run, and a
 
 When splitting a namespace into a core mechanism and a business implementation, give the implementations distinct names and update value and type consumers. With the pinned Bun version, aliasing an imported namespace to avoid a same-name local namespace is insufficient after bundling. Verify real compiled behavior; see the [compiled runtime ownership decision](../../../docs/decisions/implemented/bug-fix/2026-09-08-compiled-runtime-namespace-ownership.md).
 
-Completion callbacks that perform model work must return all nested work and be awaited before rollout settlement; preserving only a top-level promise while detaching retries or reward evaluation still loses evidence. See the [completion contribution decision](../../../docs/decisions/implemented/bug-fix/2026-09-08-await-completion-context-contributions.md).
+Completion callbacks that perform model work must not hold the turn on that work: schedule it through the detached background pool (`LoopJob.scheduleDetached`) so it settles through `settleDetached` before rollout settlement, keeping nested model-call evidence in the ledger without stalling turn completion. See the [detached encoding decision](../../../docs/decisions/implemented/bug-fix/2026-09-13-experience-encode-detached-from-turn.md); the earlier await-inline rule it supersedes is archived.

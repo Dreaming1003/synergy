@@ -18,7 +18,7 @@ Observer targets delivered by asynchronous mount callbacks must be reactive elem
 
 Solid JSX may evaluate to a function. Never distinguish a rendered trigger from a component with `typeof`; use an explicit component prop such as Popover `triggerAs`, and forward its event, ref, and accessibility props to the native button. Test click, keyboard activation, Escape, and focus return with the real Tooltip composition.
 
-1. Use stores for coherent keyed collections and signals for independent scalar state.
+1. Use stores for coherent keyed collections and signals for independent scalar state. Read project-overridable configuration from the current Scope through `useSync`; `useGlobalSync().data.config` contains global settings only. Test differing global and project values plus a Scope config refresh.
 2. Apply entity updates with targeted setters and `reconcile`; do not replace a whole stored object for a one-field event.
 3. Keep derived values one-way. Preserve composer resolution as explicit draft → session default → fallback; only explicit user choices persist upward.
 4. Use generated SDK methods for ordinary internal HTTP routes. Keep raw browser transports only for WebSocket/EventSource/WebRTC, external URLs, platform fetch injection, and browser file/blob/download flows that the SDK should not represent.
@@ -75,6 +75,10 @@ Derive activity steps and counts from canonical tool parts. Display preferences 
 5. Implement loading, empty, error, disabled, and reconnect states as first-class behavior.
 6. Update `PRODUCT.md` when an interaction or visual rule should survive refactors.
 7. For imperative renderers, use the dependency's typed live-update API and cover it with a boundary test. Do not hide an unsupported method behind a cast; same-mode theme changes must repaint already-mounted renderers.
+
+For streaming-sync changes, test a checkpoint followed by a delta in one hidden-page flush, both with and without an existing part. Exercise background repair against the actual store provider while entering history and while compaction is pending. Evaluate all snapshot rejection conditions before advancing a resource watermark; preserve stronger reload ownership when requests share a loader.
+
+Rewind and redo must converge through the server's effective message window, including retained caches with earlier rollback branches. Observe rollback identity and redo-validity transitions separately from ordinary metadata events, force message reloads after transitions, and verify removed messages also lose their part buckets without reconnecting. A new root can invalidate redo without changing the rollback ID and expose previously prefix-hidden injections. A latest rollback summary is only an immediate display filter; it cannot reconstruct the complete history projection.
 
 ## Preserve Loading Boundaries
 
@@ -144,3 +148,5 @@ Read [frontend plugin ownership](../../../docs/architecture/frontend-plugin-plat
 For UI API 5 changes, build the production App and run bun run plugin-ui:test. Its public preview helper installs extracted archives into an isolated real host. Also run the owning App/UI tests, private HTTP smoke, typecheck, localization and package gates. Browser fixtures must pre-discover their actual module entry so dependency optimization cannot reload the page during interaction assertions. Verify styles on ordinary inherited text and protected portals, not only elements that explicitly restate font variables.
 
 Keep question and permission ownership above replaceable session pages. Native presentation may register an inline outlet; a missing outlet must retain an accessible host surface automatically. Bound the combined decision region, reset plugin style ownership, and verify both native and custom-page composition.
+
+For navigation performance, test leaving the last Scope view for a global panel and returning, not only overlapping Session views. Retain recently viewed stores within the bounded inactive LRU, isolate panel data suspension below navigation controls, and verify canonical handoff convergence after a displayed timeout. A deadline sample must not replace the eventual completed navigation duration.

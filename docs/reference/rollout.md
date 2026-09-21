@@ -44,6 +44,12 @@ Canonical configuration lives in the [configuration domains](configuration.md). 
 
 ## Evidence and accounting
 
+Call-level SDK usage contributes only when no transport attempts were recorded. Recorded attempts without usage remain unknown, including retries that failed before a response. Anthropic and Bedrock SDK input excludes cache reads and writes; absent cache-write counts keep the full input total unknown while preserving known components.
+
+Google and Vertex SDK output counts visible candidates separately from thinking. Their fallback uses the provider total minus input, or sums the reported candidate and thinking counts; when neither establishes the full output, that total remains unknown.
+
+Transport attempts settle their request reader and all admitted evidence writes before recording the terminal attempt event, even when the network consumer still holds the upload lock or the provider responds before upload completion. Request cancellation is initiated without waiting for an upstream acknowledgement that can belong to an unread sibling of a cloned request. Interrupted uploads retain partial evidence and the original transport error; upload cleanup failures cannot replace it, while persistence failures remain authoritative.
+
 A logical call contains semantic model input and SDK output. Each actual inference request has its own attempt with the final provider-facing body, response body/stream, safe response headers, timestamps, raw usage and captured pricing basis. Internal retries count independently. Non-chat embeddings, reranking and voice calls use the same ledger; independent background work belongs to a Scope operation rather than a fabricated session.
 
 Tools retain original results separately from model-visible observations and bounded message previews. Process streams preserve stdout/stderr channel order in framed binary chunks before display truncation. Original attachments and received MCP resources are retained before extraction. Pruning changes model history projection; it does not remove original evidence. Explicit owner deletion removes its rollout storage. Retained legacy output files are not automatically deleted by age.
@@ -51,6 +57,8 @@ Tools retain original results separately from model-visible observations and bou
 Accounting separates known API estimates, unknown quantities/prices, provider-reported charges, historical calculations and subscription API equivalents. Reasoning is included in normalized output tokens and is never charged twice. Cache creation duration, cache reads and audio units retain their categories. Unresolved audio/cache overlap or nonstandard service-tier pricing produces an unknown estimate instead of a fabricated total. Forked/imported historical calls retain their source identities and contribute no new spend.
 
 A terminal run independently reports execution status and recording completeness; missing usage is an accounting gap, not zero usage. Failed authoritative writes stop new execution. Recovery closes interrupted calls without replaying side effects. Deliberately backgrounded processes may outlive a successful task in a persistent server; its terminal export is partial while their streams remain active.
+
+Startup recovery trusts the durable pending ledger at `data/meta/rollout/recovery-pending.json`: journal writes record their owner before mutating journal state, so a well-formed ledger bounds recovery to owners touched since the last verified pass, and an empty ledger skips the scan entirely. A missing, malformed, or unreadable ledger falls back to the exhaustive owner scan and re-arms the ledger after it completes. Journal writes preserve an absent ledger until exhaustive recovery establishes the first complete baseline, including during migrations. An unreadable ledger fails new journal recording instead of being silently reset. A drained runtime closes its transport before settling its listed owners and re-arms the ledger during shutdown, so ordinary restarts skip recovery entirely; a failed shutdown leaves the ledger listed for the next startup. `data merge` and `data move` invalidate the target ledger because imported owner trees can hold journals the target ledger never listed.
 
 ## Archives and historical data
 

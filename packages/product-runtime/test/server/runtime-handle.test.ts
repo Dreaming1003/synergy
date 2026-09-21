@@ -1,5 +1,5 @@
 import { Experiment } from "@ericsanchezok/synergy-harness/config/experiment"
-import { DEFAULT_AGENT_WORKER_POOL_OPTIONS } from "@ericsanchezok/synergy-harness/session/agent-turn/worker-pool"
+import { resolveAgentWorkerCapacity } from "@ericsanchezok/synergy-harness/execution/execution-config"
 import { GlobalBus } from "@ericsanchezok/synergy-harness/bus/global"
 import { expect, test } from "bun:test"
 import { ProductRuntimeHandle } from "@ericsanchezok/synergy-product-runtime/server/runtime-handle"
@@ -10,12 +10,14 @@ import { AgentTurn } from "@ericsanchezok/synergy-harness/session/agent-turn"
 import { PolicyWorker } from "@ericsanchezok/synergy-harness/enforcement/policy-worker"
 import { ToolScheduler } from "@ericsanchezok/synergy-harness/test/support/internals"
 import { Storage } from "@ericsanchezok/synergy-harness/storage/storage"
+import { StoragePath } from "@ericsanchezok/synergy-harness/storage/path"
 
 test("one-shot owns its Home, omits autonomous recovery, and awaits idempotent shutdown", async () => {
   const initialListeners = GlobalBus.listenerCount("event")
   const recovery: Array<number | "completed"> = []
   const runtime = await ProductRuntimeHandle.open({
     mode: "oneshot",
+    storage: Storage.current(),
     network: { hostname: "127.0.0.1", port: 0 },
     recoveryReporter: {
       progress: (current) => recovery.push(current),
@@ -27,10 +29,10 @@ test("one-shot owns its Home, omits autonomous recovery, and awaits idempotent s
     expect(recovery.at(-1)).toBe("completed")
     expect((await ServerProcessLock.read())?.mode).toBe("oneshot")
     expect(ScopeStartup.resident()).toBe(false)
-    expect(runtime.config.execution?.agentWorkers).toBe(DEFAULT_AGENT_WORKER_POOL_OPTIONS.size)
-    expect(() =>
-      Experiment.assertRuntime({ execution: { agentWorkers: DEFAULT_AGENT_WORKER_POOL_OPTIONS.size } }),
-    ).not.toThrow()
+    const capacity = resolveAgentWorkerCapacity({} as never, "oneshot")
+    expect(runtime.config.execution?.agentWorkers).toBe(capacity.size)
+    expect(runtime.config.execution?.agentWorkerMinIdle).toBe(0)
+    expect(() => Experiment.assertRuntime({ execution: { agentWorkers: capacity.size } })).not.toThrow()
     await expect(
       ProductRuntimeHandle.open({ mode: "oneshot", network: { hostname: "127.0.0.1", port: 0 } }),
     ).rejects.toThrow("already owns")
@@ -54,10 +56,14 @@ test("failed recovery does not announce completion or retain home ownership", as
   const recovery: Array<number | "completed"> = []
   await Storage.write([...root, "head"], { allocated: 1, committed: 1 })
   await Storage.write(event, { version: 1, seq: 2, time: 0, kind: "gap" })
+  // Simulate an unknown pending ledger so recovery falls back to the
+  // exhaustive scan that discovers this hand-written journal.
+  await Storage.remove(StoragePath.rolloutRecoveryPending())
   try {
     await expect(
       ProductRuntimeHandle.open({
         mode: "oneshot",
+        storage: Storage.current(),
         recoveryReporter: {
           progress: (current) => recovery.push(current),
           completed: () => recovery.push("completed"),
@@ -70,6 +76,7 @@ test("failed recovery does not announce completion or retain home ownership", as
   } finally {
     await Storage.remove(event)
     await Storage.remove([...root, "head"])
+    await Storage.remove(StoragePath.rolloutRecoveryPending())
     SessionManager.openAdmission()
     AgentTurn.configure()
     PolicyWorker.configure()

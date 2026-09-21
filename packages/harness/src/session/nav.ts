@@ -6,12 +6,19 @@ import { Identifier } from "../id/id"
 import { Storage } from "../storage/storage"
 import { StoragePath } from "../storage/path"
 import { Log } from "../util/log"
-import { Lock } from "../util/lock"
 import { Info as SessionInfo } from "./types"
 import { SessionManagedProjects } from "./managed-projects"
+import { SessionCompat } from "./compat-import"
+import { WorkflowKindRegistry } from "./workflow-kind-registry"
 
 export type NavCategory = "project" | "home" | "channel" | "background" | "github"
 export const NavCategory = z.enum(["project", "home", "channel", "background", "github"])
+const NavBlueprintIdentity = z.object({
+  loopID: z.string().optional(),
+  loopRole: z.enum(["execution", "audit"]).optional(),
+  phase: z.enum(["running", "waiting", "auditing"]).optional(),
+})
+const NavWorkflowIdentity = z.object({ kind: z.string(), active: z.boolean() })
 export const SessionNavEntry = z
   .object({
     id: z.string(),
@@ -34,6 +41,9 @@ export const SessionNavEntry = z
     channelType: z.string().optional(),
     channelAccountId: z.string().optional(),
     channelTarget: ChannelTarget.optional(),
+    blueprint: NavBlueprintIdentity.optional(),
+    workspaceType: z.string().optional(),
+    workflow: NavWorkflowIdentity.optional(),
     completionNotice: z.object({
       unread: z.boolean(),
       unreadCount: z.number().int().nonnegative(),
@@ -122,6 +132,9 @@ export interface SessionNavEntry {
   channelType?: string
   channelAccountId?: string
   channelTarget?: ChannelTarget
+  blueprint?: z.infer<typeof NavBlueprintIdentity>
+  workspaceType?: string
+  workflow?: z.infer<typeof NavWorkflowIdentity>
   completionNotice: {
     unread: boolean
     unreadCount: number
@@ -166,6 +179,39 @@ export namespace SessionNav {
     if (input.parentID || input.cortex || input.background) return "background"
     if (input.scopeType === "home") return "home"
     return "project"
+  }
+
+  function toNavBlueprint(input: unknown): SessionNavEntry["blueprint"] {
+    const parsed = NavBlueprintIdentity.safeParse(input)
+    if (!parsed.success) return undefined
+    const blueprint: NonNullable<SessionNavEntry["blueprint"]> = {}
+    if (parsed.data.loopID !== undefined) blueprint.loopID = parsed.data.loopID
+    if (parsed.data.loopRole !== undefined) blueprint.loopRole = parsed.data.loopRole
+    if (parsed.data.phase !== undefined) blueprint.phase = parsed.data.phase
+    return Object.keys(blueprint).length > 0 ? blueprint : undefined
+  }
+
+  /** Identity fields a sidebar row must render without reading any per-Scope
+   * store. Every producer of `SessionNavEntry` projects through this function
+   * so an entry's shape cannot depend on which path wrote it. */
+  export function deriveSessionIdentity(
+    session: SessionInfo,
+  ): Pick<SessionNavEntry, "blueprint" | "workspaceType" | "workflow"> {
+    const blueprint = toNavBlueprint(SessionSchemaRegistry.navIdentity(session).blueprint)
+    const kind = WorkflowKindRegistry.effectiveKind(session.workflow)
+    const workspaceType = session.workspace?.type
+    return {
+      ...(blueprint ? { blueprint } : {}),
+      ...(workspaceType ? { workspaceType } : {}),
+      ...(kind
+        ? {
+            workflow: {
+              kind,
+              active: WorkflowKindRegistry.get(kind)?.activeForPresentation?.(session) === true,
+            },
+          }
+        : {}),
+    }
   }
 
   export function paginateWithCursor(
@@ -236,6 +282,7 @@ export namespace SessionNav {
           archived: !!session.time.archived,
           archivedAt: session.time.archived || undefined,
           parentID: session.parentID,
+          ...deriveSessionIdentity(session),
           endpointKind: channelEndpoint ? "channel" : undefined,
           chatId: channelEndpoint?.chatId,
           chatName: channelEndpoint?.chatName,
@@ -257,8 +304,9 @@ export namespace SessionNav {
   }
 
   export async function buildNavIndex(scopeID: string): Promise<ScopeNavIndex> {
-    using _ = await Lock.write(mutationKey(scopeID))
-    return buildNavIndexUnlocked(scopeID)
+    return Storage.transaction(async () => {
+      return buildNavIndexUnlocked(scopeID)
+    })
   }
 
   async function readNavIndexUnlocked(scopeID: string): Promise<ScopeNavIndex> {
@@ -273,12 +321,13 @@ export namespace SessionNav {
   }
 
   export async function readNavIndex(scopeID: string): Promise<ScopeNavIndex> {
-    const existing = await Storage.read<ScopeNavIndex>(
-      StoragePath.sessionNavIndex(Identifier.asScopeID(scopeID)),
-    ).catch(() => undefined)
-    if (existing) return existing
-    using _ = await Lock.write(mutationKey(scopeID))
-    return readNavIndexUnlocked(scopeID)
+    return Storage.transaction(async () => {
+      const existing = await Storage.read<ScopeNavIndex>(
+        StoragePath.sessionNavIndex(Identifier.asScopeID(scopeID)),
+      ).catch(() => undefined)
+      const index = existing ?? (await readNavIndexUnlocked(scopeID))
+      return (await SessionCompat.mergeNavIndex(scopeID, index)) as ScopeNavIndex
+    })
   }
 
   export async function rebuildAllNavIndexes(progress?: (done: number, total: number) => void): Promise<void> {
@@ -294,7 +343,7 @@ export namespace SessionNav {
     }
   }
 
-  async function getAllScopeIDs(): Promise<string[]> {
+  export async function getAllScopeIDs(): Promise<string[]> {
     const { Scope } = await import("../scope")
     const projects = await Scope.list()
     return ["home", ...projects.map((project) => project.id)]
@@ -444,31 +493,33 @@ export namespace SessionNav {
     entry: SessionNavEntry,
     options?: { preserveActivityAt?: boolean },
   ): Promise<SessionNavEntry> {
-    using _ = await Lock.write(mutationKey(entry.scopeID))
-    const index = await readNavIndexUnlocked(entry.scopeID)
-    const existing = index.entries.findIndex((e) => e.id === entry.id)
-    const nextEntry =
-      options?.preserveActivityAt && existing >= 0
-        ? { ...entry, lastActivityAt: index.entries[existing].lastActivityAt }
-        : entry
-    if (existing >= 0) index.entries.splice(existing, 1)
-    const insertAt = index.entries.findIndex(
-      (e) =>
-        e.lastActivityAt < nextEntry.lastActivityAt ||
-        (e.lastActivityAt === nextEntry.lastActivityAt && e.id < nextEntry.id),
-    )
-    if (insertAt === -1) index.entries.push(nextEntry)
-    else index.entries.splice(insertAt, 0, nextEntry)
-    index.updatedAt = Date.now()
-    await Storage.write(StoragePath.sessionNavIndex(Identifier.asScopeID(nextEntry.scopeID)), index)
-    return nextEntry
+    return Storage.transaction(async () => {
+      const index = await readNavIndexUnlocked(entry.scopeID)
+      const existing = index.entries.findIndex((e) => e.id === entry.id)
+      const nextEntry =
+        options?.preserveActivityAt && existing >= 0
+          ? { ...entry, lastActivityAt: index.entries[existing].lastActivityAt }
+          : entry
+      if (existing >= 0) index.entries.splice(existing, 1)
+      const insertAt = index.entries.findIndex(
+        (e) =>
+          e.lastActivityAt < nextEntry.lastActivityAt ||
+          (e.lastActivityAt === nextEntry.lastActivityAt && e.id < nextEntry.id),
+      )
+      if (insertAt === -1) index.entries.push(nextEntry)
+      else index.entries.splice(insertAt, 0, nextEntry)
+      index.updatedAt = Date.now()
+      await Storage.write(StoragePath.sessionNavIndex(Identifier.asScopeID(nextEntry.scopeID)), index)
+      return nextEntry
+    })
   }
 
   export async function removeNavEntry(scopeID: string, sessionID: string): Promise<void> {
-    using _ = await Lock.write(mutationKey(scopeID))
-    const index = await readNavIndexUnlocked(scopeID)
-    index.entries = index.entries.filter((e) => e.id !== sessionID)
-    index.updatedAt = Date.now()
-    await Storage.write(StoragePath.sessionNavIndex(Identifier.asScopeID(scopeID)), index)
+    return Storage.transaction(async () => {
+      const index = await readNavIndexUnlocked(scopeID)
+      index.entries = index.entries.filter((e) => e.id !== sessionID)
+      index.updatedAt = Date.now()
+      await Storage.write(StoragePath.sessionNavIndex(Identifier.asScopeID(scopeID)), index)
+    })
   }
 }

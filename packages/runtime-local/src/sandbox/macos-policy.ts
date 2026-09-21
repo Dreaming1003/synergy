@@ -3,24 +3,24 @@
 //
 // Compiles a SynergySandboxPermissionProfile into a parameterized
 // (deny default) sandbox-exec profile using SBPL constants from
-// macos-sbpl.ts. Paths are parameterized via -D flags so the
+// macos-sbpl.ts. Writable roots are parameterized via -D flags so the
 // generated .sb file is portable across directories.
+//
+// Read model: file reads are allowed globally; only the credential
+// paths in profile.fileSystem.readDenyPaths stay unreadable. Write
+// containment is unchanged — writes are denied everywhere except the
+// parameterized writable roots.
 // ------------------------------------------------------------------
 import * as fs_node from "fs"
-import * as os from "os"
-import * as path from "path"
-import { ancestorLiterals } from "@ericsanchezok/synergy-harness/sandbox/policy"
+import * as path_node from "path"
 
 import type { SynergySandboxPermissionProfile } from "@ericsanchezok/synergy-harness/sandbox/policy-engine"
+import { partitionDeniesByWritableRoot } from "@ericsanchezok/synergy-harness/sandbox/policy"
 import { MacOSSbpl } from "./macos-sbpl"
 
 // ------------------------------------------------------------------
 // Parameter name helpers
 // ------------------------------------------------------------------
-
-function readParamName(index: number): string {
-  return `PATH_READ_${index}`
-}
 
 function writeParamName(index: number): string {
   return `PATH_WRITE_${index}`
@@ -30,14 +30,6 @@ function writeParamName(index: number): string {
 // Policy rule generators
 // ------------------------------------------------------------------
 
-function paramReadRule(paramName: string): string {
-  // A bare (param) filter is not a legal Seatbelt path filter: sandbox-exec
-  // rejects the resolved value with "illegal argument". Parameters may only
-  // appear nested inside a path filter such as (subpath (param "...")).
-  return `(allow file-read*
-  (subpath (param "${paramName}")))`
-}
-
 function paramWriteRule(paramName: string): string {
   return `(allow file-read* file-write*
   (subpath (param "${paramName}")))`
@@ -45,6 +37,10 @@ function paramWriteRule(paramName: string): string {
 
 function readOnlyDeny(subpath: string): string {
   return `(deny file-write* (subpath "${escapeSbpl(subpath)}"))`
+}
+
+function readDenyRule(denied: string): string {
+  return `(deny file-read* (subpath "${escapeSbpl(denied)}"))`
 }
 
 function metadataDenyRegex(name: string): string {
@@ -188,54 +184,34 @@ function compileGlobBody(glob: string): string {
  * SBPL rules using user-visible paths may not match kernel-resolved paths,
  * so we resolve all paths to their canonical form before Rule generation.
  *
- * Returns the original path if realpath fails (e.g. path doesn't exist yet).
+ * `realpathSync` fails for a path that does not exist yet, which is the common
+ * case for protected subpaths such as `<workspace>/.git/hooks` — the whole
+ * point of denying them is that nothing has created them. Falling back to the
+ * raw string would emit that deny in whatever spelling the caller used, while
+ * the writable-root parameter is always bound through its canonical spelling.
+ * The deny then covers a path the kernel never resolves and the deeper write
+ * allow wins, so a firmlink alias (`/var/folders/...` for
+ * `/private/var/folders/...`) escapes the protected subpath entirely.
+ *
+ * Resolving the nearest existing ancestor and re-appending the missing
+ * components keeps every emitted rule in the kernel's spelling, whether or not
+ * the target exists. Only a genuinely unresolvable path (no existing ancestor)
+ * falls back to the input.
  */
 function canonicalize(p: string): string {
-  try {
-    return fs_node.realpathSync(p)
-  } catch {
-    return p
-  }
-}
-
-/**
- * Build deny rules for sibling directories of the workspace in the homedir.
- *
- * Seatbelt SBPL enforces "deny always wins" regardless of rule order.
- * A broad (deny (subpath /Users/eric)) would block workspace access even if
- * the workspace is later allowed. Instead, we enumerate each sibling directory
- * of the homedir and deny only those that are NOT the workspace, its ancestors,
- * or an explicitly allowed readable root (or an ancestor of one).
- *
- * This achieves the goal: workspace access is permitted, other user data
- * directories under $HOME are blocked, and explicitly allowed user runtime
- * read roots (e.g. ~/.gitconfig, ~/.config/git, ~/.bun) stay readable.
- */
-function buildSiblingDenyRules(workspace: string, homedir: string, readableRoots: string[]): string[] {
-  const results: string[] = []
-  const ancestors = new Set(ancestorLiterals(workspace).map((p) => canonicalize(p)))
-  const canonicalReadRoots = readableRoots.map((r) => canonicalize(r)).filter((r) => r !== canonicalize("/"))
-  const isReadRootPath = (full: string): boolean =>
-    canonicalReadRoots.some((r) => full === r || r.startsWith(full + "/"))
-
-  try {
-    const entries = fs_node.readdirSync(homedir)
-    for (const entry of entries) {
-      const full = canonicalize(path.join(homedir, entry))
-      if (ancestors.has(full) || full.startsWith(workspace + "/") || full === workspace) continue
-      // Skip a sibling that is an explicitly allowed read root or an ancestor
-      // of one: a sibling deny would otherwise defeat the (allow file-read*)
-      // granted for user runtime roots under the homedir (deny wins in Seatbelt).
-      if (isReadRootPath(full)) continue
-      const r = escapeSbpl(full)
-      results.push(`(deny file-read* (subpath "${r}"))`)
-      results.push(`(deny file-write* (subpath "${r}"))`)
+  let existing = p
+  const trailing: string[] = []
+  for (;;) {
+    try {
+      const resolved = fs_node.realpathSync(existing)
+      return trailing.length === 0 ? resolved : path_node.join(resolved, ...trailing)
+    } catch {
+      const parent = path_node.dirname(existing)
+      if (parent === existing) return p
+      trailing.unshift(path_node.basename(existing))
+      existing = parent
     }
-  } catch {
-    // can't read homedir — skip sibling blocking
   }
-
-  return results
 }
 
 // ------------------------------------------------------------------
@@ -245,9 +221,14 @@ export namespace MacOSPolicy {
    * Compile a SynergySandboxPermissionProfile into a complete SBPL
    * string suitable for sandbox-exec -f.
    *
-   * Uses (deny default) as the base policy with parameterized path
-   * variables so the profile is portable. Call generateParams() to
-   * produce the corresponding -D parameter map.
+   * Uses (deny default) as the base policy with parameterized writable
+   * roots so the profile is portable. Reads are allowed globally and
+   * denied only for the credential paths in readDenyPaths. A deny is
+   * emitted on whichever side of the writable-root allow makes it
+   * effective, because Seatbelt applies the last matching rule, not the
+   * most specific one — see partitionDeniesByWritableRoot.
+   *
+   * Call generateParams() to produce the corresponding -D parameter map.
    */
   export function compileProfile(profile: SynergySandboxPermissionProfile): string {
     const lines: string[] = []
@@ -259,31 +240,39 @@ export namespace MacOSPolicy {
     // 2. Platform defaults (process-exec, sysctl, IOKit, mach, etc.)
     lines.push(MacOSSbpl.PLATFORM_DEFAULTS)
 
-    // 3. Readable roots — parameterized allow rules
-    for (let i = 0; i < fs.readableRoots.length; i++) {
-      lines.push(paramReadRule(readParamName(i)))
-    }
+    // 3. Global read allow — the read model is a deny list. A bare
+    //    (allow file-read*) carries no path filter, so a subpath-scoped
+    //    deny wins over it. Tool configs (e.g. ~/.config/gh), the developer
+    //    toolchain, and arbitrary host paths stay readable without per-root
+    //    enumeration.
+    lines.push("(allow file-read*)")
 
-    // 3a. Ancestor metadata allows — git validates worktree gitdirs by
-    //     stat-ing every path component from the filesystem root down to the
-    //     gitdir; deny-default otherwise fails that stat with
-    //     "Invalid path '<ancestor>'". Metadata-only: permits stat, never
-    //     directory listing or data reads.
-    const ancestorMetadata = new Set<string>()
-    for (const root of fs.readableRoots) {
-      for (const ancestor of ancestorLiterals(root)) {
-        const canonical = canonicalize(ancestor)
-        if (canonical !== "/" && canonical !== canonicalize(root)) ancestorMetadata.add(canonical)
-      }
-    }
-    if (ancestorMetadata.size > 0) {
-      const filters = [...ancestorMetadata].map((p) => `(literal "${escapeSbpl(p)}")`).join(" ")
-      lines.push(`(allow file-read-metadata ${filters})`)
+    // 3a. Credential read denies placed before the writable-root allows: a
+    //     deny CONTAINING a writable root must lose to the deeper allow, so a
+    //     workspace nested inside a credential directory still works while its
+    //     credential siblings stay denied. Canonicalized both because a
+    //     missing path canonicalizes to itself (denying nothing that exists)
+    //     and because the -D writable roots bind canonicalized spellings —
+    //     comparing raw spellings could place a deny on the wrong side.
+    const readDenies = partitionDeniesByWritableRoot(
+      (fs.readDenyPaths ?? []).map(canonicalize),
+      fs.writableRoots.map(canonicalize),
+    )
+    for (const denied of readDenies.beforeWritableRoots) {
+      lines.push(readDenyRule(denied))
     }
 
     // 4. Writable roots — parameterized allow rules
     for (let i = 0; i < fs.writableRoots.length; i++) {
       lines.push(paramWriteRule(writeParamName(i)))
+    }
+
+    // 4a. Credential read denies inside a writable root, placed after the
+    //     allow that would otherwise re-expose them. Rule order is the
+    //     enforcement mechanism here, exactly as the Linux helper orders its
+    //     cover mounts on both sides of the writable binds.
+    for (const denied of readDenies.afterWritableRoots) {
+      lines.push(readDenyRule(denied))
     }
 
     // 5. Read-only subpaths (protected paths inside writable roots)
@@ -292,26 +281,18 @@ export namespace MacOSPolicy {
       lines.push(readOnlyDeny(canonicalize(pp)))
     }
 
-    // 6. Sibling-block deny rules — block homedir children except workspace
-    //    Uses canonicalized paths for APFS firmlink correctness.
-    const homedir = canonicalize(os.homedir())
-    const workspace = canonicalize(fs.workspace)
-    for (const rule of buildSiblingDenyRules(workspace, homedir, fs.readableRoots)) {
-      lines.push(rule)
-    }
-
-    // 7. Network policy
+    // 6. Network policy
     if (fs.includePlatformDefaults || fs.writableRoots.length === 0) {
       lines.push(MacOSSbpl.networkingPolicy(profile.network.mode))
     }
 
-    // 8. Unix socket policy
+    // 7. Unix socket policy
     const unixSocketRules = MacOSSbpl.unixSocketPolicy(profile.network.allowedUnixSockets)
     if (unixSocketRules.length > 0) {
       lines.push(unixSocketRules)
     }
 
-    // 8a. Protected metadata names — deny writes to critical dirs
+    // 7a. Protected metadata names — deny writes to critical dirs
     for (const name of fs.protectedMetadataNames) {
       // Skip empty strings
       if (name.length > 0) {
@@ -319,7 +300,7 @@ export namespace MacOSPolicy {
       }
     }
 
-    // 9. Unreadable globs — deny file-read* and file-read-data via compiled regex
+    // 8. Unreadable globs — deny file-read* and file-read-data via compiled regex
     for (const glob of fs.unreadableGlobs) {
       const regex = compileGlobToSeatbeltRegex(glob)
       lines.push(`(deny file-read* (regex #"${regex}"))`)
@@ -337,10 +318,6 @@ export namespace MacOSPolicy {
   export function generateParams(profile: SynergySandboxPermissionProfile): Record<string, string> {
     const params: Record<string, string> = {}
     const fs = profile.fileSystem
-
-    for (let i = 0; i < fs.readableRoots.length; i++) {
-      params[readParamName(i)] = canonicalize(fs.readableRoots[i])
-    }
 
     for (let i = 0; i < fs.writableRoots.length; i++) {
       params[writeParamName(i)] = canonicalize(fs.writableRoots[i])

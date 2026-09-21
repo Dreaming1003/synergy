@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks"
+import { SecretPaths } from "../secrets/path-registry"
 import { LegacyExecutionConfig } from "./legacy-execution"
 import { Experiment } from "./experiment"
 import { Log } from "../util/log"
@@ -22,6 +23,7 @@ import { BusEvent } from "../bus/bus-event"
 import { ConfigMarkdown } from "./markdown"
 import { existsSync } from "fs"
 import { loadFragments } from "./fragment"
+import { DOMAIN_FRAGMENT_MODE, MalformedFragmentError, renderDomainFragment } from "./fragment-render"
 import * as Schema from "./schema"
 import { ConfigDomain } from "./domain"
 import { ConfigExtensions } from "./extensions"
@@ -280,7 +282,9 @@ export namespace Config {
 
     // Inline config content has highest precedence
     if (Flag.SYNERGY_CONFIG_CONTENT) {
-      merge(Info.parse(LegacyExecutionConfig.migrate(JSON.parse(Flag.SYNERGY_CONFIG_CONTENT))), "inline_config")
+      const inline = Info.parse(LegacyExecutionConfig.migrate(JSON.parse(Flag.SYNERGY_CONFIG_CONTENT)))
+      if (inline.storage) throw new Error("Storage configuration must use the global 130-storage.jsonc domain file")
+      merge(inline, "inline_config")
       log.debug("loaded custom config from SYNERGY_CONFIG_CONTENT")
     }
 
@@ -319,11 +323,19 @@ export namespace Config {
       if (result.compaction.maxHistoryImages === undefined) result.compaction.maxHistoryImages = 8
       if (result.compaction.codexRemote === undefined) result.compaction.codexRemote = false
     }
+    if (result.attachment === undefined) {
+      result.attachment = { maxFiles: 20, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 2 * 1024 * 1024 * 1024 }
+    } else {
+      if (result.attachment.maxFiles === undefined) result.attachment.maxFiles = 20
+      if (result.attachment.maxFileBytes === undefined) result.attachment.maxFileBytes = 200 * 1024 * 1024
+      if (result.attachment.maxTotalBytes === undefined) result.attachment.maxTotalBytes = 2 * 1024 * 1024 * 1024
+    }
 
     if (!result.username) result.username = os.userInfo().username
 
     merge(LegacyExecutionConfig.environment(), "legacy_environment")
 
+    normalizeRoleNulls(result)
     ConfigExtensions.normalize(result)
     const config = Info.parse(result)
     mark(config, "default", "", true)
@@ -334,6 +346,31 @@ export namespace Config {
       sources,
     }
   }
+  // Role models and role_variant values accept explicit null as a stored
+  // "cleared" marker: the settings round trip needs it to survive deep merge
+  // across config layers. Strip the markers here so readers always see unset.
+  function normalizeRoleNulls(config: Info) {
+    const roleFields = [
+      "model",
+      "nano_model",
+      "mini_model",
+      "mid_model",
+      "thinking_model",
+      "long_context_model",
+      "creative_model",
+      "vision_model",
+    ] as const
+    for (const field of roleFields) {
+      if (config[field] === null) delete config[field]
+    }
+    if (config.role_variant) {
+      for (const [role, variant] of Object.entries(config.role_variant)) {
+        if (variant === null) delete config.role_variant[role]
+      }
+      if (Object.keys(config.role_variant).length === 0) delete config.role_variant
+    }
+  }
+
   /**
    * Fetch and parse one well-known remote config, caching the result.
    * Returns null when the remote config is unavailable or invalid so the
@@ -498,6 +535,8 @@ export namespace Config {
       try {
         const fragment = await loadFile(filepath, { addSchema: false })
         ConfigDomain.validateKeys(fragment as Record<string, unknown>, domain.id, { preserveUnregistered: true })
+        if (domain.id === "storage" && fragment.storage && path.resolve(root) !== path.resolve(Global.Path.config))
+          throw new Error("Storage configuration is global and cannot be overridden by a project")
         result = mergeConfigConcatArrays(result, fragment as Info)
         // A recovered file clears its historical diagnostic so the registry
         // reflects the most recent load. Only clear when the file really
@@ -507,7 +546,7 @@ export namespace Config {
           clearIssueForPath(filepath)
         }
       } catch (error) {
-        if (strictExecution.getStore()) throw error
+        if (domain.id === "storage" || strictExecution.getStore()) throw error
         await quarantineDomainFile(domain.id, filepath, error)
       }
     }
@@ -674,7 +713,9 @@ export namespace Config {
         const filepath = path.join(tempDir, domain.filename)
         const existing = await loadFile(filepath, { addSchema: false })
         const fragment = split.get(domain.id) ?? {}
-        await Bun.write(filepath, serializeConfig(mergeConfigConcatArrays(existing, fragment as Info)))
+        await Bun.write(filepath, serializeConfig(mergeConfigConcatArrays(existing, fragment as Info)), {
+          mode: DOMAIN_FRAGMENT_MODE,
+        })
       }
 
       await fs.mkdir(path.dirname(domainDir), { recursive: true })
@@ -1082,83 +1123,12 @@ export namespace Config {
    * field has not changed. When the server receives this value, it merges
    * the currently stored secret instead of overwriting it with the placeholder.
    */
-  export const REDACTED_SENTINEL = "__REDACTED__"
-  // Secret-shaped key heuristic for free-form string maps (MCP remote
-  // headers, MCP local environment, agent/provider options): these fields
-  // hold arbitrary keys, so redaction matches key names instead of fixed
-  // paths. Keys are split into components (snake/kebab/camel) so
-  // ANTHROPIC_API_KEY and apiKey both match; single `key`-shaped names
-  // (keybinds, max_tokens) deliberately do not. mergeRedactedSecrets
-  // restores sentinels from stored values, keeping redacted round-trips
-  // lossless for these fields too.
-  const SECRET_KEY_COMPONENTS = new Set([
-    "secret",
-    "secrets",
-    "password",
-    "passwords",
-    "passwd",
-    "token",
-    "authorization",
-    "credential",
-    "credentials",
-    "apikey",
-    "apikeys",
-    "privatekey",
-    "privatekeys",
-    "accesstoken",
-    "accesstokens",
-    "refreshtoken",
-    "refreshtokens",
-    "cookie",
-    "cookies",
-  ])
-
-  function isSecretShapedKey(key: string): boolean {
-    const parts = key
-      .split(/[^a-zA-Z0-9]+/)
-      .flatMap((part) => part.split(/(?<=[a-z0-9])(?=[A-Z])/))
-      .map((part) => part.toLowerCase())
-      .filter(Boolean)
-    for (const part of parts) if (SECRET_KEY_COMPONENTS.has(part)) return true
-    for (let i = 0; i + 1 < parts.length; i++) {
-      if (SECRET_KEY_COMPONENTS.has(parts[i]! + parts[i + 1]!)) return true
-    }
-    return false
-  }
-
-  function redactSecretShapedRecord(record: Record<string, unknown>) {
-    for (const [key, value] of Object.entries(record)) {
-      if (typeof value === "string") {
-        if (value.length > 0 && isSecretShapedKey(key)) record[key] = REDACTED_SENTINEL
-      } else if (value && typeof value === "object" && !Array.isArray(value)) {
-        redactSecretShapedRecord(value as Record<string, unknown>)
-      }
-    }
-  }
-
-  function mergeSecretShapedRecord(incoming: Record<string, unknown>, stored: Record<string, unknown> | undefined) {
-    if (!stored) return
-    for (const [key, value] of Object.entries(incoming)) {
-      const storedValue = stored[key]
-      if (value === REDACTED_SENTINEL && typeof storedValue === "string" && storedValue.length > 0) {
-        incoming[key] = storedValue
-      } else if (
-        value &&
-        typeof value === "object" &&
-        !Array.isArray(value) &&
-        storedValue &&
-        typeof storedValue === "object" &&
-        !Array.isArray(storedValue)
-      ) {
-        mergeSecretShapedRecord(value as Record<string, unknown>, storedValue as Record<string, unknown>)
-      }
-    }
-  }
+  export const REDACTED_SENTINEL = SecretPaths.REDACTED_SENTINEL
 
   const secretHelpers = {
-    sentinel: REDACTED_SENTINEL,
-    redact: redactSecretShapedRecord,
-    restore: mergeSecretShapedRecord,
+    sentinel: SecretPaths.REDACTED_SENTINEL,
+    redact: SecretPaths.redactRecord,
+    restore: SecretPaths.mergeRecord,
   }
 
   /** Deep-clone config and replace secrets with REDACTED_SENTINEL for safe client exposure. */
@@ -1172,17 +1142,17 @@ export namespace Config {
     if (result.provider) {
       for (const provider of Object.values(result.provider) as any[]) {
         if (provider?.options?.apiKey) provider.options.apiKey = REDACTED_SENTINEL
-        if (provider?.options) redactSecretShapedRecord(provider.options)
+        if (provider?.options) SecretPaths.redactRecord(provider.options)
         for (const model of Object.values(provider?.models ?? {}) as any[]) {
           if (model?.options?.apiKey) model.options.apiKey = REDACTED_SENTINEL
-          if (model?.options) redactSecretShapedRecord(model.options)
+          if (model?.options) SecretPaths.redactRecord(model.options)
         }
       }
     }
 
     if (result.agent) {
       for (const agent of Object.values(result.agent) as any[]) {
-        if (agent?.options) redactSecretShapedRecord(agent.options)
+        if (agent?.options) SecretPaths.redactRecord(agent.options)
       }
     }
     ConfigExtensions.redact(result, secretHelpers)
@@ -1203,20 +1173,20 @@ export namespace Config {
         if (provider?.options?.apiKey === REDACTED_SENTINEL) {
           if (storedProvider?.options?.apiKey) provider.options.apiKey = storedProvider.options.apiKey
         }
-        if (provider?.options) mergeSecretShapedRecord(provider.options, storedProvider?.options)
+        if (provider?.options) SecretPaths.mergeRecord(provider.options, storedProvider?.options)
         for (const [modelKey, model] of Object.entries(provider?.models ?? {}) as [string, any][]) {
           const storedModel = storedProvider?.models?.[modelKey]
           if (model?.options?.apiKey === REDACTED_SENTINEL) {
             if (storedModel?.options?.apiKey) model.options.apiKey = storedModel.options.apiKey
           }
-          if (model?.options) mergeSecretShapedRecord(model.options, storedModel?.options)
+          if (model?.options) SecretPaths.mergeRecord(model.options, storedModel?.options)
         }
       }
     }
 
     if (result.agent && stored.agent) {
       for (const [key, agent] of Object.entries(result.agent) as [string, any][]) {
-        if (agent?.options) mergeSecretShapedRecord(agent.options, (stored.agent as Record<string, any>)[key]?.options)
+        if (agent?.options) SecretPaths.mergeRecord(agent.options, (stored.agent as Record<string, any>)[key]?.options)
       }
     }
     ConfigExtensions.restore(result, stored, secretHelpers)
@@ -1395,6 +1365,8 @@ export namespace Config {
     options: { mode?: ConfigDomain.MergeMode; root?: string } = {},
   ) {
     const parsed = ConfigDomain.Id.parse(id)
+    if (parsed === "storage")
+      throw new Error("Change the active storage target with data storage migrate --target; it cannot be hot-reloaded")
     using _ = await Lock.write(`config-domain:${ConfigDomain.filepath(parsed, options.root)}`)
     // `return await` (not bare `return promise`): with `using`, a bare return
     // disposes the lock before the async transaction has run, so concurrent
@@ -1433,6 +1405,8 @@ export namespace Config {
     options: { mode?: ConfigDomain.MergeMode } = {},
   ) {
     const parsed = ConfigDomain.Id.parse(id)
+    if (parsed === "storage")
+      throw new Error("Change the active storage target with data storage migrate --target; it cannot be hot-reloaded")
     using _ = await Lock.write(`config-domain:${ConfigDomain.filepath(parsed)}`)
     const oldConfig = await globalResolved()
     const current = await domainGet(parsed)
@@ -1484,6 +1458,8 @@ export namespace Config {
     options: { mode?: ConfigDomain.MergeMode } = {},
   ) {
     const parsed = ConfigDomain.Id.parse(id)
+    if (parsed === "storage")
+      throw new Error("Change the active storage target with data storage migrate --target; it cannot be hot-reloaded")
     using _ = await Lock.write(`config-domain:${ConfigDomain.filepath(parsed)}`)
     const oldConfig = await globalResolved()
     const result = await domainUpdateUnlocked(parsed, patch, options)
@@ -1521,7 +1497,37 @@ export namespace Config {
   async function writeDomainFile(id: ConfigDomain.Id, config: Partial<Info>, root = Global.Path.config) {
     const filepath = ConfigDomain.filepath(id, root)
     await fs.mkdir(path.dirname(filepath), { recursive: true })
-    await Bun.write(filepath, serializeConfig(config))
+    let content = serializeConfig(config)
+    let changed = true
+    try {
+      const rendered = await renderDomainFragment({
+        current: await Bun.file(filepath)
+          .text()
+          .catch(() => ""),
+        next: config,
+        filepath,
+        renderFresh: serializeConfig,
+      })
+      content = rendered.content
+      changed = rendered.changed
+    } catch (error) {
+      // A malformed fragment cannot be edited in place; replace it with the
+      // valid merged config so the save still lands, matching the quarantine
+      // recovery contract instead of turning silent overwrites into failures.
+      if (!(error instanceof MalformedFragmentError)) throw error
+    }
+    // An unchanged document skips the write entirely: an empty Settings save
+    // must not churn the fragment's mtime or wake the file watcher.
+    if (!changed) {
+      await fs
+        .chmod(filepath, DOMAIN_FRAGMENT_MODE)
+        .catch((error) => log.warn("failed to restrict config fragment permissions", { filepath, error }))
+      return
+    }
+    await Bun.write(filepath, content, { mode: DOMAIN_FRAGMENT_MODE })
+    await fs
+      .chmod(filepath, DOMAIN_FRAGMENT_MODE)
+      .catch((error) => log.warn("failed to restrict config fragment permissions", { filepath, error }))
   }
 
   export function serializeConfig(config: Partial<Info>) {

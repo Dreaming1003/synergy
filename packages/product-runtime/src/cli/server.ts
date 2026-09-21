@@ -1,4 +1,9 @@
-import { createManagedMigrationReporter, createManagedRecoveryReporter } from "./managed-startup"
+import {
+  createManagedMigrationReporter,
+  createManagedRecoveryReporter,
+  createManagedStorageReporter,
+  createManagedMaintenanceReporter,
+} from "./managed-startup"
 import { cmd } from "@ericsanchezok/synergy-cli/cli/cmd/cmd"
 import { withNetworkOptions, resolveNetworkOptions } from "@ericsanchezok/synergy-cli/cli/network"
 import { run as runServerRuntime } from "../server/runtime"
@@ -7,7 +12,6 @@ import { FormatError, FormatUnknownError } from "@ericsanchezok/synergy-cli/cli/
 import { Log } from "@ericsanchezok/synergy-harness/util/log"
 import { ServerProcessLock } from "@ericsanchezok/synergy-harness/util/server-process-lock"
 import { Server } from "@ericsanchezok/synergy-server/server/server"
-import type { RuntimeOptions } from "../server/runtime"
 
 export const ServerCommand = cmd({
   command: ["$0", "server"],
@@ -30,21 +34,24 @@ export const ServerCommand = cmd({
       }),
   describe: "start synergy server",
   handler: async (args) => {
-    let network: RuntimeOptions["network"] | undefined
+    let network: Awaited<ReturnType<typeof resolveNetworkOptions>> | undefined
     try {
       const managed = process.env.SYNERGY_DESKTOP_STARTUP_PROGRESS === "1"
-      network = await resolveNetworkOptions(args, {
-        output: managed ? "silent" : "interactive",
-        reporter: managed ? createManagedMigrationReporter() : undefined,
-      })
       const managedService = args.managedService
 
       await runServerRuntime({
+        storageReporter: managed ? createManagedStorageReporter() : undefined,
+        maintenanceReporter: managed ? createManagedMaintenanceReporter() : undefined,
+        migrationReporter: managed ? createManagedMigrationReporter() : undefined,
+        migrationOutput: managed ? "silent" : "interactive",
         recoveryReporter: managed ? createManagedRecoveryReporter() : undefined,
         interactive: !(managedService || args.nonInteractive),
         printBanner: args.banner,
         printChannelStatus: !managedService,
-        network,
+        network: async () => {
+          network = await resolveNetworkOptions(args)
+          return network
+        },
       })
     } catch (error) {
       Log.Default.error("server startup failed", {

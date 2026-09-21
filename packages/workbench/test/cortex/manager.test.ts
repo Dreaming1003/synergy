@@ -480,12 +480,13 @@ describe.serial("Cortex", () => {
             ])
 
             let cancellationSettled = false
-            const cancellation = Cortex.cancel(task.id)
+            const cancelled = Cortex.cancel(task.id)
+            const cancellation = cancelled
               .then(() => Cortex.drain(task.id))
               .then(() => {
                 cancellationSettled = true
               })
-            await Bun.sleep(10)
+            await cancelled
             expect(Cortex.get(task.id)?.status).toBe("cancelled")
             expect(cancellationSettled).toBe(false)
             releaseUsageRead.resolve()
@@ -1636,12 +1637,8 @@ describe.serial("Cortex", () => {
             taskID = createdTask.id
             await launchPromise
 
-            const output = await Promise.race([
-              observedOutput,
-              Bun.sleep(1_000).then(() => {
-                throw new Error("Parent session was not woken for the Cortex completion notice")
-              }),
-            ])
+            const output = await observedOutput
+            await Cortex.drain(taskID)
 
             expect(output).toContain("Status: completed")
             expect(output).toContain("--- Result ---")
@@ -1714,13 +1711,9 @@ describe.serial("Cortex", () => {
             taskID = task.id
             childMayFinish.resolve()
 
-            const output = await Promise.race([
-              observedOutput.promise,
-              Bun.sleep(1_000).then(() => {
-                throw new Error("Cortex completion notice was not observed")
-              }),
-            ])
+            const output = await observedOutput.promise
             await waitUntilTerminal(taskID)
+            await Cortex.drain(taskID)
 
             expect(output).toContain("Status: completed")
             expect(output).toContain("--- Result ---")
@@ -2071,7 +2064,7 @@ describe.serial("Cortex", () => {
             expect(await waitForNotification(parentSession.id, first.id)).toBeDefined()
             expect(await waitForNotification(parentSession.id, second.id)).toBeDefined()
 
-            const drained = await SessionInbox.drainSteer(parentSession.id)
+            const drained = await SessionInbox.peekSteer(parentSession.id)
             expect(drained).toHaveLength(2)
             expect(new Set(drained.map((item) => item.deliveryKey))).toEqual(
               new Set([`cortex:taskNotification:${first.id}`, `cortex:taskNotification:${second.id}`]),

@@ -28,6 +28,8 @@ For non-blocking and ordering contracts, hold the downstream operation behind an
 
 Inspect two nearby tests and `packages/harness/test/support/preload.ts` before introducing a new harness pattern.
 
+Importing an App `src/components/**` module directly from `bun:test` needs its module-load side effects satisfied first: `mock.module("@/locales/en/messages.po?lingui", () => ({ messages: {} }))` for the catalog, because the `.po?lingui` module is not Bun-loadable, and a stub for anything reaching `@ericsanchezok/synergy-ui/icon`, whose `lucide-solid` `Dynamic` chain throws "Client-only API called on the server side". Prefer extracting the logic under test into a plain module (a classifier, a resolver, a projection) and testing that directly; reach for the mocks only when the component's own wiring is the subject.
+
 Place every test under the owning package's `test/` directory, mirroring the relevant source domain when that helps navigation. Place repository-level script and policy tests under the root `test/` directory. Never cascade `*.test.*` or `*.spec.*` files beside implementation files in `src/`, `script/`, or another source directory. Run `bun run test-layout:check` when adding or moving tests.
 
 For localized UI behavior, use a real Lingui `I18nProvider` with minimal English and Simplified Chinese messages. Assert visible text and accessibility labels after a reactive locale change; do not mock translation calls to return IDs because that hides missing catalogs and stale module-load translations. Keep plugin-author, user, LLM, path, identifier, and raw-error pass-through in the same boundary test as translated host chrome.
@@ -39,6 +41,8 @@ Per-session recovery tests must migrate only their owned session fixture. Exerci
 Use `tmpdir()` and `ScopeContext` instead of mocking Storage, Session, or the filesystem. The preload-managed `SYNERGY_TEST_ROOT` contains temporary fixtures for process-level cleanup, so do not move fixtures back to unmanaged operating-system temp paths or delete them while Scope-owned asynchronous work may still reference them. Restore environment variables and singleton state in cleanup hooks. A module-level replacement of a process global — `globalThis.fetch` above all — is visible to every sibling file in the same shard process: capture the original before installing the replacement and restore it in `afterAll`, because a per-test `finally` that re-reads `globalThis.fetch` restores the replacement, not the original. Honor abort signals and dispose processes, Browser pages, servers, and timers.
 
 Cancellation tests must cover the interval after execution ownership releases but before asynchronous ledger reconciliation finishes, preserving interrupted call evidence and the terminal cancellation result.
+
+Capture process-global loop observations by their owning Session ID and assert the target Session's requests. A single last-call variable can be overwritten by unrelated background work; exercise an independent Session and drain the owned Cortex task before restoring loop mocks.
 
 Electron fixtures should launch the resolved Electron executable rather than the npm CLI wrapper so timeout signals reach the owned application. Include cold startup and teardown in the test budget, and retain phase diagnostics on failure.
 
@@ -62,7 +66,11 @@ For inbox-to-transcript transitions, exercise settlement while a real inbox item
 
 Recovery migrations must also exercise startup with no newly queued task, failed wake attempts, and repeated startup. Persisting repaired state alone does not prove that startup can discover and execute the work. When adding migration imports, run the fresh-process migration registration and owner-ledger tests; a suite with preloaded session modules can hide a cold-import cycle.
 
+For startup maintenance, pair real SQLite lifecycle tests (opening DDL, VACUUM/checkpoints, verification and failed DDL) with a fake monotonic clock at the Desktop consumer. Cover overlapping operations, duplicate/stale events, phase changes during maintenance, completion returning to the underlying deadline, and failure/worker loss. Assert observers run in the caller context even after transaction retries. Exercise split stdout/stderr and reused log files through a real managed child, then validate indeterminate elapsed time and long error details in Electron. Never let small fixtures or pre-recorded progress alone certify producer-to-consumer coverage.
+
 ## Local Performance Experiments
+
+Benchmark adapters must pass the environment's `agent_process_env` to the agent invocation so restricted-network tasks retain the evaluator's inference egress. Test both proxy-enabled and ordinary environments while keeping provider credentials in temporary private files. Validate streamed requests through the proxy and recording path: a direct provider probe, an internet-enabled task, or a successful proxy HEAD request does not establish that the actual model transport works.
 
 Test process signals through an actual child process after a deterministic provider readiness barrier. An in-process abort or timer preserves different async context from an operating-system signal; both paths must retain Scope ownership and terminal accounting.
 
@@ -126,6 +134,7 @@ Coverage has a floor. `bun run coverage:check` enforces per-package line/functio
 - Every exemption entry carries a `reason`; entries that match nothing, overlap, or cover more than 25% of a package fail validation.
 - Bun 1.3.14 supports no ignore comments (`istanbul ignore`, `v8 ignore`, and `c8 ignore` are all inert), so whole-file exemption is the only exclusion mechanism. Do not add ignore comments expecting them to work.
 - A source file never loaded by any test counts as 0% and fails the package — add a real test that loads it rather than exempting blindly.
+- Runtime-owning CLI tests must start with only the shared isolation preload, because the harness preload installs a Handle that maintenance must reject. Register these suites in the shared batch planner; preserve the original package's coverage report directory when selecting the fresh composition.
 - For Solid wrappers exercised through a Vite-compiled DOM fixture, verify whether Bun attributes coverage to the emitted bundle instead of the TSX source. An exact-file exemption must identify the behavioral suite and this instrumentation boundary; keep directly testable logic measured separately.
 
 Use [Development reference](../../../docs/reference/development.md) and [Open-source quality](../../../docs/operations/open-source-quality.md) for current command ownership. Do not invent a root `bun test`; the root script intentionally rejects that ambiguous command.

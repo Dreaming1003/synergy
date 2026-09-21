@@ -11,6 +11,7 @@ import { useWorkbenchPanels } from "@/context/workbench"
 import { holosLogoPath } from "@/utils/brand-assets"
 import { useTheme } from "@ericsanchezok/synergy-ui/theme"
 import { getScopeLabel, isHomeScope, resolveProjectScope } from "@/utils/scope"
+import { isWorkingStatus } from "@/utils/session-status"
 import { ActiveZone } from "@/components/scopes/active-zone"
 import { sessionScopeRequestFor } from "@/components/session/session-actions"
 import { SessionRow } from "@/components/scopes/session-row"
@@ -21,7 +22,7 @@ import type { Session } from "@ericsanchezok/synergy-sdk/client"
 import { getSemanticIcon, type SemanticIconTokenName } from "@ericsanchezok/synergy-ui/semantic-icon"
 import type { MessageDescriptor } from "@lingui/core"
 import { useLingui } from "@lingui/solid"
-import { appShell, sessionTags, sidebar } from "@/locales/messages"
+import { appShell, sidebar } from "@/locales/messages"
 import { useDialog } from "@ericsanchezok/synergy-ui/context/dialog"
 import { SettingsDialog } from "@/components/settings"
 import { useProjectDirectoryPicker } from "@/components/dialog/project-directory-picker"
@@ -31,7 +32,7 @@ import {
   MobileDrawerSettingsButton,
   type MobileDrawerRecentVisual,
 } from "./mobile-drawer-root"
-import { resolveSessionVisualState, scopeKeyForNavEntry } from "@/components/sidebar/session-visual-state"
+import { resolveSessionVisualState } from "@/components/sidebar/session-visual-state"
 import "./mobile-drawer.css"
 
 export function MobileDrawer() {
@@ -212,9 +213,14 @@ function ScopeListView(props: {
   // for the localization contract (see script/localization-check.ts).
   const translateSessionState = (descriptor: MessageDescriptor) => _(descriptor)
   const recentVisualFor = (entry: NavEntry): MobileDrawerRecentVisual => {
-    const scopeKey = scopeKeyForNavEntry(entry, globalSync.data.scope)
-    const store = scopeKey ? globalSync.peekScopeState(scopeKey)?.[0] : undefined
-    const visual = resolveSessionVisualState(store, entry)
+    const visual = resolveSessionVisualState({
+      entry,
+      status: globalSync.sessionStatus[entry.id],
+      waiting: (globalSync.permissions[entry.id]?.length ?? 0) > 0 || (globalSync.questions[entry.id]?.length ?? 0) > 0,
+      runningChildTasks: globalSync.cortex.some(
+        (task) => task.parentSessionID === entry.id && task.status === "running",
+      ),
+    })
     const meaningful = visual.completionUnread || visual.tone !== "default"
     return { visual, label: meaningful ? translateSessionState(visual.label) : "" }
   }
@@ -408,6 +414,7 @@ function SessionListDrawerView(props: {
 }) {
   const layout = useLayout()
   const globalSDK = useGlobalSDK()
+  const globalSync = useGlobalSync()
   const navigate = useNavigate()
   const confirm = useConfirm()
   const { _ } = useLingui()
@@ -415,25 +422,18 @@ function SessionListDrawerView(props: {
   const [loading, setLoading] = createSignal(false)
   const [pagedSessions, setPagedSessions] = createSignal<Session[]>([])
   const [pagedTotal, setPagedTotal] = createSignal(0)
-  const [tagFilter, setTagFilter] = createSignal<string | undefined>()
 
   const allSessions = createMemo(() => layout.nav.projectSessions(props.scope))
-  const childStore = createMemo(() => layout.nav.childStoreForScope(props.scope))
   const totalPages = createMemo(() => Math.max(1, Math.ceil(pagedTotal() / SESSION_PAGE_SIZE)))
-  const availableTags = createMemo(() => {
-    const tags = new Set<string>()
-    for (const session of [...allSessions(), ...pagedSessions()]) for (const tag of session.tags ?? []) tags.add(tag)
-    return [...tags].sort()
-  })
 
   const scopeName = createMemo(() => getScopeLabel(props.scope))
 
-  function fetchPage(page: number, filter = tagFilter()) {
+  function fetchPage(page: number) {
     setLoading(true)
     const offset = (page - 1) * SESSION_PAGE_SIZE
     const sdk = createSynergyClient({ baseUrl: globalSDK.url, directory: props.scope.worktree, throwOnError: true })
     sdk.session
-      .list({ offset, limit: SESSION_PAGE_SIZE, ...(filter ? { tag: filter } : {}) })
+      .list({ offset, limit: SESSION_PAGE_SIZE })
       .then((x) => {
         const result = x.data!
         setPagedSessions((result.data ?? []).filter((s) => !!s?.id && !s.time?.archived))
@@ -450,19 +450,9 @@ function SessionListDrawerView(props: {
     fetchPage(page)
   }
 
-  function selectTag(tag: string | undefined) {
-    setTagFilter(tag)
-    setCurrentPage(1)
-    fetchPage(1, tag)
-  }
-
   function getSessionState(session: Session) {
-    const store = childStore()
-    if (!store)
-      return { isWorking: false, hasPermission: false, hasError: false, hasNotification: false, notificationCount: 0 }
-    const status = store.session_status[session.id]
-    const isWorking = status?.type === "busy" || status?.type === "retry" || status?.type === "recovering"
-    const hasPermission = (store.permission[session.id] ?? []).length > 0
+    const isWorking = isWorkingStatus(globalSync.sessionStatus[session.id])
+    const hasPermission = (globalSync.permissions[session.id]?.length ?? 0) > 0
     const unseen = props.notification.session.unseen(session.id)
     const hasError = unseen.some((n) => n.type === "error")
     const hasNotification = unseen.length > 0
@@ -515,47 +505,12 @@ function SessionListDrawerView(props: {
         <span>{_(appShell.newSession)}</span>
       </button>
 
-      <Show when={availableTags().length > 0}>
-        <div class="flex items-center gap-1.5 px-3 pb-2 overflow-x-auto">
-          <button
-            type="button"
-            class="shrink-0 px-2 py-1 rounded-md text-11-medium border border-border-base/50 cursor-pointer"
-            classList={{
-              "text-text-interactive-base bg-surface-info-base/15": !tagFilter(),
-              "text-text-weak": !!tagFilter(),
-            }}
-            onClick={() => selectTag(undefined)}
-          >
-            {_(sessionTags.all)}
-          </button>
-          <For each={availableTags()}>
-            {(tag) => (
-              <button
-                type="button"
-                class="shrink-0 px-2 py-1 rounded-md text-11-medium border border-border-base/50 cursor-pointer"
-                classList={{
-                  "text-text-interactive-base bg-surface-info-base/15": tagFilter() === tag,
-                  "text-text-weak": tagFilter() !== tag,
-                }}
-                onClick={() => selectTag(tag)}
-              >
-                #{tag}
-              </button>
-            )}
-          </For>
-        </div>
-      </Show>
-
-      <Show when={childStore()}>
-        {(store) => (
-          <ActiveZone
-            sessions={allSessions()}
-            childStore={store()}
-            notification={props.notification}
-            onSelectSession={props.onSelectSession}
-          />
-        )}
-      </Show>
+      <ActiveZone
+        sessions={allSessions()}
+        runtime={globalSync}
+        notification={props.notification}
+        onSelectSession={props.onSelectSession}
+      />
 
       <div class="flex-1 min-h-0 overflow-y-auto">
         <For each={pagedSessions()}>
@@ -580,15 +535,6 @@ function SessionListDrawerView(props: {
                     title,
                   })
                 }
-                availableTags={availableTags()}
-                onTagsChange={async (tags) => {
-                  await globalSDK.client.session.update({
-                    ...sessionScopeRequestFor(session),
-                    sessionID: session.id,
-                    tags,
-                  })
-                  setPagedSessions((items) => items.map((item) => (item.id === session.id ? { ...item, tags } : item)))
-                }}
               />
             )
           }}

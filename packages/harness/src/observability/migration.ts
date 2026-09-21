@@ -1,3 +1,4 @@
+import { initializeSqliteEngine } from "../storage/sqlite-engine"
 import fs from "fs/promises"
 import { Database } from "bun:sqlite"
 import { MigrationRegistry } from "../migration/registry"
@@ -26,6 +27,7 @@ export namespace ObservabilityMigration {
       progress(1, 1)
       return
     }
+    initializeSqliteEngine()
     const legacy = new Database(legacyPath, { readonly: true })
     try {
       const steps = [
@@ -711,6 +713,7 @@ export namespace ObservabilityMigration {
 
 const migrations: Migration[] = [
   {
+    scope: "global",
     id: ObservabilityMigration.id,
     description: "Create indexed observability store and migrate legacy perf telemetry",
     domain: "observability",
@@ -720,6 +723,7 @@ const migrations: Migration[] = [
     },
   },
   {
+    scope: "global",
     id: ObservabilityMigration.redactionBackfillId,
     description: "Redact existing canonical observability telemetry",
     domain: "observability",
@@ -730,6 +734,7 @@ const migrations: Migration[] = [
     },
   },
   {
+    scope: "global",
     id: ObservabilityMigration.incrementalVacuumId,
     description: "Enable incremental vacuum for bounded observability storage",
     domain: "observability",
@@ -740,6 +745,7 @@ const migrations: Migration[] = [
     },
   },
   {
+    scope: "global",
     id: ObservabilityMigration.schemaMetadataId,
     description: "Synchronize observability schema metadata",
     domain: "observability",
@@ -750,6 +756,7 @@ const migrations: Migration[] = [
     },
   },
   {
+    scope: "global",
     id: ObservabilityMigration.resourceCgroupId,
     description: "Add cgroup and service memory resource fields",
     domain: "observability",
@@ -760,6 +767,7 @@ const migrations: Migration[] = [
     },
   },
   {
+    scope: "global",
     id: ObservabilityMigration.metricSlimId,
     description: "Drop low-value metric columns and indexes to bound storage growth",
     domain: "observability",

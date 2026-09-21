@@ -45,7 +45,14 @@ describe("rollout artifacts", () => {
     const second = await RolloutArtifact.write(target, source(), "application/octet-stream")
     expect(first.id).not.toBe(second.id)
     expect(first.sha256).toBe(second.sha256)
-    expect(await Storage.scan([...RolloutArtifact.root(target), "blobs"], { strict: true })).toHaveLength(1)
+    const blobs = await Storage.current().store.snapshot(async (tx) => {
+      const result: string[][] = []
+      const prefix = [...RolloutArtifact.root(target), "blobs"]
+      for await (const entry of tx.artifacts())
+        if (prefix.every((part, index) => entry.key[index] === part)) result.push(entry.key)
+      return result
+    })
+    expect(blobs).toHaveLength(1)
   })
 
   test("preserves content across producer chunk boundaries", async () => {
@@ -112,11 +119,11 @@ describe("rollout artifacts", () => {
   test("does not publish completion when the final commit fails", async () => {
     const target = owner()
     const original = Storage.write.bind(Storage)
-    using write = spyOn(Storage, "write").mockImplementation(async (key, data, options) => {
+    using write = spyOn(Storage, "write").mockImplementation(async (key, data) => {
       if (data && typeof data === "object" && "status" in data && data.status === "complete") {
         throw Object.assign(new Error("disk full"), { code: "ENOSPC" })
       }
-      return original(key, data, options)
+      return original(key, data)
     })
     async function* source() {
       yield new Uint8Array([1])

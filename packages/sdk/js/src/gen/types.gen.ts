@@ -1024,6 +1024,8 @@ export type PerfConfig = {
     sqliteEnabled: boolean
     jsonlMirrorEnabled: boolean
     maxSqliteBytes: number
+    retentionBytes: number
+    retentionMs: number
     walCheckpointIntervalMs: number
   }
   thresholds: {
@@ -1060,6 +1062,8 @@ export type PerformanceConfigPatch = {
     sqliteEnabled: boolean
     jsonlMirrorEnabled: boolean
     maxSqliteBytes: number
+    retentionBytes: number
+    retentionMs: number
     walCheckpointIntervalMs: number
   }
   thresholds?: {
@@ -1109,6 +1113,45 @@ export type PerfBrowserMetricBatch = {
     duration: number
     attribution?: string
   }>
+}
+
+export type StorageUpgradeStatus = {
+  ready: true
+  historyReady: boolean
+  paused: boolean
+  pauseReason?: "user" | "foreground" | "disk" | "wal"
+  backup: {
+    complete: boolean
+    attention?: boolean
+    sealed: number
+    total: number
+  }
+  pending: number
+  partial: number
+  imported: number
+  quarantined: number
+  total: number
+}
+
+export type StorageUpgradeCatalog = {
+  items: Array<{
+    sessionID: string
+    scopeID: string
+    status: "pending" | "partial" | "imported" | "quarantined"
+  }>
+  next?: Array<string>
+}
+
+export type StorageSessionPreparation = {
+  sessionID: string
+  state: "ready" | "pending" | "preparing" | "blocked" | "failed"
+  phase?: "backup" | "import" | "migrate" | "verify" | "publish" | "complete"
+  files: number
+  bytes: number
+  error?: {
+    category: "retryable" | "integrity" | "data"
+    message: string
+  }
 }
 
 export type StorageSnapshotOwnerCounts = {
@@ -1705,6 +1748,34 @@ export type AgendaItem = {
   }
 }
 
+export type GlobalActivity = {
+  active: boolean
+  sessions: number
+  backgroundJobs: number
+}
+
+export type SessionRecoveringReason = "workflow" | "incomplete-turn" | "pending-reply"
+
+export type SessionStatus =
+  | {
+      type: "idle"
+    }
+  | {
+      type: "retry"
+      attempt: number
+      message: string
+      next: number
+    }
+  | {
+      type: "busy"
+      description?: string
+    }
+  | {
+      type: "recovering"
+      reason?: SessionRecoveringReason
+      description?: string
+    }
+
 export type SessionNavEntry = {
   id: string
   scopeID: string
@@ -1739,6 +1810,16 @@ export type SessionNavEntry = {
         externalProjectId: string
         externalTaskId: string
       }
+  blueprint?: {
+    loopID?: string
+    loopRole?: "execution" | "audit"
+    phase?: "running" | "waiting" | "auditing"
+  }
+  workspaceType?: string
+  workflow?: {
+    kind: string
+    active: boolean
+  }
   completionNotice: {
     unread: boolean
     unreadCount: number
@@ -2129,6 +2210,24 @@ export type ServerConfig = {
    * Additional origins allowed for CORS and Browser viewer WebSockets
    */
   cors?: Array<string>
+}
+
+/**
+ * Prompt attachment upload limits (count and byte sizes)
+ */
+export type AttachmentConfig = {
+  /**
+   * Maximum number of prompt attachments per batch (default: 20)
+   */
+  maxFiles?: number
+  /**
+   * Maximum prompt attachment size in bytes per file (default: 209715200 = 200 MiB)
+   */
+  maxFileBytes?: number
+  /**
+   * Maximum aggregate prompt attachment size in bytes per batch (default: 2147483648 = 2 GiB)
+   */
+  maxTotalBytes?: number
 }
 
 export type PermissionActionConfig = "ask" | "allow" | "deny"
@@ -2530,6 +2629,10 @@ export type ObservabilityConfig = {
    */
   enabled?: boolean
   /**
+   * Mirror debug/info records that opt in with `mirror: true` into indexed observability events
+   */
+  logMirror?: boolean
+  /**
    * Days to retain optional observability mirror files (default: 7)
    */
   retentionDays?: number
@@ -2614,7 +2717,18 @@ export type ObservabilityConfig = {
        * Enable optional JSONL mirror files for debugging exports
        */
       jsonlMirrorEnabled?: boolean
+      /**
+       * Maximum bytes for the local observability database (default: 250MB)
+       */
       maxSqliteBytes?: number
+      /**
+       * Maximum authoritative storage bytes before budgeted pruning may remove evidence older than the retention window (default: 40GB). A backstop above the window's steady state, not a target.
+       */
+      retentionBytes?: number
+      /**
+       * Retain authoritative evidence for this long before budgeted pruning may remove it (default: 7 days, bounds 1 hour to 90 days; set 0 to disable). Pruning only runs while the database exceeds retentionBytes.
+       */
+      retentionMs?: number
       walCheckpointIntervalMs?: number
     }
     thresholds?: {
@@ -3670,6 +3784,21 @@ export type SkillsConfig = {
   compatibility?: SkillsCompatibilityConfig
 }
 
+export type WorktreeConfig = {
+  /**
+   * Maximum number of managed git worktrees kept before the janitor reclaims the oldest idle ones
+   */
+  maxManaged?: number
+  /**
+   * Hours between managed-worktree janitor sweeps
+   */
+  sweepIntervalHours?: number
+  /**
+   * Run the managed-worktree janitor at all (default: true)
+   */
+  janitor?: boolean
+}
+
 /**
  * Speech-to-text service configuration
  */
@@ -4200,7 +4329,23 @@ export type Config = {
    */
   $schema?: string
   logLevel?: LogLevel
+  /**
+   * Global authoritative storage; backend changes require an explicit storage migration
+   */
+  storage?:
+    | {
+        backend: "sqlite"
+        namespace?: string
+        filename?: string
+      }
+    | {
+        backend: "postgres"
+        namespace: string
+        connectionEnv: string
+        maxConnections?: number
+      }
   server?: ServerConfig
+  attachment?: AttachmentConfig
   /**
    * Command configuration
    */
@@ -4283,11 +4428,11 @@ export type Config = {
      */
     lspIdleReap?: boolean
     /**
-     * Maximum number of isolated Agent workers (default: min(4, available CPUs - 1), at least 1)
+     * Maximum number of isolated Agent workers (default: derived from the effective memory limit, capped by available CPUs and 64, never below agentWorkerMinIdle). Pass null to clear the explicit ceiling and derive it from the machine.
      */
-    agentWorkers?: number
+    agentWorkers?: number | null
     /**
-     * Minimum number of idle Agent workers kept warm (default: 0; cannot exceed agentWorkers)
+     * Minimum number of idle Agent workers kept warm (default: 1 on resident servers, 0 for one-shot runs; cannot exceed agentWorkers)
      */
     agentWorkerMinIdle?: number
     /**
@@ -4406,42 +4551,42 @@ export type Config = {
    */
   enabled_providers?: Array<string>
   /**
-   * Default model in the format of provider/model, eg anthropic/claude-sonnet-4-5
+   * Default model in the format of provider/model, eg anthropic/claude-sonnet-4-5. null clears the role
    */
-  model?: string
+  model?: string | null
   /**
-   * Cheapest model for trivial extraction tasks like title generation, in the format of provider/model. Falls back to mini_model → mid_model → model.
+   * Cheapest model for trivial extraction tasks like title generation, in the format of provider/model. Falls back to mini_model → mid_model → model. null clears the role's model
    */
-  nano_model?: string
+  nano_model?: string | null
   /**
-   * Lightweight model for simple tasks like intent extraction, in the format of provider/model. Falls back to mid_model → model.
+   * Lightweight model for simple tasks like intent extraction, in the format of provider/model. Falls back to mid_model → model. null clears the role's model
    */
-  mini_model?: string
+  mini_model?: string | null
   /**
-   * Mid-tier model for internal agents that need moderate reasoning (script extraction, reward evaluation, code exploration), in the format of provider/model. Falls back to the default model.
+   * Mid-tier model for internal agents that need moderate reasoning (script extraction, reward evaluation, code exploration), in the format of provider/model. Falls back to the default model. null clears the role's model
    */
-  mid_model?: string
+  mid_model?: string | null
   /**
-   * Deep thinking model for complex reasoning and architecture tasks, in the format of provider/model. Falls back to the default model if not set.
+   * Deep thinking model for complex reasoning and architecture tasks, in the format of provider/model. Falls back to the default model if not set. null clears the role's model
    */
-  thinking_model?: string
+  thinking_model?: string | null
   /**
-   * Model with extra-large context window for processing very long inputs, in the format of provider/model. Falls back to the default model if not set.
+   * Model with extra-large context window for processing very long inputs, in the format of provider/model. Falls back to the default model if not set. null clears the role's model
    */
-  long_context_model?: string
+  long_context_model?: string | null
   /**
-   * Model for creative and visual tasks (UI design, writing, artistry), in the format of provider/model. Falls back to the default model if not set.
+   * Model for creative and visual tasks (UI design, writing, artistry), in the format of provider/model. Falls back to the default model if not set. null clears the role's model
    */
-  creative_model?: string
+  creative_model?: string | null
   /**
-   * Model for separate image analysis via the look_at tool, in the format of provider/model. If not set, look_at is disabled. Direct current-model image context uses view_image based on the active model capability.
+   * Model for separate image analysis via the look_at tool, in the format of provider/model. If not set, look_at is disabled. Direct current-model image context uses view_image based on the active model capability. null clears the role's model
    */
-  vision_model?: string
+  vision_model?: string | null
   /**
-   * Default variant (e.g. low, medium, high, xhigh) applied per model role. Requires the resolved model to support the named variant.
+   * Default variant (e.g. low, medium, high, xhigh) applied per model role. Requires the resolved model to support the named variant. A null value clears the role's variant
    */
   role_variant?: {
-    [key: string]: string
+    [key: string]: string | null
   }
   /**
    * Default agent to use when none is specified. Must be a primary agent. Falls back to 'synergy' if not set or if the specified agent is invalid.
@@ -4475,6 +4620,14 @@ export type Config = {
   sandbox?: SandboxConfig
   observability?: ObservabilityConfig
   controlProfile?: ControlProfileId
+  /**
+   * Control profile for sessions created by non-interactive sources (Channels and Agenda) that have no explicit profile of their own. Default: autonomous. Changes apply to sessions created after the change; an existing bound Channel session keeps the profile it was created with.
+   */
+  nonInteractiveControlProfile?: "autonomous" | "full_access"
+  /**
+   * Records that the human accepted the risk of running with Full Access. Set by the confirmation dialog when Full Access is enabled from the UI; it is an awareness record, not a security boundary.
+   */
+  fullAccessAcknowledged?: boolean
   /**
    * Additional instruction files or patterns to include
    */
@@ -4668,6 +4821,7 @@ export type Config = {
     lsp?: boolean
   }
   skills?: SkillsConfig
+  worktree?: WorktreeConfig
   voice?: VoiceConfig
   /**
    * UI locale (system = follow OS, default: system)
@@ -4731,25 +4885,6 @@ export type Command = {
   template?: string
   hints: Array<string>
 }
-
-export type SessionStatus =
-  | {
-      type: "idle"
-    }
-  | {
-      type: "retry"
-      attempt: number
-      message: string
-      next: number
-    }
-  | {
-      type: "busy"
-      description?: string
-    }
-  | {
-      type: "recovering"
-      description?: string
-    }
 
 export type SessionScope = {
   id: string
@@ -4899,6 +5034,8 @@ export type SessionWorkingInfo =
     }
   | {
       status: "recovering"
+      reason?: SessionRecoveringReason
+      description?: string
     }
 
 export type SessionWorkspace = {
@@ -5053,6 +5190,7 @@ export type Session = {
   blueprint?: {
     loopID?: string
     loopRole?: "execution" | "audit"
+    phase?: "running" | "waiting" | "auditing"
   }
 }
 
@@ -5322,6 +5460,7 @@ export type ConfigDomainSummary = {
     | "commands"
     | "permissions"
     | "runtime"
+    | "storage"
     | "plugins"
     | "channels"
     | "holos"
@@ -5330,6 +5469,7 @@ export type ConfigDomainSummary = {
     | "library"
     | "mcp"
     | "skills"
+    | "worktree"
     | "voice"
   filename: string
   label: string
@@ -5378,6 +5518,7 @@ export type ConfigExportResult = {
     | "commands"
     | "permissions"
     | "runtime"
+    | "storage"
     | "plugins"
     | "channels"
     | "holos"
@@ -5386,6 +5527,7 @@ export type ConfigExportResult = {
     | "library"
     | "mcp"
     | "skills"
+    | "worktree"
     | "voice"
   >
   warnings: Array<string>
@@ -5436,6 +5578,7 @@ export type ConfigDomainImportDomainPlan = {
     | "commands"
     | "permissions"
     | "runtime"
+    | "storage"
     | "plugins"
     | "channels"
     | "holos"
@@ -5444,6 +5587,7 @@ export type ConfigDomainImportDomainPlan = {
     | "library"
     | "mcp"
     | "skills"
+    | "worktree"
     | "voice"
   filename: string
   path: string
@@ -5489,6 +5633,7 @@ export type ConfigDomainImportPlanInput = {
     | "commands"
     | "permissions"
     | "runtime"
+    | "storage"
     | "plugins"
     | "channels"
     | "holos"
@@ -5497,6 +5642,7 @@ export type ConfigDomainImportPlanInput = {
     | "library"
     | "mcp"
     | "skills"
+    | "worktree"
     | "voice"
   >
   mode?: "merge" | "replace-domain" | "append"
@@ -5572,6 +5718,7 @@ export type ConfigImportRevisionConflictError = {
       | "commands"
       | "permissions"
       | "runtime"
+      | "storage"
       | "plugins"
       | "channels"
       | "holos"
@@ -5580,6 +5727,7 @@ export type ConfigImportRevisionConflictError = {
       | "library"
       | "mcp"
       | "skills"
+      | "worktree"
       | "voice"
     >
   }
@@ -5603,6 +5751,7 @@ export type ConfigDomainImportApplyInput = {
     | "commands"
     | "permissions"
     | "runtime"
+    | "storage"
     | "plugins"
     | "channels"
     | "holos"
@@ -5611,6 +5760,7 @@ export type ConfigDomainImportApplyInput = {
     | "library"
     | "mcp"
     | "skills"
+    | "worktree"
     | "voice"
   >
   mode?: "merge" | "replace-domain" | "append"
@@ -5621,7 +5771,61 @@ export type ConfigDomainImportApplyInput = {
   force?: boolean
 }
 
+export type SecretPolicy = {
+  tools?: Array<string>
+  maxResolvesPerSession?: number
+}
+
+export type SecretEntry = {
+  id: string
+  fingerprint: {
+    sha256: string
+    length: number
+  }
+  source: unknown
+  policy?: SecretPolicy
+  createdAt: number
+  updatedAt: number
+  lastResolvedAt?: number
+  resolvedCount: number
+}
+
+export type SecretCreateInput = {
+  value: string
+  policy?: SecretPolicy
+}
+
+export type SecretPolicyInput = {
+  policy: SecretPolicy
+}
+
+export type SecretRotateInput = {
+  value: string
+}
+
+export type SecretResolveAuditEntry = {
+  at: number
+  sessionID?: string
+  tool?: string
+  outcome: "resolved" | "denied_policy" | "denied_limit" | "removed"
+}
+
 export type RuntimeReloadScope = "auto" | "global" | "project"
+
+export type AgentWorkerCapacityStatus = {
+  /**
+   * Explicit execution.agentWorkers ceiling, or null when the machine derives it
+   */
+  configured: number | null
+  /**
+   * Capacity the Agent worker pool runs with
+   */
+  effective: number
+  /**
+   * Whether configuration or the machine sizes the pool
+   */
+  source: "explicit" | "derived"
+}
 
 export type ControlProfileSummary = {
   id: "guarded" | "autonomous" | "full_access"
@@ -5724,6 +5928,8 @@ export type Worktree = {
   lastUsedAt?: number
   setupFailed?: boolean
   setupError?: string
+  locked?: string
+  prunable?: boolean
 }
 
 export type WorktreeCreateInput = {
@@ -5845,42 +6051,42 @@ export type ExperimentOverrides = {
     coauthorReminder?: boolean
   }
   /**
-   * Default model in the format of provider/model, eg anthropic/claude-sonnet-4-5
+   * Default model in the format of provider/model, eg anthropic/claude-sonnet-4-5. null clears the role
    */
-  model?: string
+  model?: string | null
   /**
-   * Cheapest model for trivial extraction tasks like title generation, in the format of provider/model. Falls back to mini_model → mid_model → model.
+   * Cheapest model for trivial extraction tasks like title generation, in the format of provider/model. Falls back to mini_model → mid_model → model. null clears the role's model
    */
-  nano_model?: string
+  nano_model?: string | null
   /**
-   * Lightweight model for simple tasks like intent extraction, in the format of provider/model. Falls back to mid_model → model.
+   * Lightweight model for simple tasks like intent extraction, in the format of provider/model. Falls back to mid_model → model. null clears the role's model
    */
-  mini_model?: string
+  mini_model?: string | null
   /**
-   * Mid-tier model for internal agents that need moderate reasoning (script extraction, reward evaluation, code exploration), in the format of provider/model. Falls back to the default model.
+   * Mid-tier model for internal agents that need moderate reasoning (script extraction, reward evaluation, code exploration), in the format of provider/model. Falls back to the default model. null clears the role's model
    */
-  mid_model?: string
+  mid_model?: string | null
   /**
-   * Deep thinking model for complex reasoning and architecture tasks, in the format of provider/model. Falls back to the default model if not set.
+   * Deep thinking model for complex reasoning and architecture tasks, in the format of provider/model. Falls back to the default model if not set. null clears the role's model
    */
-  thinking_model?: string
+  thinking_model?: string | null
   /**
-   * Model with extra-large context window for processing very long inputs, in the format of provider/model. Falls back to the default model if not set.
+   * Model with extra-large context window for processing very long inputs, in the format of provider/model. Falls back to the default model if not set. null clears the role's model
    */
-  long_context_model?: string
+  long_context_model?: string | null
   /**
-   * Model for creative and visual tasks (UI design, writing, artistry), in the format of provider/model. Falls back to the default model if not set.
+   * Model for creative and visual tasks (UI design, writing, artistry), in the format of provider/model. Falls back to the default model if not set. null clears the role's model
    */
-  creative_model?: string
+  creative_model?: string | null
   /**
-   * Model for separate image analysis via the look_at tool, in the format of provider/model. If not set, look_at is disabled. Direct current-model image context uses view_image based on the active model capability.
+   * Model for separate image analysis via the look_at tool, in the format of provider/model. If not set, look_at is disabled. Direct current-model image context uses view_image based on the active model capability. null clears the role's model
    */
-  vision_model?: string
+  vision_model?: string | null
   /**
-   * Default variant (e.g. low, medium, high, xhigh) applied per model role. Requires the resolved model to support the named variant.
+   * Default variant (e.g. low, medium, high, xhigh) applied per model role. Requires the resolved model to support the named variant. A null value clears the role's variant
    */
   role_variant?: {
-    [key: string]: string
+    [key: string]: string | null
   }
   toolExposure?: {
     /**
@@ -5955,11 +6161,11 @@ export type ExperimentRuntime = {
      */
     lspIdleReap?: boolean
     /**
-     * Maximum number of isolated Agent workers (default: min(4, available CPUs - 1), at least 1)
+     * Maximum number of isolated Agent workers (default: derived from the effective memory limit, capped by available CPUs and 64, never below agentWorkerMinIdle). Pass null to clear the explicit ceiling and derive it from the machine.
      */
-    agentWorkers?: number
+    agentWorkers?: number | null
     /**
-     * Minimum number of idle Agent workers kept warm (default: 0; cannot exceed agentWorkers)
+     * Minimum number of idle Agent workers kept warm (default: 1 on resident servers, 0 for one-shot runs; cannot exceed agentWorkers)
      */
     agentWorkerMinIdle?: number
     /**
@@ -6546,6 +6752,25 @@ export type SessionForkPointMissingError = {
   }
 }
 
+export type SessionAbortResult = {
+  /**
+   * Runtime signal result; not_found/idle mean no running turn was stopped
+   */
+  outcome: "not_found" | "idle" | "signaled" | "already_stopping" | "not_owner"
+  /**
+   * An interrupted turn was terminalized
+   */
+  repaired: boolean
+  /**
+   * A driverless workflow was terminalized
+   */
+  abandoned: boolean
+  /**
+   * The session settled to idle
+   */
+  settled: boolean
+}
+
 export type AttachmentSourceText = {
   value: string
   start: number
@@ -6629,6 +6854,8 @@ export type SessionInboxItem = {
   id: string
   sessionID: string
   mode: "task" | "steer" | "context"
+  status?: "failed"
+  failReason?: string
   deliveryKey?: string
   message?: {
     role?: "user" | "assistant"
@@ -6759,6 +6986,15 @@ export type AttachmentPartInput = {
 
 export type SessionInboxFirstTaskLockedError = {
   name: "SessionInboxFirstTaskLockedError"
+  data: {
+    message: string
+    sessionID: string
+    itemID: string
+  }
+}
+
+export type SessionInboxItemFailedError = {
+  name: "SessionInboxItemFailedError"
   data: {
     message: string
     sessionID: string
@@ -10652,7 +10888,7 @@ export type GlobalStatsGetResponses = {
   /**
    * Stats snapshot
    */
-  200: StatsSnapshot
+  200: StatsSnapshot | null
 }
 
 export type GlobalStatsGetResponse = GlobalStatsGetResponses[keyof GlobalStatsGetResponses]
@@ -11343,6 +11579,168 @@ export type PerformanceEventsStreamResponses = {
   200: unknown
 }
 
+export type StorageUpgradeStatusData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/storage/upgrade"
+}
+
+export type StorageUpgradeStatusErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type StorageUpgradeStatusError = StorageUpgradeStatusErrors[keyof StorageUpgradeStatusErrors]
+
+export type StorageUpgradeStatusResponses = {
+  /**
+   * Historical upgrade counts
+   */
+  200: StorageUpgradeStatus
+}
+
+export type StorageUpgradeStatusResponse = StorageUpgradeStatusResponses[keyof StorageUpgradeStatusResponses]
+
+export type StorageUpgradeCatalogData = {
+  body?: never
+  path?: never
+  query?: {
+    scopeID?: string
+    after?: [string, string, string, string]
+    limit?: number
+  }
+  url: "/global/storage/upgrade/sessions"
+}
+
+export type StorageUpgradeCatalogErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type StorageUpgradeCatalogError = StorageUpgradeCatalogErrors[keyof StorageUpgradeCatalogErrors]
+
+export type StorageUpgradeCatalogResponses = {
+  /**
+   * One page from the immutable upgrade cohort
+   */
+  200: StorageUpgradeCatalog
+}
+
+export type StorageUpgradeCatalogResponse = StorageUpgradeCatalogResponses[keyof StorageUpgradeCatalogResponses]
+
+export type StorageControlUpgradeData = {
+  body?: {
+    action: "pause" | "resume"
+  }
+  path?: never
+  query?: never
+  url: "/global/storage/upgrade/control"
+}
+
+export type StorageControlUpgradeErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type StorageControlUpgradeError = StorageControlUpgradeErrors[keyof StorageControlUpgradeErrors]
+
+export type StorageControlUpgradeResponses = {
+  /**
+   * Updated preparation status
+   */
+  200: StorageUpgradeStatus
+}
+
+export type StorageControlUpgradeResponse = StorageControlUpgradeResponses[keyof StorageControlUpgradeResponses]
+
+export type StorageUpgradeSessionData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/global/storage/upgrade/sessions/{sessionID}"
+}
+
+export type StorageUpgradeSessionErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type StorageUpgradeSessionError = StorageUpgradeSessionErrors[keyof StorageUpgradeSessionErrors]
+
+export type StorageUpgradeSessionResponses = {
+  /**
+   * Preparation status without starting work
+   */
+  200: StorageSessionPreparation
+}
+
+export type StorageUpgradeSessionResponse = StorageUpgradeSessionResponses[keyof StorageUpgradeSessionResponses]
+
+export type StoragePrepareSessionData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/global/storage/upgrade/sessions/{sessionID}/prepare"
+}
+
+export type StoragePrepareSessionErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type StoragePrepareSessionError = StoragePrepareSessionErrors[keyof StoragePrepareSessionErrors]
+
+export type StoragePrepareSessionResponses = {
+  /**
+   * Current preparation status
+   */
+  200: StorageSessionPreparation
+}
+
+export type StoragePrepareSessionResponse = StoragePrepareSessionResponses[keyof StoragePrepareSessionResponses]
+
+export type StorageRetrySessionData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/global/storage/upgrade/sessions/{sessionID}/retry"
+}
+
+export type StorageRetrySessionErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type StorageRetrySessionError = StorageRetrySessionErrors[keyof StorageRetrySessionErrors]
+
+export type StorageRetrySessionResponses = {
+  /**
+   * Current preparation status
+   */
+  200: StorageSessionPreparation
+}
+
+export type StorageRetrySessionResponse = StorageRetrySessionResponses[keyof StorageRetrySessionResponses]
+
 export type StorageSnapshotUsageData = {
   body?: never
   path?: never
@@ -12008,6 +12406,31 @@ export type GlobalAgendaListResponses = {
 
 export type GlobalAgendaListResponse = GlobalAgendaListResponses[keyof GlobalAgendaListResponses]
 
+export type GlobalActivityData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/activity"
+}
+
+export type GlobalActivityErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type GlobalActivityError = GlobalActivityErrors[keyof GlobalActivityErrors]
+
+export type GlobalActivityResponses = {
+  /**
+   * Global activity snapshot
+   */
+  200: GlobalActivity
+}
+
+export type GlobalActivityResponse = GlobalActivityResponses[keyof GlobalActivityResponses]
+
 export type GlobalSessionSearchData = {
   body?: never
   path?: never
@@ -12103,6 +12526,33 @@ export type GlobalSessionSearchResponses = {
 }
 
 export type GlobalSessionSearchResponse = GlobalSessionSearchResponses[keyof GlobalSessionSearchResponses]
+
+export type GlobalSessionStatusesData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/session/status"
+}
+
+export type GlobalSessionStatusesErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type GlobalSessionStatusesError = GlobalSessionStatusesErrors[keyof GlobalSessionStatusesErrors]
+
+export type GlobalSessionStatusesResponses = {
+  /**
+   * Cross-scope session status map
+   */
+  200: {
+    [key: string]: SessionStatus
+  }
+}
+
+export type GlobalSessionStatusesResponse = GlobalSessionStatusesResponses[keyof GlobalSessionStatusesResponses]
 
 export type GlobalNavRecentData = {
   body?: never
@@ -12892,6 +13342,7 @@ export type ConfigDomainGetData = {
       | "commands"
       | "permissions"
       | "runtime"
+      | "storage"
       | "plugins"
       | "channels"
       | "holos"
@@ -12900,6 +13351,7 @@ export type ConfigDomainGetData = {
       | "library"
       | "mcp"
       | "skills"
+      | "worktree"
       | "voice"
   }
   query?: {
@@ -12942,6 +13394,7 @@ export type ConfigDomainUpdateData = {
       | "commands"
       | "permissions"
       | "runtime"
+      | "storage"
       | "plugins"
       | "channels"
       | "holos"
@@ -12950,6 +13403,7 @@ export type ConfigDomainUpdateData = {
       | "library"
       | "mcp"
       | "skills"
+      | "worktree"
       | "voice"
   }
   query?: {
@@ -12992,6 +13446,7 @@ export type ConfigDomainOpenData = {
       | "commands"
       | "permissions"
       | "runtime"
+      | "storage"
       | "plugins"
       | "channels"
       | "holos"
@@ -13000,6 +13455,7 @@ export type ConfigDomainOpenData = {
       | "library"
       | "mcp"
       | "skills"
+      | "worktree"
       | "voice"
   }
   query?: {
@@ -13050,6 +13506,7 @@ export type ConfigExportData = {
       | "commands"
       | "permissions"
       | "runtime"
+      | "storage"
       | "plugins"
       | "channels"
       | "holos"
@@ -13058,6 +13515,7 @@ export type ConfigExportData = {
       | "library"
       | "mcp"
       | "skills"
+      | "worktree"
       | "voice"
       | Array<
           | "general"
@@ -13067,6 +13525,7 @@ export type ConfigExportData = {
           | "commands"
           | "permissions"
           | "runtime"
+          | "storage"
           | "plugins"
           | "channels"
           | "holos"
@@ -13075,6 +13534,7 @@ export type ConfigExportData = {
           | "library"
           | "mcp"
           | "skills"
+          | "worktree"
           | "voice"
         >
     includeSecrets?: string
@@ -13213,6 +13673,218 @@ export type ConfigProvidersResponses = {
 
 export type ConfigProvidersResponse = ConfigProvidersResponses[keyof ConfigProvidersResponses]
 
+export type SecretsListData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    scopeID?: string
+  }
+  url: "/secrets"
+}
+
+export type SecretsListErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type SecretsListError = SecretsListErrors[keyof SecretsListErrors]
+
+export type SecretsListResponses = {
+  /**
+   * Secret entries without values
+   */
+  200: Array<SecretEntry>
+}
+
+export type SecretsListResponse = SecretsListResponses[keyof SecretsListResponses]
+
+export type SecretsCreateData = {
+  body?: SecretCreateInput
+  path?: never
+  query?: {
+    directory?: string
+    scopeID?: string
+  }
+  url: "/secrets"
+}
+
+export type SecretsCreateErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * Conflict
+   */
+  409: {
+    name: string
+    data: unknown
+  }
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type SecretsCreateError = SecretsCreateErrors[keyof SecretsCreateErrors]
+
+export type SecretsCreateResponses = {
+  /**
+   * The registered entry without its value
+   */
+  200: SecretEntry
+}
+
+export type SecretsCreateResponse = SecretsCreateResponses[keyof SecretsCreateResponses]
+
+export type SecretsRemoveData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    scopeID?: string
+  }
+  url: "/secrets/{id}"
+}
+
+export type SecretsRemoveErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type SecretsRemoveError = SecretsRemoveErrors[keyof SecretsRemoveErrors]
+
+export type SecretsRemoveResponses = {
+  /**
+   * Whether an entry was removed
+   */
+  200: {
+    removed: boolean
+  }
+}
+
+export type SecretsRemoveResponse = SecretsRemoveResponses[keyof SecretsRemoveResponses]
+
+export type SecretsUpdatePolicyData = {
+  body?: SecretPolicyInput
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    scopeID?: string
+  }
+  url: "/secrets/{id}"
+}
+
+export type SecretsUpdatePolicyErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * Not found
+   */
+  404: NotFoundError
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type SecretsUpdatePolicyError = SecretsUpdatePolicyErrors[keyof SecretsUpdatePolicyErrors]
+
+export type SecretsUpdatePolicyResponses = {
+  /**
+   * The updated entry without its value
+   */
+  200: SecretEntry
+}
+
+export type SecretsUpdatePolicyResponse = SecretsUpdatePolicyResponses[keyof SecretsUpdatePolicyResponses]
+
+export type SecretsRotateData = {
+  body?: SecretRotateInput
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    scopeID?: string
+  }
+  url: "/secrets/{id}/rotate"
+}
+
+export type SecretsRotateErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * Not found
+   */
+  404: NotFoundError
+  /**
+   * Conflict
+   */
+  409: {
+    name: string
+    data: unknown
+  }
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type SecretsRotateError = SecretsRotateErrors[keyof SecretsRotateErrors]
+
+export type SecretsRotateResponses = {
+  /**
+   * The rotated entry without its value
+   */
+  200: SecretEntry
+}
+
+export type SecretsRotateResponse = SecretsRotateResponses[keyof SecretsRotateResponses]
+
+export type SecretsHistoryData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    scopeID?: string
+  }
+  url: "/secrets/{id}/history"
+}
+
+export type SecretsHistoryErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type SecretsHistoryError = SecretsHistoryErrors[keyof SecretsHistoryErrors]
+
+export type SecretsHistoryResponses = {
+  /**
+   * Resolve audit entries
+   */
+  200: Array<SecretResolveAuditEntry>
+}
+
+export type SecretsHistoryResponse = SecretsHistoryResponses[keyof SecretsHistoryResponses]
+
 export type RuntimeReloadData = {
   body?: {
     targets: Array<RuntimeReloadTarget>
@@ -13249,6 +13921,34 @@ export type RuntimeReloadResponses = {
 }
 
 export type RuntimeReloadResponse = RuntimeReloadResponses[keyof RuntimeReloadResponses]
+
+export type RuntimeAgentWorkersData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    scopeID?: string
+  }
+  url: "/runtime/agent-workers"
+}
+
+export type RuntimeAgentWorkersErrors = {
+  /**
+   * Runtime shutting down
+   */
+  503: RuntimeShuttingDownError
+}
+
+export type RuntimeAgentWorkersError = RuntimeAgentWorkersErrors[keyof RuntimeAgentWorkersErrors]
+
+export type RuntimeAgentWorkersResponses = {
+  /**
+   * Agent worker capacity status
+   */
+  200: AgentWorkerCapacityStatus
+}
+
+export type RuntimeAgentWorkersResponse = RuntimeAgentWorkersResponses[keyof RuntimeAgentWorkersResponses]
 
 export type ControlProfileListData = {
   body?: never
@@ -14417,9 +15117,9 @@ export type SessionAbortError = SessionAbortErrors[keyof SessionAbortErrors]
 
 export type SessionAbortResponses = {
   /**
-   * Aborted session
+   * Abort result
    */
-  200: boolean
+  200: SessionAbortResult
 }
 
 export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]
@@ -14612,9 +15312,9 @@ export type SessionInboxGuideErrors = {
    */
   404: NotFoundError
   /**
-   * First task is locked until its root is ready
+   * First task is locked until its root is ready, or the item is parked as failed
    */
-  409: SessionInboxFirstTaskLockedError
+  409: SessionInboxFirstTaskLockedError | SessionInboxItemFailedError
   /**
    * Runtime shutting down
    */
@@ -15541,6 +16241,10 @@ export type PermissionListData = {
   query?: {
     directory?: string
     scopeID?: string
+    /**
+     * Only return pending permission requests owned by this session
+     */
+    sessionID?: string
   }
   url: "/permission"
 }
@@ -22257,6 +22961,7 @@ export type McpBuiltinsResponses = {
     url: string
     status: McpStatus
     keyConfigured: boolean
+    keyHint?: string
   }>
 }
 

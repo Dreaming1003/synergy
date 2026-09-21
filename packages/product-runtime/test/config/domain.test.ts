@@ -22,6 +22,7 @@ test("config domain filenames are stable and ordered", () => {
     "40-mcp.jsonc",
     "50-plugins.jsonc",
     "55-skills.jsonc",
+    "57-worktree.jsonc",
     "60-agents.jsonc",
     "70-commands.jsonc",
     "80-permissions.jsonc",
@@ -31,6 +32,7 @@ test("config domain filenames are stable and ordered", () => {
     "115-github.jsonc",
     "120-runtime.jsonc",
     "125-voice.jsonc",
+    "130-storage.jsonc",
   ])
 })
 

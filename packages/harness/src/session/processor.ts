@@ -12,7 +12,8 @@ import { Bus } from "../bus"
 import { SessionRetry } from "./retry"
 import { SessionManager } from "./manager"
 import { SessionPluginHooks as Plugin } from "./plugin-hooks"
-import type { Provider } from "../provider/provider"
+import { providerEndpointHost } from "../provider/retry-coordinator"
+import { Provider } from "../provider/provider"
 import { LLM } from "./llm"
 import { Config } from "../config/config"
 import { TimeoutConfig } from "../util/timeout-config"
@@ -38,6 +39,7 @@ import type { Tool as AITool } from "ai"
 import { AgentTurn } from "./agent-turn"
 import { ToolScheduler } from "./tool-scheduler"
 import type { ToolResolver } from "./tool-resolver"
+import { SecretMask } from "../secrets/mask"
 
 export namespace SessionProcessor {
   const DOOM_LOOP_THRESHOLD = 3
@@ -617,12 +619,18 @@ export namespace SessionProcessor {
       if (!state) return
       pendingToolCallStates.delete(callID)
 
+      const presentation = {
+        title: state.title ?? match.state.title,
+        metadata: structuredClone(
+          ToolTimeout.mergeMetadata(match.state.metadata, state.metadata) ?? match.state.metadata,
+        ),
+      }
+      await SecretMask.transformResult(presentation)
       const updated = await Session.updatePart({
         ...match,
         state: {
           ...match.state,
-          title: state.title ?? match.state.title,
-          metadata: ToolTimeout.mergeMetadata(match.state.metadata, state.metadata) ?? match.state.metadata,
+          ...presentation,
           status: "running",
           input: state.input,
           time: {
@@ -987,9 +995,15 @@ export namespace SessionProcessor {
           agent: input.assistantMessage.agent,
         })
         const shouldBreak = (await Config.current()).execution?.continueOnDeny !== true
+        const retainedPartIDs = new Set(
+          (await MessageV2.parts({ sessionID: input.sessionID, messageID: input.assistantMessage.id })).map(
+            (part) => part.id,
+          ),
+        )
         try {
           while (true) {
             let streamAborted = false
+            let retryEligible = false
             let contextUsageEnrichment:
               | {
                   draft: Promise<ContextUsage.Draft | undefined>
@@ -998,6 +1012,27 @@ export namespace SessionProcessor {
               | undefined
             try {
               input.abort.throwIfAborted()
+              if (attempt > 0) {
+                await waitForTrackedSettlements()
+                await Promise.all(toolCallStateUpdates.values())
+                await Session.flushPartWrites(input.sessionID)
+                const parts = await MessageV2.parts({
+                  sessionID: input.sessionID,
+                  messageID: input.assistantMessage.id,
+                })
+                for (const part of parts) {
+                  if (retainedPartIDs.has(part.id) || part.type === "patch" || part.type === "step-finish") continue
+                  await Session.removePart({
+                    sessionID: input.sessionID,
+                    messageID: input.assistantMessage.id,
+                    partID: part.id,
+                  })
+                }
+                dispose("retry")
+                blocked = false
+                input.assistantMessage.finish = undefined
+                await Session.updateMessage(input.assistantMessage)
+              }
               let currentText: MessageV2.TextPart | undefined
               let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
               const deferredToolCalls: Array<{
@@ -1018,6 +1053,7 @@ export namespace SessionProcessor {
                 resolverInput: _resolverInput,
                 ...agentTurnInput
               } = streamInput
+              retryEligible = true
               const stream = await AgentTurn.stream(agentTurnInput)
               const rollout = stream.rollout
               const stepFinishes: MessageV2.StepFinishPart[] = []
@@ -1510,10 +1546,17 @@ export namespace SessionProcessor {
                       input.assistantMessage.finish = value.finishReason
                       input.assistantMessage.cost += usage.cost
                       input.assistantMessage.tokens = usage.tokens
-                      if (hasProviderInputUsage(value.usage) && stream.contextUsageDraft) {
+                      const exactProviderInputTotal = rollout
+                        ? stepAccounting?.tokens.input.total
+                        : ModelLimit.actualInput(usage.tokens)
+                      if (
+                        hasProviderInputUsage(value.usage) &&
+                        stream.contextUsageDraft &&
+                        exactProviderInputTotal != null
+                      ) {
                         contextUsageEnrichment = {
                           draft: stream.contextUsageDraft,
-                          totalInput: ModelLimit.actualInput(usage.tokens),
+                          totalInput: exactProviderInputTotal,
                         }
                       }
                       const step = await Session.updatePart({
@@ -1629,6 +1672,7 @@ export namespace SessionProcessor {
                       break
                   }
                 }
+                retryEligible = false
                 ObservabilitySpans.end(llmSpan, {
                   attributes: { provider: input.model.providerID, model: input.model.id },
                 })
@@ -1766,9 +1810,18 @@ export namespace SessionProcessor {
               log.error("process", {
                 error: e,
               })
-              const error = MessageV2.fromError(e, { providerID: input.model.providerID, modelID: input.model.id })
-              const retry = fastAbort ? undefined : SessionRetry.retryable(error)
-              if (retry !== undefined && attempt < SessionRetry.RETRY_MAX_ATTEMPTS) {
+              // Derive the endpoint host from the same connection identity
+              // source as providerRetryKey: provider-level options (e.g. a
+              // proxy baseURL) must merge over the model record, or a proxied
+              // provider reports the catalog URL instead of the real host.
+              const providerRecord = await Provider.getProvider(input.model.providerID).catch(() => undefined)
+              const error = MessageV2.fromError(e, {
+                providerID: input.model.providerID,
+                modelID: input.model.id,
+                endpointHost: providerEndpointHost(input.model, providerRecord),
+              })
+              const retry = fastAbort || !retryEligible ? undefined : SessionRetry.retryable(error)
+              if (retry !== undefined && attempt < retry.maxAttempts) {
                 attempt++
                 const delay = SessionRetry.delay(attempt, error.name === "APIError" ? error : undefined)
                 ObservabilityMetrics.record({
@@ -1778,7 +1831,7 @@ export namespace SessionProcessor {
                   module: "session",
                   sessionID: input.sessionID,
                   messageID: input.assistantMessage.id,
-                  labels: { attempt, retry, errorName: error.name },
+                  labels: { attempt, retry: retry.message, errorName: error.name },
                 })
                 await Observability.emit("session.turn.retry", {
                   traceId: turnTraceId,
@@ -1788,14 +1841,14 @@ export namespace SessionProcessor {
                   data: {
                     attempt,
                     delay,
-                    retry,
+                    retry: retry.message,
                     error,
                   },
                 })
                 SessionManager.setStatus(input.sessionID, {
                   type: "retry",
                   attempt,
-                  message: retry,
+                  message: retry.message,
                   next: Date.now() + delay,
                 })
                 await SessionRetry.sleep(delay, input.abort).catch(() => {})

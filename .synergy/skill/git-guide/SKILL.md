@@ -94,7 +94,8 @@ Project-relative source paths such as `packages/runtime-local/src/tools/read.ts`
 3. Open the pull request against `dev`.
 4. Use project-relative paths and redacted evidence in the PR body.
 5. State the summary and exact test commands. Do not claim checks that were not run.
-6. Use a reviewed Note as the file input when outbound content requires user editing:
+6. When the change implements a BlueprintLoop, state that loop's final status and audit conclusion in the body. An executor's own "done" is not an audit result: the loop counts as accepted only once `blueprint_loop_approve` settled it, and a loop left in `auditing`, failed, or rejected without a fresh audit is reported as unaccepted rather than described as complete.
+7. Use a reviewed Note as the file input when outbound content requires user editing:
 
 ```bash
 git commit -F /synergy/note/<note-id>
@@ -104,27 +105,31 @@ gh issue comment <number> --body-file /synergy/note/<note-id>
 
 Do not interpolate Note contents into a shell command or pass them to an option that executes the file as code.
 
+A required check can also fail for reasons that belong to the runner rather than the change: the local artifact build needs `docker`, and a hosted job can fail before it compiles anything. Distinguish the two before treating a red gate as evidence about the code, but do not merge past it either — re-run until green. A check that cannot be made green is a blocker to report to the user, not a condition to waive.
+
 The `autonomous` profile permits ordinary topic-branch and pull-request publication from either the primary checkout or a worktree. Protected-branch pushes and broader remote mutations remain `shell_remote_write` and are denied. This capability boundary does not replace the user's authorization to publish.
 
 ## GitHub CLI Permission Matrix
 
 The permission system classifies `gh` commands before applying the active control profile. The table shows the base profile decision before user rules, approval cache, SmartAllow, GitHub authorization, or ordinary runtime failures.
 
-| Command                              | Capability             | Guarded  | Autonomous | Full Access |
-| ------------------------------------ | ---------------------- | -------- | ---------- | ----------- |
-| `gh pr view/list/status/checks/diff` | `shell_read`           | ✅ allow | ✅ allow   | ✅ allow    |
-| `gh pr create`                       | `shell_remote_publish` | ⚠️ ask   | ✅ allow   | ✅ allow    |
-| `gh pr comment` / `gh pr review`     | `shell_remote_publish` | ⚠️ ask   | ✅ allow   | ✅ allow    |
-| `gh pr edit` / `gh pr ready`         | `shell_remote_write`   | ⚠️ ask   | ❌ deny    | ✅ allow    |
-| `gh issue view/list/status`          | `shell_read`           | ✅ allow | ✅ allow   | ✅ allow    |
-| `gh issue create/comment`            | `shell_remote_publish` | ⚠️ ask   | ✅ allow   | ✅ allow    |
-| `gh issue edit/close/reopen`         | `shell_remote_write`   | ⚠️ ask   | ❌ deny    | ✅ allow    |
-| `gh pr merge/close/reopen`           | `shell_destructive`    | ⚠️ ask   | ❌ deny    | ✅ allow    |
-| `gh api <endpoint>` (GET, no fields) | `shell_read`           | ✅ allow | ✅ allow   | ✅ allow    |
-| `gh api -X GET` / `-X HEAD`          | `shell_read`           | ✅ allow | ✅ allow   | ✅ allow    |
-| `gh api -f/-F/--input` (auto-POST)   | `shell_remote_write`   | ⚠️ ask   | ❌ deny    | ✅ allow    |
-| `gh api -X POST/PATCH/PUT/DELETE`    | `shell_remote_write`   | ⚠️ ask   | ❌ deny    | ✅ allow    |
-| `gh api graphql` (mutation possible) | `shell_remote_write`   | ⚠️ ask   | ❌ deny    | ✅ allow    |
+| Command                              | Capability             | Guarded | Autonomous | Full Access |
+| ------------------------------------ | ---------------------- | ------- | ---------- | ----------- |
+| `gh pr view/list/status/checks/diff` | `shell`                | ⚠️ ask  | ✅ allow   | ✅ allow    |
+| `gh pr create`                       | `shell_remote_publish` | ⚠️ ask  | ✅ allow   | ✅ allow    |
+| `gh pr comment` / `gh pr review`     | `shell_remote_publish` | ⚠️ ask  | ✅ allow   | ✅ allow    |
+| `gh pr edit` / `gh pr ready`         | `shell_remote_write`   | ⚠️ ask  | ❌ deny    | ✅ allow    |
+| `gh issue view/list/status`          | `shell`                | ⚠️ ask  | ✅ allow   | ✅ allow    |
+| `gh issue create/comment`            | `shell_remote_publish` | ⚠️ ask  | ✅ allow   | ✅ allow    |
+| `gh issue edit/close/reopen`         | `shell_remote_write`   | ⚠️ ask  | ❌ deny    | ✅ allow    |
+| `gh pr merge/close/reopen`           | `shell_destructive`    | ⚠️ ask  | ❌ deny    | ✅ allow    |
+| `gh api <endpoint>` (GET, no fields) | `shell`                | ⚠️ ask  | ✅ allow   | ✅ allow    |
+| `gh api -X GET` / `-X HEAD`          | `shell`                | ⚠️ ask  | ✅ allow   | ✅ allow    |
+| `gh api -f/-F/--input` (auto-POST)   | `shell_remote_write`   | ⚠️ ask  | ❌ deny    | ✅ allow    |
+| `gh api -X POST/PATCH/PUT/DELETE`    | `shell_remote_write`   | ⚠️ ask  | ❌ deny    | ✅ allow    |
+| `gh api graphql` (mutation possible) | `shell_remote_write`   | ⚠️ ask  | ❌ deny    | ✅ allow    |
+
+Read-only `gh` commands sit at the `shell` risk floor rather than a read-only tier: there is no `shell_read` capability, because a shell command string carries no precise input for the gate to reason about. Every `gh` command also carries `network_request`. Under `guarded`, `network_request` alone is allowed but `shell` is a medium capability outside the allowed set, so the combination asks; `autonomous` allows both. Use the table as the base profile decision — it is not the resolved one.
 
 Checkout type does not change ordinary `shell_remote_publish` into `shell_remote_write`. Unknown write-capable `gh` subcommands default to `shell_remote_write`. Full Access silently allows permission-system capabilities but does not override task authorization, protected-branch rules, GitHub permissions, validation failures, or network/runtime errors.
 
@@ -140,14 +145,15 @@ Behavior:
   including mixed, chained, and piped commands (`echo ok; gh api user`, `gh repo view owner/repo | head`).
 - The injected `GH_TOKEN` is inherited by every process in the invocation —
   any command can read it via `$GH_TOKEN`. An explicit `GH_TOKEN=...` prefix assignment or `export GH_TOKEN=...` earlier in the command takes precedence; use `env -u GH_TOKEN <cmd>` to clear it for a single command. An explicit `GITHUB_TOKEN=...` does not override the injected `GH_TOKEN`, because gh prefers `GH_TOKEN`.
-- When no Synergy GitHub credential is connected, the invocation runs without
-  injection and the bash tool appends a `[GitHub CLI token skipped: ...]` notice to the output.
+- When no Synergy GitHub credential is connected, the invocation runs without injection or an output notice. The CLI can use its own stored login; the macOS sandbox permits the native Keychain service lookup described in [Execution boundaries](../../../docs/architecture/execution-boundaries.md#sandbox-enforcement).
 - If a credential is injected, telemetry emits `bash.github.token.injected`;
   if injection is skipped, `bash.github.token.skipped` records the reason.
 
+For a host login that fails only inside the macOS sandbox, inspect injection metadata and correlate the reproduction with kernel `mach-lookup` denials for `com.apple.SecurityServer`, including the CLI's credential-helper subprocess. The Bash denial collector filters out Mach lookups and selects the direct child PID, so an empty collected denial is not evidence that native auth succeeded. Keep credential output discarded; use [Find logs](../find-logs/SKILL.md) for isolated reproduction and redacted evidence.
+
 ## Maintain Repository Automation
 
-Oryn configuration and labels follow [the operations guide](../../../docs/operations/oryn.md). Keep executable workflow/policy and validation selection on a trusted revision, use separate read/publication App tokens, and keep model credentials out of validation. Update the immutable runtime pin, label catalog and validation graph together when their contracts change. Verify `bun test --config /dev/null test/script/oryn-validation.test.ts` and `bun run workflow:check`, then perform a manual preflight and selected live review. A successful preflight does not establish model or publication success.
+Oryn configuration and labels follow [the operations guide](../../../docs/operations/oryn.md). Keep executable workflow/policy and validation selection on a trusted revision, use separate read/publication App tokens, and keep model credentials out of validation. Update the immutable runtime pin, label catalog and validation graph together when their contracts change. Verify `bun test --config /dev/null test/script/oryn-validation.test.ts` and `bun run workflow:check`, then perform a manual preflight and selected live review. A successful preflight does not establish model or publication success. Bind each item publisher to the producing upload artifact ID and verify full-run, execution-only and publication-only retry behavior. After a runtime receipt-contract upgrade, start a fresh workflow; historical reruns retain their original runtime and plan. For report submission changes, run the Oryn real Core report smoke alongside existing provider/failure smokes before updating the pin.
 
 ## Rebase or Recover
 

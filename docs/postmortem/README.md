@@ -48,6 +48,20 @@ Entries are added only when an incident qualifies; the table stays empty until t
 | 0009 | Local benchmark cancellation lost export evidence | implemented | 2026-09-10 |
 | 0010 | Global event subscription loss left the UI connected but stale | implemented | 2026-09-12 |
 | 0011 | Watcher static C++ runtime crashed subsequent ONNX loading | implemented | 2026-09-12 |
+| 0012 | Preparation deadline truncated native benchmark execution | implemented | 2026-09-14 |
+| 0013 | Short native probes missed OpenCode runtime stalls under Rosetta | mitigated | 2026-09-14 |
+| 0014 | Benchmark recopied instructions into their existing bind mount | implemented | 2026-09-14 |
+
+| 0015 | Streaming checkpoint ordering and repair | implemented | 2026-09-18 |
+
+| 0016 | Interactive reads scanned historical state | implemented | 2026-09-18 |
+
+| 0017 | Unmapped certificate failure terminated a long child task | implemented | 2026-09-19 |
+| 0018 | Host suspend pinned a session in recovering | implemented | 2026-09-19 |
+
+| 0019 | Retention maintenance stalled the live writer | implemented | 2026-09-19 |
+
+| 0020 | Managed startup maintenance outgrew Desktop progress | implemented | 2026-09-20 |
 
 ## History rules
 

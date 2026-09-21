@@ -110,7 +110,7 @@ function installBasicLoopMocks(options?: {
   const originalGetModel = Provider.getModel
   const originalGetAgent = Agent.get
   const originalConfigCurrent = Config.current
-  const originalDefinitions = ToolResolver.definitions
+  const originalAvailability = ToolResolver.availability
   const originalResolveWithAvailability = ToolResolver.resolveWithAvailability
   const originalBuildPlan = PromptBudgeter.buildPlan
   const originalDecide = PromptBudgeter.decide
@@ -150,7 +150,11 @@ function installBasicLoopMocks(options?: {
     library: { memory: { enabled: false }, experience: { retrieve: false } },
     ...options?.config,
   }))
-  ;(ToolResolver.definitions as any) = mock(async () => options?.toolDefinitions ?? [])
+  ;(ToolResolver.availability as any) = mock(async () => ({
+    visible: options?.toolDefinitions ?? [],
+    diagnostics: new Map(),
+    autoExpandable: new Set(),
+  }))
   ;(ToolResolver.resolveWithAvailability as any) = mock(async () => ({
     definitions: [],
     executionTools: {},
@@ -199,7 +203,7 @@ function installBasicLoopMocks(options?: {
     ;(Provider.getModel as any) = originalGetModel
     ;(Agent.get as any) = originalGetAgent
     ;(Config.current as any) = originalConfigCurrent
-    ;(ToolResolver.definitions as any) = originalDefinitions
+    ;(ToolResolver.availability as any) = originalAvailability
     ;(ToolResolver.resolveWithAvailability as any) = originalResolveWithAvailability
     ;(PromptBudgeter.buildPlan as any) = originalBuildPlan
     ;(PromptBudgeter.decide as any) = originalDecide
@@ -639,7 +643,7 @@ describe("SessionInvoke system prompt assembly", () => {
     const originalGetModel = Provider.getModel
     const originalGetAgent = Agent.get
     const originalConfigCurrent = Config.current
-    const originalDefinitions = ToolResolver.definitions
+    const originalAvailability = ToolResolver.availability
     const originalResolveWithAvailability = ToolResolver.resolveWithAvailability
     const originalBuildPlan = PromptBudgeter.buildPlan
     const originalDecide = PromptBudgeter.decide
@@ -680,7 +684,11 @@ describe("SessionInvoke system prompt assembly", () => {
         compaction: { auto: true, maxHistoryImages: 8 },
         library: { memory: { enabled: false }, experience: { retrieve: false } },
       }))
-      ;(ToolResolver.definitions as any) = mock(async () => [])
+      ;(ToolResolver.availability as any) = mock(async () => ({
+        visible: [],
+        diagnostics: new Map(),
+        autoExpandable: new Set(),
+      }))
       ;(ToolResolver.resolveWithAvailability as any) = mock(async () => ({
         definitions: [],
         executionTools: {},
@@ -761,7 +769,7 @@ describe("SessionInvoke system prompt assembly", () => {
       ;(Provider.getModel as any) = originalGetModel
       ;(Agent.get as any) = originalGetAgent
       ;(Config.current as any) = originalConfigCurrent
-      ;(ToolResolver.definitions as any) = originalDefinitions
+      ;(ToolResolver.availability as any) = originalAvailability
       ;(ToolResolver.resolveWithAvailability as any) = originalResolveWithAvailability
       ;(PromptBudgeter.buildPlan as any) = originalBuildPlan
       ;(PromptBudgeter.decide as any) = originalDecide
@@ -1016,7 +1024,7 @@ describe("SessionInvoke pre-stream error handling", () => {
 
     const restore = installBasicLoopMocks()
     const processCalled = mock(async () => "stop" as const)
-    ;(ToolResolver.definitions as any) = mock(async () => {
+    ;(ToolResolver.availability as any) = mock(async () => {
       throw new Error("plugin tool uses incompatible schema")
     })
     ;(SessionProcessor.create as any) = mock((input: Parameters<typeof SessionProcessor.create>[0]) => ({
@@ -1061,9 +1069,8 @@ describe("SessionInvoke pre-stream error handling", () => {
 })
 
 describe("SessionInvoke inbox boundaries", () => {
-  test("keeps the next task durable until its root message is materialized", async () => {
+  test("parks an invalid first task without losing its payload or fabricating a transcript", async () => {
     await using tmp = await tmpdir({ git: true })
-    const originalMaterializeItem = SessionInbox.materializeItem
     let activeSessionID = ""
 
     try {
@@ -1076,19 +1083,21 @@ describe("SessionInvoke inbox boundaries", () => {
             sessionID: session.id,
             agent: "synergy",
             model: { providerID: "test-provider", modelID: "test-model" },
-            parts: [{ type: "text", text: "Keep me durable" }],
+            parts: [
+              { type: "text", text: "Keep me durable" },
+              { type: "attachment", mime: "text/plain", filename: "broken.txt", url: "data:text/plain;base64,!!!" },
+            ],
           })
-          ;(SessionInbox.materializeItem as any) = mock(async () => {
-            throw new Error("simulated materialization failure")
-          })
-
-          await expect(SessionInvoke.loop.force(session.id)).rejects.toThrow("simulated materialization failure")
+          await expect(SessionInvoke.loop.force(session.id)).rejects.toThrow(
+            "Session inbox task could not be materialized",
+          )
           expect((await SessionInbox.list(session.id)).map((item) => item.id)).toContain(queued.id)
+          expect((await SessionInbox.getStored(session.id, queued.id)).status).toBe("failed")
+          expect(await SessionInbox.hasRunnableItem(session.id)).toBe(false)
           expect(await Session.messages({ sessionID: session.id })).toHaveLength(0)
         },
       })
     } finally {
-      ;(SessionInbox.materializeItem as any) = originalMaterializeItem
       if (activeSessionID) SessionManager.unregisterRuntime(activeSessionID)
     }
   })
@@ -2586,7 +2595,7 @@ for (const phase of ["materializing", "persisted-terminal", "startup-without-tas
               parts: [{ type: "text", text: "Child task completed" }],
             })
             if (phase !== "materializing")
-              for (const item of await SessionInbox.drainSteer(session.id))
+              for (const item of await SessionInbox.peekSteer(session.id))
                 await SessionInbox.materializeItem(item, rootID, { guiding: true })
             const queued = phase.startsWith("startup")
               ? undefined

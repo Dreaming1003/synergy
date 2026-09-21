@@ -235,14 +235,21 @@
       "get": {
         "operationId": "global.stats.get",
         "summary": "Get stats snapshot",
-        "description": "Get the full stats snapshot after incrementally refreshing changed session and rollout records. Use ?recompute=true to force a full recompute from scratch.",
+        "description": "Read the last computed stats snapshot without scanning history; null means no snapshot exists. Use the progress stream to refresh, or ?recompute=true to force a full recompute.",
         "responses": {
           "200": {
             "description": "Stats snapshot",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatsSnapshot"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/StatsSnapshot"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               }
             }
@@ -292,7 +299,7 @@
       "get": {
         "operationId": "global.stats.progress",
         "summary": "Stream stats recompute progress",
-        "description": "Force a stats recompute and stream progress updates over SSE until the final snapshot is ready.",
+        "description": "Refresh changed statistics and stream progress updates until the final snapshot is ready. Concurrent refreshes share one computation.",
         "responses": {
           "200": {
             "description": "Server-sent events containing progress and final snapshot payloads",
@@ -1641,6 +1648,293 @@
         ]
       }
     },
+    "/global/storage/upgrade": {
+      "get": {
+        "operationId": "storage.upgradeStatus",
+        "summary": "Get historical data upgrade progress",
+        "description": "The runtime is ready for new work. Historical Sessions are admitted individually after migration and recovery.",
+        "responses": {
+          "200": {
+            "description": "Historical upgrade counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageUpgradeStatus"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.storage.upgradeStatus({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/global/storage/upgrade/sessions": {
+      "get": {
+        "operationId": "storage.upgradeCatalog",
+        "summary": "List unresolved historical Sessions",
+        "responses": {
+          "200": {
+            "description": "One page from the immutable upgrade cohort",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageUpgradeCatalog"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "in": "query",
+            "name": "scopeID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "minItems": 4,
+              "maxItems": 4,
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.storage.upgradeCatalog({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/global/storage/upgrade/control": {
+      "post": {
+        "operationId": "storage.controlUpgrade",
+        "summary": "Pause or resume background history preparation",
+        "responses": {
+          "200": {
+            "description": "Updated preparation status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageUpgradeStatus"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "enum": ["pause", "resume"]
+                  }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.storage.controlUpgrade({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/global/storage/upgrade/sessions/{sessionID}": {
+      "get": {
+        "operationId": "storage.upgradeSession",
+        "summary": "Get historical Session preparation status",
+        "responses": {
+          "200": {
+            "description": "Preparation status without starting work",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageSessionPreparation"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.storage.upgradeSession({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/global/storage/upgrade/sessions/{sessionID}/prepare": {
+      "post": {
+        "operationId": "storage.prepareSession",
+        "summary": "Prioritize historical Session preparation",
+        "description": "Returns immediately. Poll status; leaving the page does not cancel durable preparation.",
+        "responses": {
+          "200": {
+            "description": "Current preparation status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageSessionPreparation"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.storage.prepareSession({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/global/storage/upgrade/sessions/{sessionID}/retry": {
+      "post": {
+        "operationId": "storage.retrySession",
+        "summary": "Retry interrupted historical Session preparation",
+        "description": "Retries from durable checkpoints. Quarantined data requires repair; this operation never discards or overwrites a recovery set.",
+        "responses": {
+          "200": {
+            "description": "Current preparation status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageSessionPreparation"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true
+          }
+        ],
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.storage.retrySession({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/global/storage/snapshot": {
       "get": {
         "operationId": "storage.snapshot.usage",
@@ -2848,6 +3142,41 @@
         ]
       }
     },
+    "/global/activity": {
+      "get": {
+        "operationId": "global.activity",
+        "summary": "Get global activity",
+        "description": "Report whether any session or background job is currently working. Non-idle runtimes in this process (busy, retry, recovering) and in-flight loop background jobs both count; a session still queued for recovery after a restart counts once it begins executing. Read-only and served from memory; clients that must not let the machine idle poll this endpoint.",
+        "responses": {
+          "200": {
+            "description": "Global activity snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalActivity"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.global.activity({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/global/session": {
       "get": {
         "operationId": "global.session.search",
@@ -3062,6 +3391,47 @@
           {
             "lang": "js",
             "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.global.session.search({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/global/session/status": {
+      "get": {
+        "operationId": "global.session.statuses",
+        "summary": "Global session status",
+        "description": "Retrieve the runtime status of every non-idle session across all scopes, including recovered workflow sessions that no status event publishes.",
+        "responses": {
+          "200": {
+            "description": "Cross-scope session status map",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "$ref": "#/components/schemas/SessionStatus"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.global.session.statuses({\n  ...\n})"
           }
         ]
       }
@@ -4684,6 +5054,7 @@
                 "commands",
                 "permissions",
                 "runtime",
+                "storage",
                 "plugins",
                 "channels",
                 "holos",
@@ -4692,6 +5063,7 @@
                 "library",
                 "mcp",
                 "skills",
+                "worktree",
                 "voice"
               ]
             },
@@ -4769,6 +5141,7 @@
                 "commands",
                 "permissions",
                 "runtime",
+                "storage",
                 "plugins",
                 "channels",
                 "holos",
@@ -4777,6 +5150,7 @@
                 "library",
                 "mcp",
                 "skills",
+                "worktree",
                 "voice"
               ]
             },
@@ -4865,6 +5239,7 @@
                 "commands",
                 "permissions",
                 "runtime",
+                "storage",
                 "plugins",
                 "channels",
                 "holos",
@@ -4873,6 +5248,7 @@
                 "library",
                 "mcp",
                 "skills",
+                "worktree",
                 "voice"
               ]
             },
@@ -4971,6 +5347,7 @@
                     "commands",
                     "permissions",
                     "runtime",
+                    "storage",
                     "plugins",
                     "channels",
                     "holos",
@@ -4979,6 +5356,7 @@
                     "library",
                     "mcp",
                     "skills",
+                    "worktree",
                     "voice"
                   ]
                 },
@@ -4994,6 +5372,7 @@
                       "commands",
                       "permissions",
                       "runtime",
+                      "storage",
                       "plugins",
                       "channels",
                       "holos",
@@ -5002,6 +5381,7 @@
                       "library",
                       "mcp",
                       "skills",
+                      "worktree",
                       "voice"
                     ]
                   }
@@ -5325,6 +5705,463 @@
         ]
       }
     },
+    "/secrets": {
+      "get": {
+        "operationId": "secrets.list",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "directory",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scopeID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "summary": "List secret vault entries",
+        "description": "List registered secret vault entries. Values are never returned.",
+        "responses": {
+          "200": {
+            "description": "Secret entries without values",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SecretEntry"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.secrets.list({\n  ...\n})"
+          }
+        ]
+      },
+      "post": {
+        "operationId": "secrets.create",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "directory",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scopeID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "summary": "Register a secret",
+        "description": "Register a value in the secret vault. Idempotent for an already-registered value.",
+        "responses": {
+          "200": {
+            "description": "The registered entry without its value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  },
+                  "required": ["name", "data"]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretCreateInput"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.secrets.create({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/secrets/{id}": {
+      "patch": {
+        "operationId": "secrets.updatePolicy",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "directory",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scopeID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "summary": "Update a secret's policy",
+        "description": "Replace the per-key resolution policy of one vault entry.",
+        "responses": {
+          "200": {
+            "description": "The updated entry without its value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretPolicyInput"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.secrets.updatePolicy({\n  ...\n})"
+          }
+        ]
+      },
+      "delete": {
+        "operationId": "secrets.remove",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "directory",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scopeID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "summary": "Remove a secret",
+        "description": "Remove one vault entry. Historical mask tokens stop resolving and render as revoked; re-registering the same value restores them.",
+        "responses": {
+          "200": {
+            "description": "Whether an entry was removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "removed": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["removed"]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.secrets.remove({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/secrets/{id}/rotate": {
+      "post": {
+        "operationId": "secrets.rotate",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "directory",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scopeID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "summary": "Rotate a secret's value",
+        "description": "Replace the value of one vault entry; policy and resolve history carry over.",
+        "responses": {
+          "200": {
+            "description": "The rotated entry without its value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  },
+                  "required": ["name", "data"]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretRotateInput"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.secrets.rotate({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/secrets/{id}/history": {
+      "get": {
+        "operationId": "secrets.history",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "directory",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scopeID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "summary": "Read a secret's resolve history",
+        "description": "Read the bounded resolve audit trail of one vault entry.",
+        "responses": {
+          "200": {
+            "description": "Resolve audit entries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SecretResolveAuditEntry"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.secrets.history({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/runtime/reload": {
       "post": {
         "operationId": "runtime.reload",
@@ -5410,6 +6247,57 @@
           {
             "lang": "js",
             "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.runtime.reload({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/runtime/agent-workers": {
+      "get": {
+        "operationId": "runtime.agentWorkers",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "directory",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scopeID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "summary": "Get Agent worker capacity status",
+        "description": "Get the explicit Agent worker ceiling, the capacity the runtime resolves from it, and whether configuration or the machine decided it.",
+        "responses": {
+          "200": {
+            "description": "Agent worker capacity status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentWorkerCapacityStatus"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Runtime shutting down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeShuttingDownError"
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createSynergyClient } from \"@ericsanchezok/synergy-sdk\"\n\nconst client = createSynergyClient()\nawait client.runtime.agentWorkers({\n  ...\n})"
           }
         ]
       }
@@ -7956,11 +8844,11 @@
         "description": "Abort an active session and stop any ongoing AI processing or command execution.",
         "responses": {
           "200": {
-            "description": "Aborted session",
+            "description": "Abort result",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "boolean"
+                  "$ref": "#/components/schemas/SessionAbortResult"
                 }
               }
             }
@@ -8428,11 +9316,18 @@
             }
           },
           "409": {
-            "description": "First task is locked until its root is ready",
+            "description": "First task is locked until its root is ready, or the item is parked as failed",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionInboxFirstTaskLockedError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionInboxFirstTaskLockedError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionInboxItemFailedError"
+                    }
+                  ]
                 }
               }
             }
@@ -10556,6 +11451,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "sessionID",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only return pending permission requests owned by this session"
           }
         ],
         "summary": "List pending permissions",
@@ -24861,6 +25764,9 @@
                       },
                       "keyConfigured": {
                         "type": "boolean"
+                      },
+                      "keyHint": {
+                        "type": "string"
                       }
                     },
                     "required": ["name", "url", "status", "keyConfigured"]
@@ -30290,11 +31196,24 @@
               "maxSqliteBytes": {
                 "type": "number"
               },
+              "retentionBytes": {
+                "type": "number"
+              },
+              "retentionMs": {
+                "type": "number"
+              },
               "walCheckpointIntervalMs": {
                 "type": "number"
               }
             },
-            "required": ["sqliteEnabled", "jsonlMirrorEnabled", "maxSqliteBytes", "walCheckpointIntervalMs"]
+            "required": [
+              "sqliteEnabled",
+              "jsonlMirrorEnabled",
+              "maxSqliteBytes",
+              "retentionBytes",
+              "retentionMs",
+              "walCheckpointIntervalMs"
+            ]
           },
           "thresholds": {
             "type": "object",
@@ -30417,11 +31336,24 @@
               "maxSqliteBytes": {
                 "type": "number"
               },
+              "retentionBytes": {
+                "type": "number"
+              },
+              "retentionMs": {
+                "type": "number"
+              },
               "walCheckpointIntervalMs": {
                 "type": "number"
               }
             },
-            "required": ["sqliteEnabled", "jsonlMirrorEnabled", "maxSqliteBytes", "walCheckpointIntervalMs"]
+            "required": [
+              "sqliteEnabled",
+              "jsonlMirrorEnabled",
+              "maxSqliteBytes",
+              "retentionBytes",
+              "retentionMs",
+              "walCheckpointIntervalMs"
+            ]
           },
           "thresholds": {
             "type": "object",
@@ -30584,6 +31516,154 @@
           }
         },
         "required": ["sentAt", "metrics"]
+      },
+      "StorageUpgradeStatus": {
+        "type": "object",
+        "properties": {
+          "ready": {
+            "type": "boolean",
+            "const": true
+          },
+          "historyReady": {
+            "type": "boolean"
+          },
+          "paused": {
+            "type": "boolean"
+          },
+          "pauseReason": {
+            "type": "string",
+            "enum": ["user", "foreground", "disk", "wal"]
+          },
+          "backup": {
+            "type": "object",
+            "properties": {
+              "complete": {
+                "type": "boolean"
+              },
+              "attention": {
+                "type": "boolean"
+              },
+              "sealed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "total": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": ["complete", "sealed", "total"]
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "partial": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "imported": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "quarantined": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "ready",
+          "historyReady",
+          "paused",
+          "backup",
+          "pending",
+          "partial",
+          "imported",
+          "quarantined",
+          "total"
+        ]
+      },
+      "StorageUpgradeCatalog": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "sessionID": {
+                  "type": "string"
+                },
+                "scopeID": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": ["pending", "partial", "imported", "quarantined"]
+                }
+              },
+              "required": ["sessionID", "scopeID", "status"]
+            }
+          },
+          "next": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": ["items"]
+      },
+      "StorageSessionPreparation": {
+        "type": "object",
+        "properties": {
+          "sessionID": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": ["ready", "pending", "preparing", "blocked", "failed"]
+          },
+          "phase": {
+            "type": "string",
+            "enum": ["backup", "import", "migrate", "verify", "publish", "complete"]
+          },
+          "files": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "category": {
+                "type": "string",
+                "enum": ["retryable", "integrity", "data"]
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": ["category", "message"]
+          }
+        },
+        "required": ["sessionID", "state", "files", "bytes"]
       },
       "StorageSnapshotOwnerCounts": {
         "type": "object",
@@ -32044,6 +33124,91 @@
         },
         "required": ["id", "status", "title", "prompt", "origin", "createdBy", "time"]
       },
+      "GlobalActivity": {
+        "type": "object",
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "sessions": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "backgroundJobs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": ["active", "sessions", "backgroundJobs"]
+      },
+      "SessionRecoveringReason": {
+        "type": "string",
+        "enum": ["workflow", "incomplete-turn", "pending-reply"]
+      },
+      "SessionStatus": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "idle"
+              }
+            },
+            "required": ["type"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "retry"
+              },
+              "attempt": {
+                "type": "number"
+              },
+              "message": {
+                "type": "string"
+              },
+              "next": {
+                "type": "number"
+              }
+            },
+            "required": ["type", "attempt", "message", "next"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "busy"
+              },
+              "description": {
+                "type": "string"
+              }
+            },
+            "required": ["type"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "recovering"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/SessionRecoveringReason"
+              },
+              "description": {
+                "type": "string"
+              }
+            },
+            "required": ["type"]
+          }
+        ]
+      },
       "SessionNavEntry": {
         "type": "object",
         "properties": {
@@ -32156,6 +33321,37 @@
                 "required": ["kind", "externalProjectId", "externalTaskId"]
               }
             ]
+          },
+          "blueprint": {
+            "type": "object",
+            "properties": {
+              "loopID": {
+                "type": "string"
+              },
+              "loopRole": {
+                "type": "string",
+                "enum": ["execution", "audit"]
+              },
+              "phase": {
+                "type": "string",
+                "enum": ["running", "waiting", "auditing"]
+              }
+            }
+          },
+          "workspaceType": {
+            "type": "string"
+          },
+          "workflow": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string"
+              },
+              "active": {
+                "type": "boolean"
+              }
+            },
+            "required": ["kind", "active"]
           },
           "completionNotice": {
             "type": "object",
@@ -33488,6 +34684,31 @@
         },
         "additionalProperties": false
       },
+      "AttachmentConfig": {
+        "description": "Prompt attachment upload limits (count and byte sizes)",
+        "type": "object",
+        "properties": {
+          "maxFiles": {
+            "description": "Maximum number of prompt attachments per batch (default: 20)",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "maxFileBytes": {
+            "description": "Maximum prompt attachment size in bytes per file (default: 209715200 = 200 MiB)",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "maxTotalBytes": {
+            "description": "Maximum aggregate prompt attachment size in bytes per batch (default: 2147483648 = 2 GiB)",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "additionalProperties": false
+      },
       "PermissionActionConfig": {
         "type": "string",
         "enum": ["ask", "allow", "deny"]
@@ -34263,6 +35484,10 @@
             "description": "Enable local indexed observability events, spans, metrics, issues, and diagnostics (default: true)",
             "type": "boolean"
           },
+          "logMirror": {
+            "description": "Mirror debug/info records that opt in with `mirror: true` into indexed observability events",
+            "type": "boolean"
+          },
           "retentionDays": {
             "description": "Days to retain optional observability mirror files (default: 7)",
             "type": "integer",
@@ -34396,8 +35621,21 @@
                     "type": "boolean"
                   },
                   "maxSqliteBytes": {
+                    "description": "Maximum bytes for the local observability database (default: 250MB)",
                     "type": "integer",
                     "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "retentionBytes": {
+                    "description": "Maximum authoritative storage bytes before budgeted pruning may remove evidence older than the retention window (default: 40GB). A backstop above the window's steady state, not a target.",
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "retentionMs": {
+                    "description": "Retain authoritative evidence for this long before budgeted pruning may remove it (default: 7 days, bounds 1 hour to 90 days; set 0 to disable). Pruning only runs while the database exceeds retentionBytes.",
+                    "type": "integer",
+                    "minimum": 0,
                     "maximum": 9007199254740991
                   },
                   "walCheckpointIntervalMs": {
@@ -36140,6 +37378,27 @@
         },
         "additionalProperties": false
       },
+      "WorktreeConfig": {
+        "type": "object",
+        "properties": {
+          "maxManaged": {
+            "description": "Maximum number of managed git worktrees kept before the janitor reclaims the oldest idle ones",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "sweepIntervalHours": {
+            "description": "Hours between managed-worktree janitor sweeps",
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "janitor": {
+            "description": "Run the managed-worktree janitor at all (default: true)",
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
       "VoiceSttConfig": {
         "description": "Speech-to-text service configuration",
         "type": "object",
@@ -37014,8 +38273,59 @@
           "logLevel": {
             "$ref": "#/components/schemas/LogLevel"
           },
+          "storage": {
+            "description": "Global authoritative storage; backend changes require an explicit storage migration",
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "backend": {
+                    "type": "string",
+                    "const": "sqlite"
+                  },
+                  "namespace": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,128}$"
+                  },
+                  "filename": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["backend"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "backend": {
+                    "type": "string",
+                    "const": "postgres"
+                  },
+                  "namespace": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,128}$"
+                  },
+                  "connectionEnv": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+                  },
+                  "maxConnections": {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 64
+                  }
+                },
+                "required": ["backend", "namespace", "connectionEnv"],
+                "additionalProperties": false
+              }
+            ]
+          },
           "server": {
             "$ref": "#/components/schemas/ServerConfig"
+          },
+          "attachment": {
+            "$ref": "#/components/schemas/AttachmentConfig"
           },
           "command": {
             "description": "Command configuration",
@@ -37157,13 +38467,20 @@
                 "type": "boolean"
               },
               "agentWorkers": {
-                "description": "Maximum number of isolated Agent workers (default: min(4, available CPUs - 1), at least 1)",
-                "type": "integer",
-                "exclusiveMinimum": 0,
-                "maximum": 64
+                "description": "Maximum number of isolated Agent workers (default: derived from the effective memory limit, capped by available CPUs and 64, never below agentWorkerMinIdle). Pass null to clear the explicit ceiling and derive it from the machine.",
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 64
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
               "agentWorkerMinIdle": {
-                "description": "Minimum number of idle Agent workers kept warm (default: 0; cannot exceed agentWorkers)",
+                "description": "Minimum number of idle Agent workers kept warm (default: 1 on resident servers, 0 for one-shot runs; cannot exceed agentWorkers)",
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 64
@@ -37355,45 +38672,108 @@
             }
           },
           "model": {
-            "description": "Default model in the format of provider/model, eg anthropic/claude-sonnet-4-5",
-            "type": "string"
+            "description": "Default model in the format of provider/model, eg anthropic/claude-sonnet-4-5. null clears the role",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "nano_model": {
-            "description": "Cheapest model for trivial extraction tasks like title generation, in the format of provider/model. Falls back to mini_model → mid_model → model.",
-            "type": "string"
+            "description": "Cheapest model for trivial extraction tasks like title generation, in the format of provider/model. Falls back to mini_model → mid_model → model. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "mini_model": {
-            "description": "Lightweight model for simple tasks like intent extraction, in the format of provider/model. Falls back to mid_model → model.",
-            "type": "string"
+            "description": "Lightweight model for simple tasks like intent extraction, in the format of provider/model. Falls back to mid_model → model. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "mid_model": {
-            "description": "Mid-tier model for internal agents that need moderate reasoning (script extraction, reward evaluation, code exploration), in the format of provider/model. Falls back to the default model.",
-            "type": "string"
+            "description": "Mid-tier model for internal agents that need moderate reasoning (script extraction, reward evaluation, code exploration), in the format of provider/model. Falls back to the default model. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "thinking_model": {
-            "description": "Deep thinking model for complex reasoning and architecture tasks, in the format of provider/model. Falls back to the default model if not set.",
-            "type": "string"
+            "description": "Deep thinking model for complex reasoning and architecture tasks, in the format of provider/model. Falls back to the default model if not set. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "long_context_model": {
-            "description": "Model with extra-large context window for processing very long inputs, in the format of provider/model. Falls back to the default model if not set.",
-            "type": "string"
+            "description": "Model with extra-large context window for processing very long inputs, in the format of provider/model. Falls back to the default model if not set. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "creative_model": {
-            "description": "Model for creative and visual tasks (UI design, writing, artistry), in the format of provider/model. Falls back to the default model if not set.",
-            "type": "string"
+            "description": "Model for creative and visual tasks (UI design, writing, artistry), in the format of provider/model. Falls back to the default model if not set. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "vision_model": {
-            "description": "Model for separate image analysis via the look_at tool, in the format of provider/model. If not set, look_at is disabled. Direct current-model image context uses view_image based on the active model capability.",
-            "type": "string"
+            "description": "Model for separate image analysis via the look_at tool, in the format of provider/model. If not set, look_at is disabled. Direct current-model image context uses view_image based on the active model capability. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "role_variant": {
-            "description": "Default variant (e.g. low, medium, high, xhigh) applied per model role. Requires the resolved model to support the named variant.",
+            "description": "Default variant (e.g. low, medium, high, xhigh) applied per model role. Requires the resolved model to support the named variant. A null value clears the role's variant",
             "type": "object",
             "propertyNames": {
               "type": "string"
             },
             "additionalProperties": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "default_agent": {
@@ -37458,6 +38838,15 @@
           },
           "controlProfile": {
             "$ref": "#/components/schemas/ControlProfileId"
+          },
+          "nonInteractiveControlProfile": {
+            "description": "Control profile for sessions created by non-interactive sources (Channels and Agenda) that have no explicit profile of their own. Default: autonomous. Changes apply to sessions created after the change; an existing bound Channel session keeps the profile it was created with.",
+            "type": "string",
+            "enum": ["autonomous", "full_access"]
+          },
+          "fullAccessAcknowledged": {
+            "description": "Records that the human accepted the risk of running with Full Access. Set by the confirmation dialog when Full Access is enabled from the UI; it is an awareness record, not a security boundary.",
+            "type": "boolean"
           },
           "instructions": {
             "description": "Additional instruction files or patterns to include",
@@ -37912,6 +39301,9 @@
           "skills": {
             "$ref": "#/components/schemas/SkillsConfig"
           },
+          "worktree": {
+            "$ref": "#/components/schemas/WorktreeConfig"
+          },
           "voice": {
             "$ref": "#/components/schemas/VoiceConfig"
           },
@@ -38059,65 +39451,6 @@
           }
         },
         "required": ["name", "hints"]
-      },
-      "SessionStatus": {
-        "anyOf": [
-          {
-            "type": "object",
-            "properties": {
-              "type": {
-                "type": "string",
-                "const": "idle"
-              }
-            },
-            "required": ["type"]
-          },
-          {
-            "type": "object",
-            "properties": {
-              "type": {
-                "type": "string",
-                "const": "retry"
-              },
-              "attempt": {
-                "type": "number"
-              },
-              "message": {
-                "type": "string"
-              },
-              "next": {
-                "type": "number"
-              }
-            },
-            "required": ["type", "attempt", "message", "next"]
-          },
-          {
-            "type": "object",
-            "properties": {
-              "type": {
-                "type": "string",
-                "const": "busy"
-              },
-              "description": {
-                "type": "string"
-              }
-            },
-            "required": ["type"]
-          },
-          {
-            "type": "object",
-            "properties": {
-              "type": {
-                "type": "string",
-                "const": "recovering"
-              },
-              "description": {
-                "type": "string"
-              }
-            },
-            "required": ["type"]
-          }
-        ]
       },
       "SessionScope": {
         "type": "object",
@@ -38607,6 +39940,12 @@
               "status": {
                 "type": "string",
                 "const": "recovering"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/SessionRecoveringReason"
+              },
+              "description": {
+                "type": "string"
               }
             },
             "required": ["status"]
@@ -39080,6 +40419,10 @@
               "loopRole": {
                 "type": "string",
                 "enum": ["execution", "audit"]
+              },
+              "phase": {
+                "type": "string",
+                "enum": ["running", "waiting", "auditing"]
               }
             }
           }
@@ -39845,6 +41188,7 @@
               "commands",
               "permissions",
               "runtime",
+              "storage",
               "plugins",
               "channels",
               "holos",
@@ -39853,6 +41197,7 @@
               "library",
               "mcp",
               "skills",
+              "worktree",
               "voice"
             ]
           },
@@ -39991,6 +41336,7 @@
                 "commands",
                 "permissions",
                 "runtime",
+                "storage",
                 "plugins",
                 "channels",
                 "holos",
@@ -39999,6 +41345,7 @@
                 "library",
                 "mcp",
                 "skills",
+                "worktree",
                 "voice"
               ]
             }
@@ -40122,6 +41469,7 @@
               "commands",
               "permissions",
               "runtime",
+              "storage",
               "plugins",
               "channels",
               "holos",
@@ -40130,6 +41478,7 @@
               "library",
               "mcp",
               "skills",
+              "worktree",
               "voice"
             ]
           },
@@ -40254,6 +41603,7 @@
                 "commands",
                 "permissions",
                 "runtime",
+                "storage",
                 "plugins",
                 "channels",
                 "holos",
@@ -40262,6 +41612,7 @@
                 "library",
                 "mcp",
                 "skills",
+                "worktree",
                 "voice"
               ]
             }
@@ -40474,6 +41825,7 @@
                     "commands",
                     "permissions",
                     "runtime",
+                    "storage",
                     "plugins",
                     "channels",
                     "holos",
@@ -40482,6 +41834,7 @@
                     "library",
                     "mcp",
                     "skills",
+                    "worktree",
                     "voice"
                   ]
                 }
@@ -40532,6 +41885,7 @@
                 "commands",
                 "permissions",
                 "runtime",
+                "storage",
                 "plugins",
                 "channels",
                 "holos",
@@ -40540,6 +41894,7 @@
                 "library",
                 "mcp",
                 "skills",
+                "worktree",
                 "voice"
               ]
             }
@@ -40566,9 +41921,143 @@
         },
         "required": ["config"]
       },
+      "SecretPolicy": {
+        "type": "object",
+        "properties": {
+          "tools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "maxResolvesPerSession": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          }
+        }
+      },
+      "SecretEntry": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "fingerprint": {
+            "type": "object",
+            "properties": {
+              "sha256": {
+                "type": "string"
+              },
+              "length": {
+                "type": "number"
+              }
+            },
+            "required": ["sha256", "length"]
+          },
+          "source": {},
+          "policy": {
+            "$ref": "#/components/schemas/SecretPolicy"
+          },
+          "createdAt": {
+            "type": "number"
+          },
+          "updatedAt": {
+            "type": "number"
+          },
+          "lastResolvedAt": {
+            "type": "number"
+          },
+          "resolvedCount": {
+            "type": "number"
+          }
+        },
+        "required": ["id", "fingerprint", "source", "createdAt", "updatedAt", "resolvedCount"]
+      },
+      "SecretCreateInput": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "string",
+            "minLength": 1
+          },
+          "policy": {
+            "$ref": "#/components/schemas/SecretPolicy"
+          }
+        },
+        "required": ["value"]
+      },
+      "SecretPolicyInput": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "$ref": "#/components/schemas/SecretPolicy"
+          }
+        },
+        "required": ["policy"]
+      },
+      "SecretRotateInput": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["value"]
+      },
+      "SecretResolveAuditEntry": {
+        "type": "object",
+        "properties": {
+          "at": {
+            "type": "number"
+          },
+          "sessionID": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": ["resolved", "denied_policy", "denied_limit", "removed"]
+          }
+        },
+        "required": ["at", "outcome"]
+      },
       "RuntimeReloadScope": {
         "type": "string",
         "enum": ["auto", "global", "project"]
+      },
+      "AgentWorkerCapacityStatus": {
+        "type": "object",
+        "properties": {
+          "configured": {
+            "description": "Explicit execution.agentWorkers ceiling, or null when the machine derives it",
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 64
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "effective": {
+            "description": "Capacity the Agent worker pool runs with",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "source": {
+            "description": "Whether configuration or the machine sizes the pool",
+            "type": "string",
+            "enum": ["explicit", "derived"]
+          }
+        },
+        "required": ["configured", "effective", "source"]
       },
       "ControlProfileSummary": {
         "type": "object",
@@ -40882,6 +42371,12 @@
           },
           "setupError": {
             "type": "string"
+          },
+          "locked": {
+            "type": "string"
+          },
+          "prunable": {
+            "type": "boolean"
           }
         },
         "required": ["id", "name", "path", "scopeID"]
@@ -41162,45 +42657,108 @@
             "additionalProperties": false
           },
           "model": {
-            "description": "Default model in the format of provider/model, eg anthropic/claude-sonnet-4-5",
-            "type": "string"
+            "description": "Default model in the format of provider/model, eg anthropic/claude-sonnet-4-5. null clears the role",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "nano_model": {
-            "description": "Cheapest model for trivial extraction tasks like title generation, in the format of provider/model. Falls back to mini_model → mid_model → model.",
-            "type": "string"
+            "description": "Cheapest model for trivial extraction tasks like title generation, in the format of provider/model. Falls back to mini_model → mid_model → model. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "mini_model": {
-            "description": "Lightweight model for simple tasks like intent extraction, in the format of provider/model. Falls back to mid_model → model.",
-            "type": "string"
+            "description": "Lightweight model for simple tasks like intent extraction, in the format of provider/model. Falls back to mid_model → model. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "mid_model": {
-            "description": "Mid-tier model for internal agents that need moderate reasoning (script extraction, reward evaluation, code exploration), in the format of provider/model. Falls back to the default model.",
-            "type": "string"
+            "description": "Mid-tier model for internal agents that need moderate reasoning (script extraction, reward evaluation, code exploration), in the format of provider/model. Falls back to the default model. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "thinking_model": {
-            "description": "Deep thinking model for complex reasoning and architecture tasks, in the format of provider/model. Falls back to the default model if not set.",
-            "type": "string"
+            "description": "Deep thinking model for complex reasoning and architecture tasks, in the format of provider/model. Falls back to the default model if not set. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "long_context_model": {
-            "description": "Model with extra-large context window for processing very long inputs, in the format of provider/model. Falls back to the default model if not set.",
-            "type": "string"
+            "description": "Model with extra-large context window for processing very long inputs, in the format of provider/model. Falls back to the default model if not set. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "creative_model": {
-            "description": "Model for creative and visual tasks (UI design, writing, artistry), in the format of provider/model. Falls back to the default model if not set.",
-            "type": "string"
+            "description": "Model for creative and visual tasks (UI design, writing, artistry), in the format of provider/model. Falls back to the default model if not set. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "vision_model": {
-            "description": "Model for separate image analysis via the look_at tool, in the format of provider/model. If not set, look_at is disabled. Direct current-model image context uses view_image based on the active model capability.",
-            "type": "string"
+            "description": "Model for separate image analysis via the look_at tool, in the format of provider/model. If not set, look_at is disabled. Direct current-model image context uses view_image based on the active model capability. null clears the role's model",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "role_variant": {
-            "description": "Default variant (e.g. low, medium, high, xhigh) applied per model role. Requires the resolved model to support the named variant.",
+            "description": "Default variant (e.g. low, medium, high, xhigh) applied per model role. Requires the resolved model to support the named variant. A null value clears the role's variant",
             "type": "object",
             "propertyNames": {
               "type": "string"
             },
             "additionalProperties": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "toolExposure": {
@@ -41389,13 +42947,20 @@
                 "type": "boolean"
               },
               "agentWorkers": {
-                "description": "Maximum number of isolated Agent workers (default: min(4, available CPUs - 1), at least 1)",
-                "type": "integer",
-                "exclusiveMinimum": 0,
-                "maximum": 64
+                "description": "Maximum number of isolated Agent workers (default: derived from the effective memory limit, capped by available CPUs and 64, never below agentWorkerMinIdle). Pass null to clear the explicit ceiling and derive it from the machine.",
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 64
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
               "agentWorkerMinIdle": {
-                "description": "Minimum number of idle Agent workers kept warm (default: 0; cannot exceed agentWorkers)",
+                "description": "Minimum number of idle Agent workers kept warm (default: 1 on resident servers, 0 for one-shot runs; cannot exceed agentWorkers)",
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 64
@@ -43429,6 +44994,29 @@
         },
         "required": ["name", "data"]
       },
+      "SessionAbortResult": {
+        "type": "object",
+        "properties": {
+          "outcome": {
+            "description": "Runtime signal result; not_found/idle mean no running turn was stopped",
+            "type": "string",
+            "enum": ["not_found", "idle", "signaled", "already_stopping", "not_owner"]
+          },
+          "repaired": {
+            "description": "An interrupted turn was terminalized",
+            "type": "boolean"
+          },
+          "abandoned": {
+            "description": "A driverless workflow was terminalized",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "The session settled to idle",
+            "type": "boolean"
+          }
+        },
+        "required": ["outcome", "repaired", "abandoned", "settled"]
+      },
       "AttachmentSourceText": {
         "type": "object",
         "properties": {
@@ -43675,6 +45263,13 @@
           "mode": {
             "type": "string",
             "enum": ["task", "steer", "context"]
+          },
+          "status": {
+            "type": "string",
+            "enum": ["failed"]
+          },
+          "failReason": {
+            "type": "string"
           },
           "deliveryKey": {
             "type": "string"
@@ -44060,6 +45655,33 @@
           "name": {
             "type": "string",
             "const": "SessionInboxFirstTaskLockedError"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses.*"
+              },
+              "itemID": {
+                "type": "string",
+                "pattern": "^inb.*"
+              }
+            },
+            "required": ["message", "sessionID", "itemID"]
+          }
+        },
+        "required": ["name", "data"]
+      },
+      "SessionInboxItemFailedError": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "const": "SessionInboxItemFailedError"
           },
           "data": {
             "type": "object",

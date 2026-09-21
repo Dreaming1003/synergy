@@ -1,3 +1,4 @@
+import { SessionPreparingError } from "@ericsanchezok/synergy-harness/persistence"
 import { BusEvent } from "@ericsanchezok/synergy-harness/bus/bus-event"
 import { Bus } from "@ericsanchezok/synergy-harness/bus"
 import { GlobalBus } from "@ericsanchezok/synergy-harness/bus/global"
@@ -44,10 +45,12 @@ import { PermissionRoute } from "./permission"
 import { WorkspaceFilesRoute } from "./workspace-files"
 import { File as SynergyFile } from "@ericsanchezok/synergy-runtime-local/file"
 import { ConfigRoute } from "./config-route"
+import { SecretsRoute } from "./secrets-route"
 import { AssetRoute } from "./asset"
 import { SkillRoute } from "./skill-route"
 import { RuntimeRoute } from "./runtime-route"
 import { GlobalSessionRoute } from "./global-session"
+import { GlobalActivityRoute } from "./global-activity"
 import { SessionNavRoute } from "./session-nav"
 import { ControlProfileRoute } from "./control-profile-route"
 import { SandboxReadinessRoute } from "./sandbox-readiness-route"
@@ -442,6 +445,10 @@ export namespace Server {
     appInitialized = true
     return app
       .onError((err, c) => {
+        if (err instanceof SessionPreparingError) {
+          c.header("Retry-After", "2")
+          return c.json(err.toObject(), 409)
+        }
         if (err instanceof Storage.NotFoundError) return c.json(err.toObject(), { status: 404 })
         if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") {
           return c.json(new Storage.NotFoundError({ message: "Resource not found" }).toObject(), { status: 404 })
@@ -483,7 +490,11 @@ export namespace Server {
       .use(async (c, next) => {
         const reqPath = c.req.path
         const routePath = ObservabilityRedaction.routePath(reqPath)
-        const skipLogging = reqPath === "/log" || reqPath === "/global/health" || reqPath.startsWith("/assets/")
+        const skipLogging =
+          reqPath === "/log" ||
+          reqPath === "/global/health" ||
+          reqPath === "/global/activity" ||
+          reqPath.startsWith("/assets/")
         const skipPerformance = skipLogging || reqPath.startsWith("/global/performance/")
         const start = Date.now()
         const requestId = crypto.randomUUID().slice(0, 8)
@@ -885,6 +896,7 @@ export namespace Server {
         },
       )
       .route("", contributionRoutes("global-services"))
+      .route("/global/activity", GlobalActivityRoute)
       .route("/global/session", GlobalSessionRoute)
       .route("", contributionRoutes("global-navigation"))
       .get("/doc", async (c) => c.json(await openapi()))
@@ -894,6 +906,7 @@ export namespace Server {
       .route("/scope", createScopeBootstrapRoute(contributions.bootstrap))
       .route("/pty", PtyRoute)
       .route("/config", ConfigRoute)
+      .route("/secrets", SecretsRoute)
       .route("/runtime", RuntimeRoute)
       .route("", ControlProfileRoute)
       .route("", SandboxReadinessRoute)

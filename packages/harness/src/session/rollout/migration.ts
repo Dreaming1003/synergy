@@ -13,7 +13,9 @@ import { Attachment } from "../../attachment"
 import { RolloutArtifact } from "./artifact"
 import { RolloutAttachment } from "./attachment"
 import type { RolloutSchema } from "./schema"
+import { work } from "../../util/queue"
 
+const MIGRATION_CONCURRENCY = 8
 export namespace RolloutMigration {
   // Archived session metadata is historical evidence; validate only the settlement fields this migration owns.
   const SettlementRecord = z
@@ -31,7 +33,6 @@ export namespace RolloutMigration {
       requests: z.literal("historical_requests_not_recorded"),
     })
     .strict()
-  const options = { private: true, durable: true, compact: true } as const
 
   async function retainedOutput(filepath: unknown) {
     if (typeof filepath !== "string") return undefined
@@ -65,7 +66,7 @@ export namespace RolloutMigration {
       sessionID = Identifier.asSessionID(owner.sessionID)
     const infoKey = StoragePath.sessionInfo(scopeID, sessionID)
     const info = SettlementRecord.parse(await Storage.read(infoKey))
-    for (const messageID of await Storage.scan(StoragePath.sessionMessagesRoot(scopeID, sessionID), { strict: true })) {
+    for (const messageID of await Storage.scan(StoragePath.sessionMessagesRoot(scopeID, sessionID))) {
       const mid = Identifier.asMessageID(messageID)
       const infoKey = StoragePath.messageInfo(scopeID, sessionID, mid)
       const raw = await Storage.read(infoKey)
@@ -75,14 +76,10 @@ export namespace RolloutMigration {
         continue
       }
       if (parsed.data.role === "assistant" && !parsed.data.accounting) {
-        await Storage.write(
-          infoKey,
-          { ...parsed.data, accounting: { kind: "legacy", calculation: "session-v0" } },
-          options,
-        )
+        await Storage.write(infoKey, { ...parsed.data, accounting: { kind: "legacy", calculation: "session-v0" } })
         audit.legacyMessages++
       } else if (parsed.data.role === "assistant" && parsed.data.accounting?.kind === "legacy") audit.legacyMessages++
-      for (const partID of await Storage.scan(StoragePath.messageParts(scopeID, sessionID, mid), { strict: true })) {
+      for (const partID of await Storage.scan(StoragePath.messageParts(scopeID, sessionID, mid))) {
         const partKey = StoragePath.messagePart(scopeID, sessionID, mid, Identifier.asPartID(partID))
         const parsed = MessageV2.Part.safeParse(await Storage.read(partKey))
         if (!parsed.success) {
@@ -148,34 +145,40 @@ export namespace RolloutMigration {
               continue
             }
             Object.assign(attachment, captured)
-            await Storage.write(partKey, part, options)
+            await Storage.write(partKey, part)
           } else if (attachment.mime !== "application/x-directory")
             audit.missing.push(`attachment:${attachment.id}:original_not_recorded`)
         }
-        if (part !== parsed.data) await Storage.write(partKey, part, options)
+        if (part !== parsed.data) await Storage.write(partKey, part)
       }
     }
     if (info.cortex && !["queued", "running"].includes(info.cortex.status) && !info.cortex.settledAt) {
-      await Storage.write(infoKey, { ...info, cortex: { ...info.cortex, settledAt: audit.completedAt } }, options)
+      await Storage.write(infoKey, { ...info, cortex: { ...info.cortex, settledAt: audit.completedAt } })
       audit.missing.push("cortex:historical_delivery_not_verified")
     }
-    await Storage.write(key, audit, options)
+    await Storage.write(key, audit)
     return audit
   }
 
   export const migration: Migration = {
+    scope: "session",
+    async upSession(owner) {
+      await session({ kind: "session", ...owner })
+    },
     id: "20260907-session-rollout-evidence",
     description: "Preserve legacy accounting and retained tool evidence with explicit historical gaps",
     dependsOn: ["20260828-session-nav-timestamps"],
     async up(progress) {
       const owners: RolloutSchema.Owner[] = []
-      for (const scopeID of await Storage.scan(["sessions"], { strict: true }))
-        for (const sessionID of await Storage.scan(["sessions", scopeID], { strict: true }))
+      for (const scopeID of await Storage.scan(["sessions"]))
+        for (const sessionID of await Storage.scan(["sessions", scopeID]))
           owners.push({ kind: "session", scopeID, sessionID })
-      for (let index = 0; index < owners.length; index++) {
-        await session(owners[index])
-        progress(index + 1, owners.length)
-      }
+      let completed = 0
+      await work(MIGRATION_CONCURRENCY, owners, async (owner) => {
+        await session(owner)
+        completed++
+        progress(completed, owners.length)
+      })
       await Storage.removeTree(StoragePath.statsRoot())
     },
   }

@@ -58,7 +58,7 @@ Use Cortex for decisions that must be independently auditable. Choose task visib
 
 ## Direct AI SDK Calls
 
-`config/setup.ts` uses `generateText()` for a live provider capability probe before normal agent/session orchestration is appropriate. Keep direct AI SDK usage limited to such bootstrap/provider plumbing or the implementation of the shared `LLM` layer. Product inference should not bypass provider transforms, configured roles, plugin hooks, telemetry, timeouts, or output policy. Bootstrap probes that reach a managed-inference endpoint must pass through the same per-request header gate as normal turns (`ProviderSessionHeader.forRequest` with the resolved provider options), because the provider cannot distinguish a probe from a conversation.
+`packages/cli/src/setup/config.ts` uses `generateText()` for a live provider capability probe before normal agent/session orchestration is appropriate. Keep direct AI SDK usage limited to such bootstrap/provider plumbing or the implementation of the shared `LLM` layer. Product inference should not bypass provider transforms, configured roles, plugin hooks, telemetry, timeouts, or output policy. Bootstrap probes that reach a managed-inference endpoint must pass through the same per-request header gate as normal turns (`ProviderSessionHeader.forRequest` with the resolved provider options), because the provider cannot distinguish a probe from a conversation.
 
 ## External Model Catalogs
 
@@ -73,6 +73,8 @@ Automatic reasoning variants are derived from model identity (`model.id`, API mo
 When a provider requires a per-request header derived from the conversation (for example OpenCode Go's `x-opencode-session`), add it through the per-call headers layer gated by the resolved endpoint (`ProviderSessionHeader`), never through provider creation options or a global header map on the SDK package. Provider-creation headers bypass the conversation boundary: language-model instances are cached across sessions, and a gate on the SDK package alone would disclose conversation ids to every service reusing that package. Resolve the endpoint the SDK will actually use (model options beat provider options; the catalog API URL is only the fallback) and scope the disclosure to that endpoint with exact host and path matching.
 
 ## Streaming Bounds
+
+Own upload cancellation inside the recording stream so a native fetch reader lock cannot prevent settlement. Drain admitted request reads and writes before ending the attempt, including network failure and early HTTP responses; test with a cloned Request and the real recorder. Do not wait for an upstream cancellation acknowledgement shared with an unowned live sibling, or let upload cleanup failures replace the transport outcome. Request-side cleanup must not recursively wait on its own attempt finalizer.
 
 Production product inference enters `AgentTurn`: the Control Plane resolves final prompt and parameter plugin hooks plus serializable provider options into a request plan, request snapshots are schema-validated and capped, and the plan is sent as acknowledged chunks; event frames are bounded and acknowledged after consumption. The worker protocol owns its event projection: do not expose raw AI SDK stream objects as IPC types, and strip provider request bodies, response diagnostics, warnings, or other fields the Control Plane does not consume before checking the frame bound. Agent workers reconstruct built-in provider runtime functions without provider-plugin discovery. Keep executable callbacks, plugin runtimes and Host Services, session writers, permission promises, and other Control Plane handles out of the worker input. Model-facing tools are `ToolCatalog.Definition[]` only.
 
@@ -94,6 +96,14 @@ Treat streamed tool argument deltas as transport/progress data, not canonical to
 
 ## Verify and Document
 
+For retry changes, exercise raw runtime errors, nested causes, aggregate address failures, worker serialization, SDK admission, and session recovery. Reuse `provider/retry.ts` and the shared network classifier rather than domain-name or broad message matching. Keep one owner for each retry budget; preserve cancellation, permanent failures and recording errors. A model retry must end before tool dispatch can produce effects. Test both successful transient recovery and a post-dispatch failure that must not replay the model; for derived calls, exercise both stream-start and body errors against one caller-owned budget with SDK retries disabled. Verify that retry withdrawal removes failed text and unexecuted proposals from visible history and model context while preserving rollout events, failure status, and accounting. Shared provider recovery belongs before worker admission; test cancellation, bounded waits, one recovery probe, connection isolation, and stale-success/new-failure races.
+
+Classify by evidence strength, never by failure surface alone. The shared classifier's `transient`, `permanent`, `aborted`, and `indeterminate` kinds mean "retry may help", "deterministic failure", "cancelled", and "cause unknown but empirically transient". A mapped reason code (`CERT_HAS_EXPIRED`, `DEPTH_ZERO_SELF_SIGNED_CERT`, `ERR_TLS_CERT_ALTNAME_INVALID`, and similar) is deterministic and stays terminal; certificate verification wording **without** a reason code is `indeterminate` and earns a narrower budget. A runtime drops the reason code exactly when it cannot attribute a verification failure, so `undefined` from the classifier means "unrecognized" and must not silently become "permanent". When adding a certificate or TLS branch, place it after the `permanent` check, keep `aborted > permanent > (indeterminate | transient)` merge precedence, and test both the unmapped wording and every mapped code.
+
+Return the retry budget with the decision rather than relying on a global constant, so a narrower budget is explicit at the call site. Keep the classifier answering only the fact while each caller owns its budget: the session processor, `AgentCall`, and web fetch keep independent limits that must never multiply.
+
+Never relax TLS verification to work around an endpoint failure — no `rejectUnauthorized: false`, no auto-trusting an intercepted CA. When persisting failure evidence, record the endpoint **host only**, derived from the same connection-identity source as `providerRetryKey`. Provider keys are often embedded in the URL path, so reducing a URL to its pathname is not redaction; a regression test must assert no credential path reaches persisted metadata.
+
 1. Test the chosen lifecycle boundary as a behavior: no session for sessionless work; explicit child lineage and output for Cortex work.
 2. Run focused Agent protocol/worker, provider, session, Cortex, and permission tests, then typecheck and `quality:quick`.
 3. Update [LLM loop and compaction](../../../docs/architecture/llm-loop.md) when the shared call pipeline or path-selection contract changes.
@@ -107,3 +117,9 @@ Report why the operation is sessionless, existing-session, Cortex, or bootstrap;
 Capture provider service-tier metadata when available; unresolved nonstandard pricing must remain unknown. Preserve live authorization evidence before side effects and inherit task snapshots during request preparation, including independent non-chat operations.
 
 Public task cancellation must return after durable cancellation without waiting on held processors. Use explicit Cortex drainage for rollout finalization and runtime shutdown, and test both boundaries with controlled pending calls instead of timing sleeps.
+
+Historical derived retries must not append to a terminal source rollout. Use explicit operation ownership with source identity in metadata, while preserving the caller signal; reserve causal Session ownership for work still owned by the matching root. Test this under an ambient terminal rollout so accidental context inheritance fails.
+
+SDK usage fallback must not assign a call aggregate to each unmeasured transport retry. Test a failed attempt followed by a successful attempt with call usage, and preserve provider-specific cache inclusion and unknown cache-write counts when only SDK evidence remains.
+
+Verify SDK output inclusion against the locked adapter: Google and Vertex expose candidate output separately from thinking, unlike OpenAI. Test reported aggregates, separate components and missing components before labeling fallback totals complete.

@@ -145,12 +145,12 @@ For headless tasks, versioned experiment settings, durable execution evidence an
 
 ## Product Surfaces
 
-| Surface            | Purpose                                                                                                                               |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Web                | Primary workbench for sessions, project files, Browser, Notes, Library, Agenda, plugins, settings, and operational views.             |
-| Desktop            | Electron product with a managed packaged server, native Browser presentation, local folder selection, protocol handling, and updates. |
-| CLI                | Runtime management, one-off `send` execution, configuration, sessions, integrations, diagnostics, and development workflows.          |
-| Server API and SDK | Shared contract used by first-party clients and integrations.                                                                         |
+| Surface            | Purpose                                                                                                                                                         |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Web                | Primary workbench for sessions, project files, Browser, Notes, Library, Agenda, plugins, settings, and operational views.                                       |
+| Desktop            | Electron product with a managed packaged server, native Browser presentation, local folder selection, protocol handling, keep-awake while running, and updates. |
+| CLI                | Runtime management, one-off `send` execution, configuration, sessions, integrations, diagnostics, and development workflows.                                    |
+| Server API and SDK | Shared contract used by first-party clients and integrations.                                                                                                   |
 
 ## Develop Synergy
 
@@ -181,7 +181,7 @@ bun run quality:quick
 
 For programmatic experiments, `packages/harness` exposes the execution and lifecycle APIs, and `packages/runtime-local` supplies local tools, native execution and provider SDKs. `packages/cli` keeps the same `synergy` command with an injected runtime; the complete product composes optional capabilities in `packages/product-runtime`. See the [package map](docs/reference/packages.md) for build and installation checks.
 
-Local performance experiments use the [benchmark workspace](benchmark/README.md): fixed task subsets, frozen source revisions, paired variants and native rollout evidence. Start with `bun bench plan benchmark/configs/ab.yaml`.
+Local performance experiments use the [benchmark workspace](benchmark/README.md): independent harness/model matrices, frozen inputs, native rollout evidence and paired reports. Start with `bun bench plan benchmark/configs/ab.yaml`.
 
 Core runtime tests run from `packages/harness`:
 
@@ -259,3 +259,5 @@ Coding agents and LLM tools should begin with [llms.txt](llms.txt). Read [AGENTS
 Contributions, bug reports, and feature ideas are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), follow the [Code of Conduct](CODE_OF_CONDUCT.md), and use the repository's [security reporting process](.github/SECURITY.md) for vulnerabilities rather than opening a public issue.
 
 Synergy is open source under the [MIT License](LICENSE).
+
+Agent records use transactional SQLite by default, with an explicit PostgreSQL option. Binary evidence uses checksummed packs. Existing Home data upgrades through resumable migration. Eligible upgrades admit new work while history prepares in the background. Open old conversations on demand, or pause background preparation from the status bar. Preserve frozen originals and protected snapshot paths until the independent recovery backup is complete. See [Agent storage](docs/architecture/agent-storage.md) and [storage operations](docs/reference/storage-and-paths.md).

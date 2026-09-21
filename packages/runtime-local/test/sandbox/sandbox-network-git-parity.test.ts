@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test"
 import * as fs from "node:fs"
-import * as os from "node:os"
 import * as path from "node:path"
 import { buildPermissionProfile } from "@ericsanchezok/synergy-harness/sandbox/policy-engine"
 import {
@@ -8,6 +7,8 @@ import {
   defaultRuntimeReadRoots,
   gitProtectedSubpaths,
   macosPlatformReadRoots,
+  READ_DENY_PATHS,
+  readDenyHomeDirs,
 } from "@ericsanchezok/synergy-harness/sandbox/policy"
 import { MacBackend } from "../../src/sandbox/macos"
 import { MacOSPolicy } from "../../src/sandbox/macos-policy"
@@ -94,34 +95,32 @@ describe("sandbox network parity (PR #1308 follow-up)", () => {
     fs.unlinkSync(wrapper.tempPath!)
   })
 
-  test("linux helper profile binds /etc read-only only when networkMode is full", () => {
-    const full = LinuxBackend.prepare({
-      command: "/bin/sh",
-      args: ["-c", "true"],
-      workspace: WORKSPACE,
-      sandboxMode: "workspace_write",
-      forcePlatform: "linux",
-      forceHelperPath: "/bin/true",
-      forceHelperVerified: true,
-      networkMode: "full",
-    })
-    const restricted = LinuxBackend.prepare({
-      command: "/bin/sh",
-      args: ["-c", "true"],
-      workspace: WORKSPACE,
-      sandboxMode: "workspace_write",
-      forcePlatform: "linux",
-      forceHelperPath: "/bin/true",
-      forceHelperVerified: true,
-      networkMode: "restricted",
-    })
+  test("linux helper profile reaches network config paths under every network mode", () => {
+    const prepareFor = (networkMode: "full" | "restricted") =>
+      LinuxBackend.prepare({
+        command: "/bin/sh",
+        args: ["-c", "true"],
+        workspace: WORKSPACE,
+        sandboxMode: "workspace_write",
+        forcePlatform: "linux",
+        forceHelperPath: "/bin/true",
+        forceHelperVerified: true,
+        networkMode,
+      })
+    const full = prepareFor("full")
+    const restricted = prepareFor("restricted")
     expect(full.sandboxed).toBe(true)
     expect(restricted.sandboxed).toBe(true)
     const fullProfile = JSON.parse(fs.readFileSync(full.tempPath!, "utf8"))
     const restrictedProfile = JSON.parse(fs.readFileSync(restricted.tempPath!, "utf8"))
-    // /etc always exists on Linux; the remaining paths are existence-filtered.
-    expect(fullProfile.fileSystem.readableRoots).toContain("/etc")
-    expect(restrictedProfile.fileSystem.readableRoots).not.toContain("/etc")
+
+    // Reads are global under the deny-list model, so /etc/resolv.conf and the
+    // CA stores are reachable in every network mode rather than needing a
+    // per-mode bind. Network mode still selects the namespace/unshare policy.
+    expect(fullProfile.fileSystem.readableRoots).toEqual(["/"])
+    expect(restrictedProfile.fileSystem.readableRoots).toEqual(["/"])
+    expect(fullProfile.network.mode).toBe("full")
+    expect(restrictedProfile.network.mode).toBe("restricted")
     fs.unlinkSync(full.tempPath!)
     fs.unlinkSync(restricted.tempPath!)
   })
@@ -171,7 +170,7 @@ describe("sandbox read-root parity (PR #1308 follow-up)", () => {
     expect(roots).not.toContain("/private/tmp")
   })
 
-  test("deny-default wrapper exposes the /bin/sh selector path to the sandbox", () => {
+  test("deny-default profile grants reads globally instead of enumerating PATH_READ roots", () => {
     const wrapper = MacBackend.prepare({
       command: "/bin/sh",
       args: ["-c", "true"],
@@ -181,19 +180,18 @@ describe("sandbox read-root parity (PR #1308 follow-up)", () => {
     })
     try {
       const dArgs = wrapper.args.filter((arg) => /^PATH_READ_\d+=/.test(arg))
-      expect(dArgs.some((arg) => arg.endsWith("=/var/select") || arg.endsWith("=/private/var/select"))).toBe(true)
+      expect(dArgs).toHaveLength(0)
+      const sbpl = fs.readFileSync(wrapper.tempPath!, "utf8")
+      // The /bin/sh selector path and every other host path are covered by
+      // the global read allow — the read model is a deny list, not an
+      // enumeration of runtime read roots.
+      expect(sbpl).toContain("(allow file-read*)")
     } finally {
       MacBackend.cleanupTemp(wrapper.tempPath!)
     }
   })
 
-  test("deny-default profile stats readable-root ancestors for git path validation", () => {
-    const sbpl = MacOSPolicy.compileProfile(profile())
-    expect(sbpl).toContain("(allow file-read-metadata")
-    expect(sbpl).toContain('(allow file-read-metadata (literal "/Users")')
-  })
-
-  test("runtime user roots under the homedir are not defeated by sibling denies", () => {
+  test("deny-default profile denies reads only for credential and sensitive data paths", () => {
     if (process.platform !== "darwin") return
     const wrapper = MacBackend.prepare({
       command: "/bin/sh",
@@ -204,10 +202,31 @@ describe("sandbox read-root parity (PR #1308 follow-up)", () => {
     })
     const sbpl = fs.readFileSync(wrapper.tempPath!, "utf8")
     MacBackend.cleanupTemp(wrapper.tempPath!)
-    const homedir = os.homedir()
-    for (const root of DEFAULT_USER_RUNTIME_READ_ROOTS(homedir)) {
-      if (!fs.existsSync(root)) continue
-      expect(sbpl).not.toContain(`(deny file-read* (subpath "${root}"))`)
+    // macOS firmlinks the home to its /private/... spelling, so a compiled rule
+    // may carry either form; the protected relative location is the invariant.
+    const homes = readDenyHomeDirs().flatMap((home) => {
+      const canonical = home.replace(/\/+$/, "")
+      let resolved: string
+      try {
+        resolved = fs.realpathSync(canonical)
+      } catch {
+        resolved = canonical
+      }
+      return [canonical, resolved]
+    })
+    const expected = new Set(
+      readDenyHomeDirs().flatMap((home) =>
+        READ_DENY_PATHS(home).map((p) => p.slice(home.replace(/\/+$/, "").length + 1)),
+      ),
+    )
+    const denyLines = sbpl.split("\n").filter((line) => line.startsWith("(deny file-read*"))
+    expect(denyLines.length).toBeGreaterThan(0)
+    for (const line of denyLines) {
+      const match = line.match(/\(subpath "([^"]+)"\)/)
+      expect(match).not.toBeNull()
+      const home = homes.find((h) => match![1].startsWith(h + "/"))
+      expect(home).toBeDefined()
+      expect(expected.has(match![1].slice(home!.length + 1))).toBe(true)
     }
   })
 

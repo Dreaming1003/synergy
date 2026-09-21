@@ -1,3 +1,4 @@
+import { StorageConfiguration } from "../storage/config"
 import { Log } from "../util/log"
 import z from "zod"
 import { MAX_EXECUTION_CANCEL_GRACE_MS } from "@ericsanchezok/synergy-util/runtime-shutdown"
@@ -94,6 +95,10 @@ export const ObservabilityConfig = z
       .boolean()
       .optional()
       .describe("Enable local indexed observability events, spans, metrics, issues, and diagnostics (default: true)"),
+    logMirror: z
+      .boolean()
+      .optional()
+      .describe("Mirror debug/info records that opt in with `mirror: true` into indexed observability events"),
     retentionDays: z
       .number()
       .int()
@@ -170,7 +175,28 @@ export const ObservabilityConfig = z
               .boolean()
               .optional()
               .describe("Enable optional JSONL mirror files for debugging exports"),
-            maxSqliteBytes: z.number().int().positive().optional(),
+            maxSqliteBytes: z
+              .number()
+              .int()
+              .positive()
+              .optional()
+              .describe("Maximum bytes for the local observability database (default: 250MB)"),
+            retentionBytes: z
+              .number()
+              .int()
+              .positive()
+              .optional()
+              .describe(
+                "Maximum authoritative storage bytes before budgeted pruning may remove evidence older than the retention window (default: 40GB). A backstop above the window's steady state, not a target.",
+              ),
+            retentionMs: z
+              .number()
+              .int()
+              .min(0)
+              .optional()
+              .describe(
+                "Retain authoritative evidence for this long before budgeted pruning may remove it (default: 7 days, bounds 1 hour to 90 days; set 0 to disable). Pruning only runs while the database exceeds retentionBytes.",
+              ),
             walCheckpointIntervalMs: z.number().int().positive().optional(),
           })
           .strict()
@@ -397,6 +423,33 @@ export const CategoryConfig = z
   })
 export type CategoryConfig = z.infer<typeof CategoryConfig>
 
+export const AttachmentConfig = z
+  .object({
+    maxFiles: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Maximum number of prompt attachments per batch (default: 20)"),
+    maxFileBytes: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Maximum prompt attachment size in bytes per file (default: 209715200 = 200 MiB)"),
+    maxTotalBytes: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Maximum aggregate prompt attachment size in bytes per batch (default: 2147483648 = 2 GiB)"),
+  })
+  .strict()
+  .meta({
+    ref: "AttachmentConfig",
+  })
+export type AttachmentConfig = z.infer<typeof AttachmentConfig>
+
 export const Provider = ModelsDev.Provider.partial()
   .extend({
     profile: z
@@ -467,7 +520,11 @@ const CoreInfo = z
   .object({
     $schema: z.string().optional().describe("JSON schema reference for configuration validation"),
     logLevel: Log.Level.optional().describe("Log level"),
+    storage: StorageConfiguration.optional().describe(
+      "Global authoritative storage; backend changes require an explicit storage migration",
+    ),
     server: Server.optional().describe("Server configuration for synergy serve and web commands"),
+    attachment: AttachmentConfig.optional().describe("Prompt attachment upload limits (count and byte sizes)"),
     command: z.record(z.string(), Command).optional().describe("Command configuration"),
     timeout: z
       .object({
@@ -553,15 +610,20 @@ const CoreInfo = z
           .int()
           .positive()
           .max(64)
+          .nullable()
           .optional()
-          .describe("Maximum number of isolated Agent workers (default: min(4, available CPUs - 1), at least 1)"),
+          .describe(
+            "Maximum number of isolated Agent workers (default: derived from the effective memory limit, capped by available CPUs and 64, never below agentWorkerMinIdle). Pass null to clear the explicit ceiling and derive it from the machine.",
+          ),
         agentWorkerMinIdle: z
           .number()
           .int()
           .nonnegative()
           .max(64)
           .optional()
-          .describe("Minimum number of idle Agent workers kept warm (default: 0; cannot exceed agentWorkers)"),
+          .describe(
+            "Minimum number of idle Agent workers kept warm (default: 1 on resident servers, 0 for one-shot runs; cannot exceed agentWorkers)",
+          ),
         agentWorkerIdleTimeoutMs: z
           .number()
           .int()
@@ -766,55 +828,63 @@ const CoreInfo = z
       ),
     model: z
       .string()
-      .describe("Default model in the format of provider/model, eg anthropic/claude-sonnet-4-5")
+      .nullable()
+      .describe("Default model in the format of provider/model, eg anthropic/claude-sonnet-4-5. null clears the role")
       .optional(),
     nano_model: z
       .string()
+      .nullable()
       .describe(
-        "Cheapest model for trivial extraction tasks like title generation, in the format of provider/model. Falls back to mini_model → mid_model → model.",
+        "Cheapest model for trivial extraction tasks like title generation, in the format of provider/model. Falls back to mini_model → mid_model → model. null clears the role's model",
       )
       .optional(),
     mini_model: z
       .string()
+      .nullable()
       .describe(
-        "Lightweight model for simple tasks like intent extraction, in the format of provider/model. Falls back to mid_model → model.",
+        "Lightweight model for simple tasks like intent extraction, in the format of provider/model. Falls back to mid_model → model. null clears the role's model",
       )
       .optional(),
     mid_model: z
       .string()
+      .nullable()
       .describe(
-        "Mid-tier model for internal agents that need moderate reasoning (script extraction, reward evaluation, code exploration), in the format of provider/model. Falls back to the default model.",
+        "Mid-tier model for internal agents that need moderate reasoning (script extraction, reward evaluation, code exploration), in the format of provider/model. Falls back to the default model. null clears the role's model",
       )
       .optional(),
     thinking_model: z
       .string()
+      .nullable()
       .describe(
-        "Deep thinking model for complex reasoning and architecture tasks, in the format of provider/model. Falls back to the default model if not set.",
+        "Deep thinking model for complex reasoning and architecture tasks, in the format of provider/model. Falls back to the default model if not set. null clears the role's model",
       )
       .optional(),
     long_context_model: z
       .string()
+      .nullable()
       .describe(
-        "Model with extra-large context window for processing very long inputs, in the format of provider/model. Falls back to the default model if not set.",
+        "Model with extra-large context window for processing very long inputs, in the format of provider/model. Falls back to the default model if not set. null clears the role's model",
       )
       .optional(),
     creative_model: z
       .string()
+      .nullable()
       .describe(
-        "Model for creative and visual tasks (UI design, writing, artistry), in the format of provider/model. Falls back to the default model if not set.",
+        "Model for creative and visual tasks (UI design, writing, artistry), in the format of provider/model. Falls back to the default model if not set. null clears the role's model",
       )
       .optional(),
     vision_model: z
       .string()
+      .nullable()
       .describe(
-        "Model for separate image analysis via the look_at tool, in the format of provider/model. If not set, look_at is disabled. Direct current-model image context uses view_image based on the active model capability.",
+        "Model for separate image analysis via the look_at tool, in the format of provider/model. If not set, look_at is disabled. Direct current-model image context uses view_image based on the active model capability. null clears the role's model",
       )
       .optional(),
     role_variant: z
-      .record(z.string(), z.string())
+      .record(z.string(), z.string().nullable())
       .optional()
       .describe(
-        "Default variant (e.g. low, medium, high, xhigh) applied per model role. Requires the resolved model to support the named variant.",
+        "Default variant (e.g. low, medium, high, xhigh) applied per model role. Requires the resolved model to support the named variant. A null value clears the role's variant",
       ),
     default_agent: z
       .string()
@@ -846,6 +916,18 @@ const CoreInfo = z
     sandbox: SandboxConfig.optional().describe("Sandbox configuration for workspace boundary enforcement"),
     observability: ObservabilityConfig.optional().describe("Local logs, indexed telemetry, and diagnostics settings"),
     controlProfile: ControlProfileId.optional().describe("Default control profile applied to all agents"),
+    nonInteractiveControlProfile: z
+      .enum(["autonomous", "full_access"])
+      .optional()
+      .describe(
+        "Control profile for sessions created by non-interactive sources (Channels and Agenda) that have no explicit profile of their own. Default: autonomous. Changes apply to sessions created after the change; an existing bound Channel session keeps the profile it was created with.",
+      ),
+    fullAccessAcknowledged: z
+      .boolean()
+      .optional()
+      .describe(
+        "Records that the human accepted the risk of running with Full Access. Set by the confirmation dialog when Full Access is enabled from the UI; it is an awareness record, not a security boundary.",
+      ),
     instructions: z.array(z.string()).optional().describe("Additional instruction files or patterns to include"),
     project_doc_fallback_filenames: z
       .array(z.string())

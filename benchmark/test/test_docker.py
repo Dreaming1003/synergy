@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import shutil
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -123,6 +125,8 @@ def prepared_fixture(tmp_path_factory: pytest.TempPathFactory):
     config = {
         "version": 1,
         "suite": "suite.json",
+        "timeout_seconds": "native",
+        "resources": {"cache_budget_gib": 10, "min_free_disk_gib": 2} if os.environ.get("CI") == "true" else {},
         "cache": str(BENCHMARK.parent / ".artifacts/benchmark/cache"),
         "output": str(BENCHMARK.parent / ".artifacts/benchmark/integration"),
         "variants": {
@@ -156,8 +160,6 @@ def test_real_synergy_paired_rollout(prepared_fixture) -> None:
 
 
 def assert_retained_credentials_absent(root: Path) -> None:
-    import zipfile
-
     sentinel = b"deterministic-local-fixture"
     for evidence_file in root.glob("trials/*/attempt-*/evidence.json"):
         evidence = read_json(evidence_file)
@@ -172,10 +174,13 @@ def assert_retained_credentials_absent(root: Path) -> None:
 
 
 def primary_attempts(root: Path):
-    for call in root.glob("trials/*/attempt-*/*/agent/home/.synergy/data/sessions/*/*/rollout/runs/*/calls/*.json"):
-        if read_json(call)["purpose"] == "synergy":
-            for attempt in (call.parent.parent / "attempts" / call.stem).glob("*.json"):
-                yield read_json(attempt)
+    for file in root.glob("trials/*/attempt-*/*/agent/rollout.zip"):
+        with zipfile.ZipFile(file) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["format"] == "synergy-rollout" and manifest["version"] == 1
+        for snapshot in manifest["snapshots"]:
+            calls = {call["id"] for call in snapshot["calls"] if call["purpose"] == "synergy"}
+            yield from (attempt for attempt in snapshot["attempts"] if attempt["callID"] in calls)
 
 
 @pytest.mark.parametrize("mode", ["long", "disconnect", "timeout", "cancel", "docker-stop"])
@@ -216,17 +221,7 @@ def test_faults_preserve_terminal_evidence_and_cleanup(prepared_fixture, mode: s
                 )
                 assert len(containers.splitlines()) == 1
                 container = containers.strip()
-                probe = """
-import json
-from pathlib import Path
-observed = False
-for call in Path('/logs/agent/home').glob('.synergy/data/sessions/*/*/rollout/runs/*/calls/*.json'):
-    if json.loads(call.read_text())['purpose'] != 'synergy':
-        continue
-    for file in (call.parent.parent / 'attempts' / call.stem).glob('*.json'):
-        observed |= (json.loads(file.read_text()).get('response') or {}).get('bytes', 0) > 0
-print(observed)
-"""
+                probe = (BENCHMARK / "test/fixtures/rollout_progress.py").read_text()
                 while (
                     await asyncio.to_thread(
                         command, ["docker", "exec", "--user", "0", container, "python", "-c", probe]

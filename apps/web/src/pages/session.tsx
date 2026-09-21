@@ -1,3 +1,4 @@
+import { SessionPreparation } from "@/components/session/session-preparation"
 import type { PluginComposerLayoutService } from "@ericsanchezok/synergy-plugin"
 import { StatusBar } from "@/components/status-bar"
 import { NewSessionGreeting } from "@/components/session/session-new-view"
@@ -145,7 +146,9 @@ export default function Page() {
       <ResourceOpenProvider>
         <PromptProvider>
           <BuiltinWorkbenchPanelsProvider>
-            <SessionPageContent />
+            <SessionPreparation>
+              <SessionPageContent />
+            </SessionPreparation>
           </BuiltinWorkbenchPanelsProvider>
         </PromptProvider>
       </ResourceOpenProvider>
@@ -748,10 +751,11 @@ function SessionPageContent() {
   createEffect(() => {
     const sessionID = params.id
     const entry = visibleSessionTransitionEntry()
-    if (!sessionID || entry?.progress.phase !== "loading" || !entry.handoff) return
+    if (!sessionID || !entry?.handoff) return
     const acceptedAt = entry.handoff.acceptedAt ?? Date.now()
     const decision = decideSessionTransitionHandoff({
       messageID: entry.handoff.messageID,
+      phase: entry.progress.phase,
       messages: messages(),
       // Explicit exemption: same undefined-loading semantics as above.
       inbox: sync.data.inbox[sessionID],
@@ -931,6 +935,8 @@ function SessionPageContent() {
           connected: sdk.connected(),
           ready: sync.ready,
           reconnectVersion: sync.reconnectVersion,
+          historyID: rollback()?.id,
+          canUnrollback: rollbackActive(),
         }),
       (current, prev) => {
         const [id] = current
@@ -942,7 +948,13 @@ function SessionPageContent() {
         // Protect the viewed session's buckets from LRU eviction.
         sync.markActiveSession(id)
         if (!id || !shouldRunSessionSync(current, prev)) return
-        void sync.session.sync(id, { refreshVolatile: true }).catch(() => undefined)
+        const historyChanged = prevId === id && (prev?.[4] !== current[4] || prev?.[5] !== current[5])
+        void sync.session
+          .sync(id, {
+            refreshVolatile: true,
+            ...(historyChanged ? { trigger: { type: "history-transition" as const } } : {}),
+          })
+          .catch(() => undefined)
       },
     ),
   )
@@ -974,7 +986,8 @@ function SessionPageContent() {
         next: working.next,
       }
     }
-    if (working?.status === "recovering") return { type: "recovering" }
+    if (working?.status === "recovering")
+      return { type: "recovering", reason: working.reason, description: working.description }
     return runtimeStatus ?? idle
   })
 

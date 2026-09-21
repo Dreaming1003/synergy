@@ -27,8 +27,10 @@ import { SessionBounds } from "./bounds"
 import { SessionToolInput } from "./tool-input"
 import { Scope } from "../scope"
 import { ScopeContext } from "../scope/context"
-import { EnforcementGate, type Capability, type GateOptions } from "../enforcement/gate"
+import { EnforcementGate, type Capability, type GateOptions, type SandboxContainment } from "../enforcement/gate"
 import { SandboxHost } from "../sandbox/host"
+import { approvablePath, formatExplanationForModel } from "../sandbox/explain"
+import { SandboxSessionApproval } from "../sandbox/session-approval"
 import type { BashSandboxPrepare } from "../tool/bash-contract"
 import type { ResolvedProfile } from "../control-profile/types"
 import { EnforcementError } from "../enforcement/errors"
@@ -48,6 +50,8 @@ import { SessionToolContext } from "./tool-context"
 import type { ToolCatalog } from "./tool-catalog"
 import { ToolExecutor } from "./tool-executor"
 import type { ToolExecutorKind } from "./tool-scheduler"
+import { SecretMask } from "../secrets/mask"
+import { SecretResolve } from "../secrets/resolve"
 
 export namespace ToolResolver {
   const log = Log.create({ service: "tool.resolver" })
@@ -252,8 +256,7 @@ export namespace ToolResolver {
 
   function permissionForGateCapability(toolName: string, className: string): string {
     if (className === "file_external_read" || className === "file_external_write") return "external_directory"
-    if (className === "shell_read" || className === "shell_remote_publish" || className === "shell_remote_write")
-      return "bash"
+    if (className === "shell_remote_publish" || className === "shell_remote_write") return "bash"
     if (className === "shell_destructive") return "bash"
     if (className === "network_request") return toolName === "webfetch" ? toolName : "network_request"
     return className
@@ -282,16 +285,47 @@ export namespace ToolResolver {
     ;(ctx.extra as any).shellBypassSandbox = true
   }
 
+  /** The resolver already decided this call's authorization. */
+  function markShellAuthorizationResolved(ctx: Tool.Context) {
+    ;(ctx.extra as any).shellAuthorizationResolved = true
+  }
+
+  /**
+   * Record a shell authorization outcome for the execution layer.
+   *
+   * Two separate questions used to share the `shellBypassSandbox` flag, which is
+   * what blocked authorization from following containment: the bash tool asked
+   * for its own approval unless the sandbox was bypassed, so the only way to
+   * stop it re-asking was to also switch the sandbox off.
+   *
+   * - `shellAuthorizationResolved` answers "may the tool ask again?" — never,
+   *   because the resolver already decided.
+   * - `shellBypassSandbox` answers "does this run without the sandbox?" — only
+   *   when the sandbox is not what justified the decision. A contained call
+   *   keeps its sandbox: the kernel is the boundary that authorized it.
+   */
+  function applyShellAuthorization(ctx: Tool.Context, profileId: string, containment?: SandboxContainment) {
+    markShellAuthorizationResolved(ctx)
+    if (containment?.contained === true) return
+    if (profileId !== "autonomous") markShellSandboxBypass(ctx)
+  }
+
+  /**
+   * A user or profile approval already crossed the shell boundary for this
+   * call, so the tool must not ask again and the historical behavior — an
+   * interactively approved shell command runs without the sandbox — is
+   * preserved.
+   */
   function rememberShellApproval(ctx: Tool.Context, permission: string, metadata: Record<string, unknown>) {
     const capability = String(metadata.capability ?? "")
     if (
       permission === "bash" ||
       capability === "shell" ||
-      capability === "shell_read" ||
       capability === "shell_remote_publish" ||
       capability === "shell_remote_write" ||
       capability === "shell_destructive"
     ) {
+      markShellAuthorizationResolved(ctx)
       markShellSandboxBypass(ctx)
     }
   }
@@ -300,6 +334,52 @@ export namespace ToolResolver {
     const roots = patterns.filter((pattern) => pattern.startsWith("/"))
     if (roots.length === 0) return
     ;(ctx.extra as any).approvedExternalRoots = [...new Set([...approvedExternalRoots(ctx), ...roots])]
+  }
+
+  interface ShellContainment {
+    verdict: SandboxContainment
+    release(): void
+  }
+
+  /**
+   * Ask the sandbox host whether it will contain this bash call, before the
+   * authorization decision is made.
+   *
+   * Authorization follows containment: the gate cannot decide a shell command
+   * while assuming containment it may not get. The verdict is therefore
+   * produced first, from the same host preparation execution uses, and handed
+   * to the gate. Only the containment verdict is needed here — the sandbox
+   * cannot be asked about the command's reach, and its availability is a
+   * property of the platform and helper, not of the command text or roots — so
+   * the prepared wrapper is released as soon as the decision is known and the
+   * execution path prepares its own with the materialized command.
+   *
+   * `release` uses the host's existing cleanup contract rather than a second
+   * one, which is what keeps a refused call from leaving its temporary profile
+   * behind.
+   */
+  function prepareShellContainment(input: {
+    gate: Awaited<ReturnType<typeof EnforcementGate.create>>
+    ctx: Tool.Context
+    workspace: string
+    command: string
+  }): ShellContainment | undefined {
+    const sandbox = input.gate.getSandbox()
+    if (sandbox.mode === "none" || shouldBypassShellSandbox(input.ctx)) return undefined
+    const wrapper = SandboxHost.prepareWrapper({
+      command: "/bin/sh",
+      args: ["-c", input.command],
+      workspace: input.workspace,
+      sandboxMode: sandbox.mode,
+      backend: sandbox.backend,
+    })
+    return {
+      verdict: {
+        contained: wrapper.sandboxed && !wrapper.skipReason,
+        ...(wrapper.skipReason ? { skipReason: wrapper.skipReason } : {}),
+      },
+      release: () => SandboxHost.cleanupWrapper(wrapper),
+    }
   }
 
   interface ToolTiming {
@@ -666,7 +746,7 @@ export namespace ToolResolver {
       // static classification cannot see (variable redirect targets) are still
       // contained at execution time. Guarded/full_access keep the historical
       // bypass for user-approved interactive work.
-      if (toolName === "bash" && profile.profileId !== "autonomous") markShellSandboxBypass(ctx)
+      if (toolName === "bash") applyShellAuthorization(ctx, profile.profileId, envelope.containment)
       return
     }
 
@@ -707,7 +787,7 @@ export namespace ToolResolver {
           source: "user",
           reason: `Allowed by user rule: ${ruleDecision.rule?.permission}(${ruleDecision.rule?.pattern})`,
         })
-        if (toolName === "bash") markShellSandboxBypass(ctx)
+        if (toolName === "bash") applyShellAuthorization(ctx, profile.profileId, envelope.containment)
         return
       }
       // ask → fall through to Smart allow / gateOwnedAsks; deny → Smart allow or policy denial.
@@ -735,7 +815,7 @@ export namespace ToolResolver {
             source: "smart_allow",
             reason: `Auto-allowed by Smart allow: ${classification!.reason} (confidence ${classification!.confidence.toFixed(2)})`,
           })
-          if (toolName === "bash") markShellSandboxBypass(ctx)
+          if (toolName === "bash") applyShellAuthorization(ctx, profile.profileId, envelope.containment)
           return
         }
         if (classification) {
@@ -757,7 +837,10 @@ export namespace ToolResolver {
         smartAllow = { skipped: true, reason: "Non-bypassable capability" }
       }
       await setApprovalMetadata(ctx, { ...metadata, reason: diagnosticReason, ...(smartAllow ? { smartAllow } : {}) })
-      throw new EnforcementError.PolicyDenied(diagnosticReason, decision.capabilities, envelope.profileId)
+      throw new EnforcementError.PolicyDenied(diagnosticReason, decision.capabilities, envelope.profileId, {
+        permanent: envelope.refusal?.permanent ?? true,
+        guidance: envelope.refusal?.guidance,
+      })
     }
 
     if (profile.profileId === "autonomous" && decision.action === "ask") {
@@ -770,7 +853,10 @@ export namespace ToolResolver {
         smartAllow = { skipped: true, reason: "Non-bypassable capability" }
       }
       await setApprovalMetadata(ctx, { ...metadata, reason: diagnosticReason, ...(smartAllow ? { smartAllow } : {}) })
-      throw new EnforcementError.PolicyDenied(diagnosticReason, decision.capabilities, envelope.profileId)
+      throw new EnforcementError.PolicyDenied(diagnosticReason, decision.capabilities, envelope.profileId, {
+        permanent: envelope.refusal?.permanent ?? true,
+        guidance: envelope.refusal?.guidance,
+      })
     }
 
     // Pre-authorization origin: sessions created by system scheduling (e.g. agenda wake)
@@ -784,7 +870,7 @@ export namespace ToolResolver {
         source: "provenance",
         reason: `Pre-authorized by system scheduling (session inherits trust from agenda wake)`,
       })
-      if (toolName === "bash") markShellSandboxBypass(ctx)
+      if (toolName === "bash") applyShellAuthorization(ctx, profile.profileId, envelope.containment)
       return
     }
 
@@ -824,22 +910,80 @@ export namespace ToolResolver {
     }
   }
 
-  function formatErrorForModel(error: unknown): string {
+  function controlProfileForContext(ctx: Tool.Context | undefined): string | undefined {
+    const profileId = (ctx?.extra as { controlProfile?: unknown } | undefined)?.controlProfile
+    return typeof profileId === "string" && profileId.length > 0 ? profileId : undefined
+  }
+
+  /**
+   * Ask the user to approve the exact path a sandbox denial named, then carry
+   * that approval into later tool calls.
+   *
+   * A sandbox denial happens while the command is already running, so the
+   * denied path never reached the gate's own ask pass. `guarded` is the only
+   * profile that may prompt: `autonomous` stays fail-closed and `full_access`
+   * never reaches a sandbox at all. Only an outside-the-write-roots boundary is
+   * approvable — a blocked read is not something the profile ruleset turns into
+   * a real prompt, so promising it would be dishonest. The approval is
+   * remembered for the session and re-seeded into the sandbox roots of the next
+   * call, so retrying the same command succeeds instead of being denied again.
+   */
+  async function requestSandboxDenialApproval(
+    error: EnforcementError.SandboxBlocked,
+    ctx: Tool.Context,
+    input: Input,
+  ): Promise<void> {
+    if (controlProfileForContext(ctx) !== "guarded") return
+    const target = approvablePath(error.explanation)
+    if (!target || target.access !== "write") return
+
+    try {
+      await ctx.ask({
+        permission: "external_directory",
+        patterns: [target.path],
+        metadata: {
+          nonBypassable: true,
+          capability: "file_external_write",
+          workspaceBoundary: true,
+          outsideWorkspace: true,
+          sandboxDeniedPath: target.path,
+          sandboxDeniedAccess: target.access,
+        },
+      })
+    } catch (approvalError) {
+      log.debug("sandbox denial path not approved", {
+        sessionID: input.sessionID,
+        path: target.path,
+        access: target.access,
+        error: errorMessage(approvalError),
+      })
+      return
+    }
+
+    SandboxSessionApproval.remember(input.session?.id ?? ctx.sessionID, target.path, target.access)
+    ;(ctx.extra as any).sandboxDeniedApproved = target
+    log.info("sandbox denial path approved", {
+      sessionID: input.sessionID,
+      path: target.path,
+      access: target.access,
+    })
+  }
+
+  function formatErrorForModel(error: unknown, ctx?: Tool.Context): string {
     if (error instanceof ToolDiagnosticError) {
       return error.message
     }
 
     if (error instanceof EnforcementError.PolicyDenied) {
-      return [
-        `Permission denied by profile "${error.profileId}".`,
-        `Blocked capabilities: ${error.capabilities.join(", ")}`,
-        `This is a policy restriction. Do not retry the same approach.`,
-        error.message,
-      ].join("\n")
+      return error.modelMessage
     }
 
     if (error instanceof EnforcementError.SandboxBlocked) {
-      return error.message
+      return formatExplanationForModel(error.explanation, {
+        controlProfile: controlProfileForContext(ctx),
+        approved: ((ctx?.extra as any)?.sandboxDeniedApproved as { path: string; access: "read" | "write" }) ?? null,
+        message: error.message,
+      })
     }
 
     if (error instanceof EnforcementError.BoundaryHit) {
@@ -1456,7 +1600,30 @@ export namespace ToolResolver {
                   workspaceType: workspaceInfo?.type ?? "scope",
                 })
 
-                const envelope = await gate.evaluateIsolated(item.id, args as Record<string, any>, ctx.abort)
+                // Containment is known before authorization: the wrapper is
+                // prepared first, its verdict decides the `shell` capability,
+                // and a call the sandbox refuses to wrap falls back to the
+                // ordinary capability flow instead of being allowed as if it
+                // were contained.
+                const containment =
+                  item.id === "bash"
+                    ? prepareShellContainment({ gate, ctx, workspace, command: String(args.command ?? "") })
+                    : undefined
+                let envelope: ReturnType<Awaited<ReturnType<typeof EnforcementGate.create>>["evaluate"]>
+                try {
+                  envelope = await gate.evaluateIsolated(
+                    item.id,
+                    args as Record<string, any>,
+                    ctx.abort,
+                    containment?.verdict,
+                  )
+                } finally {
+                  // The verdict is already carried by the envelope and the
+                  // execution path prepares the wrapper it actually runs, so
+                  // release here — on refusal and on success alike — through
+                  // the host's existing cleanup contract.
+                  containment?.release()
+                }
                 await RolloutTool.authorize({ stage: "evaluated", profile: gate.getProfileInfo(), envelope })
                 const modeDiagnostic = SessionModePolicy.evaluateCall({
                   toolName: item.id,
@@ -1497,11 +1664,16 @@ export namespace ToolResolver {
                 if (item.id === "bash") {
                   const sandbox = gate.getSandbox()
                   if (sandbox.mode !== "none" && !shouldBypassShellSandbox(ctx)) {
-                    // Register externally-approved roots into the gate so the
-                    // policy engine can aggregate them with auto-approved paths.
-                    const extRoots = approvedExternalRoots(ctx)
-                    if (extRoots.length > 0) {
-                      gate.registerApprovedPaths(extRoots, extRoots, false)
+                    // Register externally-approved roots, plus the paths the
+                    // user approved for this session after a sandbox denial,
+                    // so the policy engine aggregates them with auto-approved
+                    // paths and a retry finds them inside the sandbox roots.
+                    const sessionKey = runtimeInput.session?.id ?? ctx.sessionID
+                    const sessionReads = SandboxSessionApproval.readPaths(sessionKey)
+                    const sessionWrites = SandboxSessionApproval.writePaths(sessionKey)
+                    const extRoots = [...new Set([...approvedExternalRoots(ctx), ...sessionReads])]
+                    if (extRoots.length > 0 || sessionWrites.length > 0) {
+                      gate.registerApprovedPaths(extRoots, [...new Set([...extRoots, ...sessionWrites])], false)
                     }
                     const sandboxPolicy = gate.getSandboxPolicy()
                     const sandboxPrepare: BashSandboxPrepare = async (input) => {
@@ -1562,9 +1734,19 @@ export namespace ToolResolver {
                 )
                 await toolTrace.phase("plugin.runtime.before.end", "plugin before end")
                 await toolTrace.phase("tool.execute.start", "tool execute start")
-                const result = await settleExecutionOnAbort(() => item.execute(args, toolCtx), combinedAbort)
-                await RolloutTool.capture(result)
+                // Secret boundary: tokens resolve into an execution-only args
+                // copy (the durable args stay tokenized), the bash secret
+                // environment rides toolCtx.extra, and the settled result is
+                // masked before rollout capture, plugins, and persistence.
+                const secrets = await SecretResolve.transformArgs(args, {
+                  sessionID: ctx.sessionID,
+                  tool: item.id,
+                })
+                if (secrets.secretEnv) (toolCtx.extra ??= {}).secretEnv = secrets.secretEnv
+                const executed = await settleExecutionOnAbort(() => item.execute(secrets.args, toolCtx), combinedAbort)
+                const result = (await SecretMask.transformResult(executed, combinedAbort)) as typeof executed
                 Tool.validateAttachmentResult(item.id, result)
+                await RolloutTool.capture(result)
                 await toolTrace.phase("tool.execute.end", "tool execute end", {
                   outputChars: result.output.length,
                   attachmentCount: result.attachments?.length ?? 0,
@@ -1607,6 +1789,7 @@ export namespace ToolResolver {
                 return result
               } catch (error) {
                 if (error instanceof EnforcementError.SandboxBlocked) {
+                  await requestSandboxDenialApproval(error, ctx, runtimeInput)
                   await setApprovalMetadata(ctx, {
                     status: "sandbox_blocked",
                     source: "sandbox",
@@ -1632,7 +1815,7 @@ export namespace ToolResolver {
                   owner: "builtin",
                 })
                 RolloutTool.afterCommit(() =>
-                  slot.fail(args, formatErrorForModel(error), metadataForError(error, approvalFromContext(ctx))),
+                  slot.fail(args, formatErrorForModel(error, ctx), metadataForError(error, approvalFromContext(ctx))),
                 )
                 log.warn("tool.execute.callback.failed", {
                   tool: item.id,
@@ -1794,10 +1977,18 @@ export namespace ToolResolver {
                   await toolTrace.phase("plugin.runtime.before.end", "plugin before end")
 
                   await toolTrace.phase("tool.execute.start", "tool execute start")
+                  // Secret boundary, same ordering as the builtin path:
+                  // resolve into an execution-only args copy and mask the raw
+                  // result before rollout capture so artifacts stay tokenized.
+                  const mcpSecrets = await SecretResolve.transformArgs(args as Record<string, any>, {
+                    sessionID: ctx.sessionID,
+                    tool: key,
+                  })
                   const rawResult = await settleExecutionOnAbort(
-                    () => execute(args, { ...opts, abortSignal: combinedAbort }),
+                    () => execute(mcpSecrets.args as Record<string, any>, { ...opts, abortSignal: combinedAbort }),
                     combinedAbort,
                   )
+                  await SecretMask.transformResult(rawResult as Record<string, any>, combinedAbort)
                   await RolloutTool.capture(rawResult)
                   let result = ToolMcpSource.get()!.normalizeResult(rawResult)
                   await toolTrace.phase("tool.execute.end", "tool execute end", {
@@ -1897,7 +2088,7 @@ export namespace ToolResolver {
                     owner: "mcp",
                   })
                   RolloutTool.afterCommit(() =>
-                    slot.fail(args, formatErrorForModel(error), metadataForError(error, approvalFromContext(ctx))),
+                    slot.fail(args, formatErrorForModel(error, ctx), metadataForError(error, approvalFromContext(ctx))),
                   )
                   log.warn("tool.execute.callback.failed", {
                     tool: key,
@@ -1972,11 +2163,20 @@ export namespace ToolResolver {
     } as AITool
   }
 
-  export async function resolveWithAvailability(input: Input): Promise<ResolvedTools> {
+  /**
+   * Resolve execution tools from an availability result. Callers that already
+   * hold one for this round (the turn loop resolves definitions while it
+   * assembles the prompt) pass it as `prepared` so the registry, MCP, and
+   * ephemeral sources are collected once per round instead of twice. The
+   * `availability` and `resolveWithAvailability` timing spans stay in place:
+   * the caller still measures collection, and this function still measures
+   * resolution.
+   */
+  export async function resolveWithAvailability(input: Input, prepared?: Availability): Promise<ResolvedTools> {
     using _ = log.time("resolveWithAvailability")
     const executionTools: Record<string, AITool> = {}
     const executorKinds: Record<string, ToolExecutorKind> = {}
-    const availabilityResult = await availability(input)
+    const availabilityResult = prepared ?? (await availability(input))
     const activeToolIDs = availabilityResult.visible.map((item) => item.id)
     const runtimeInput = { ...input, activeToolIDs }
 

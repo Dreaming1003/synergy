@@ -200,6 +200,8 @@ import type {
   ExperimentFile,
   FormatterStatusErrors,
   FormatterStatusResponses,
+  GlobalActivityErrors,
+  GlobalActivityResponses,
   GlobalAgendaListErrors,
   GlobalAgendaListResponses,
   GlobalDisposeErrors,
@@ -220,6 +222,8 @@ import type {
   GlobalPathsGetResponses,
   GlobalSessionSearchErrors,
   GlobalSessionSearchResponses,
+  GlobalSessionStatusesErrors,
+  GlobalSessionStatusesResponses,
   GlobalStatsGetErrors,
   GlobalStatsGetResponses,
   GlobalStatsProgressErrors,
@@ -549,6 +553,8 @@ import type {
   RegistryRefreshResponses,
   RewardsInfo,
   RolloutArtifactRef,
+  RuntimeAgentWorkersErrors,
+  RuntimeAgentWorkersResponses,
   RuntimeReloadErrors,
   RuntimeReloadResponses,
   RuntimeReloadScope,
@@ -571,6 +577,21 @@ import type {
   ScopeRuntimeDisposeResponses,
   ScopeUpdateErrors,
   ScopeUpdateResponses,
+  SecretCreateInput,
+  SecretPolicyInput,
+  SecretRotateInput,
+  SecretsCreateErrors,
+  SecretsCreateResponses,
+  SecretsHistoryErrors,
+  SecretsHistoryResponses,
+  SecretsListErrors,
+  SecretsListResponses,
+  SecretsRemoveErrors,
+  SecretsRemoveResponses,
+  SecretsRotateErrors,
+  SecretsRotateResponses,
+  SecretsUpdatePolicyErrors,
+  SecretsUpdatePolicyResponses,
   ServerUpdateStartInput,
   SessionAbortErrors,
   SessionAbortResponses,
@@ -666,6 +687,12 @@ import type {
   SkillReloadResponses,
   SkillRemoveErrors,
   SkillRemoveResponses,
+  StorageControlUpgradeErrors,
+  StorageControlUpgradeResponses,
+  StoragePrepareSessionErrors,
+  StoragePrepareSessionResponses,
+  StorageRetrySessionErrors,
+  StorageRetrySessionResponses,
   StorageSnapshotCleanErrors,
   StorageSnapshotCleanInput,
   StorageSnapshotCleanResponses,
@@ -677,6 +704,12 @@ import type {
   StorageSnapshotMigrateResponses,
   StorageSnapshotUsageErrors,
   StorageSnapshotUsageResponses,
+  StorageUpgradeCatalogErrors,
+  StorageUpgradeCatalogResponses,
+  StorageUpgradeSessionErrors,
+  StorageUpgradeSessionResponses,
+  StorageUpgradeStatusErrors,
+  StorageUpgradeStatusResponses,
   SynergyLinkTargetCreateErrors,
   SynergyLinkTargetCreateInput,
   SynergyLinkTargetCreateResponses,
@@ -864,7 +897,7 @@ export class Stats extends HeyApiClient {
   /**
    * Get stats snapshot
    *
-   * Get the full stats snapshot after incrementally refreshing changed session and rollout records. Use ?recompute=true to force a full recompute from scratch.
+   * Read the last computed stats snapshot without scanning history; null means no snapshot exists. Use the progress stream to refresh, or ?recompute=true to force a full recompute.
    */
   public get<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -883,7 +916,7 @@ export class Stats extends HeyApiClient {
   /**
    * Stream stats recompute progress
    *
-   * Force a stats recompute and stream progress updates over SSE until the final snapshot is ready.
+   * Refresh changed statistics and stream progress updates until the final snapshot is ready. Concurrent refreshes share one computation.
    */
   public progress<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).sse.get<
@@ -1957,6 +1990,19 @@ export class Session extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  /**
+   * Global session status
+   *
+   * Retrieve the runtime status of every non-idle session across all scopes, including recovered workflow sessions that no status event publishes.
+   */
+  public statuses<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<
+      GlobalSessionStatusesResponses,
+      GlobalSessionStatusesErrors,
+      ThrowOnError
+    >({ url: "/global/session/status", ...options })
   }
 
   /**
@@ -3816,6 +3862,18 @@ export class Global extends HeyApiClient {
     })
   }
 
+  /**
+   * Get global activity
+   *
+   * Report whether any session or background job is currently working. Non-idle runtimes in this process (busy, retry, recovering) and in-flight loop background jobs both count; a session still queued for recovery after a restart counts once it begins executing. Read-only and served from memory; clients that must not let the machine idle poll this endpoint.
+   */
+  public activity<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<GlobalActivityResponses, GlobalActivityErrors, ThrowOnError>({
+      url: "/global/activity",
+      ...options,
+    })
+  }
+
   paths = new Paths({ client: this.client })
 
   filesystem = new Filesystem({ client: this.client })
@@ -4417,6 +4475,144 @@ export class Snapshot extends HeyApiClient {
 }
 
 export class Storage extends HeyApiClient {
+  /**
+   * Get historical data upgrade progress
+   *
+   * The runtime is ready for new work. Historical Sessions are admitted individually after migration and recovery.
+   */
+  public upgradeStatus<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<
+      StorageUpgradeStatusResponses,
+      StorageUpgradeStatusErrors,
+      ThrowOnError
+    >({ url: "/global/storage/upgrade", ...options })
+  }
+
+  /**
+   * List unresolved historical Sessions
+   */
+  public upgradeCatalog<ThrowOnError extends boolean = false>(
+    parameters?: {
+      scopeID?: string
+      after?: [string, string, string, string]
+      limit?: number
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "scopeID" },
+            { in: "query", key: "after" },
+            { in: "query", key: "limit" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      StorageUpgradeCatalogResponses,
+      StorageUpgradeCatalogErrors,
+      ThrowOnError
+    >({
+      url: "/global/storage/upgrade/sessions",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Pause or resume background history preparation
+   */
+  public controlUpgrade<ThrowOnError extends boolean = false>(
+    parameters?: {
+      action?: "pause" | "resume"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "action" }] }])
+    return (options?.client ?? this.client).post<
+      StorageControlUpgradeResponses,
+      StorageControlUpgradeErrors,
+      ThrowOnError
+    >({
+      url: "/global/storage/upgrade/control",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get historical Session preparation status
+   */
+  public upgradeSession<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).get<
+      StorageUpgradeSessionResponses,
+      StorageUpgradeSessionErrors,
+      ThrowOnError
+    >({
+      url: "/global/storage/upgrade/sessions/{sessionID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Prioritize historical Session preparation
+   *
+   * Returns immediately. Poll status; leaving the page does not cancel durable preparation.
+   */
+  public prepareSession<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).post<
+      StoragePrepareSessionResponses,
+      StoragePrepareSessionErrors,
+      ThrowOnError
+    >({
+      url: "/global/storage/upgrade/sessions/{sessionID}/prepare",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Retry interrupted historical Session preparation
+   *
+   * Retries from durable checkpoints. Quarantined data requires repair; this operation never discards or overwrites a recovery set.
+   */
+  public retrySession<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).post<StorageRetrySessionResponses, StorageRetrySessionErrors, ThrowOnError>(
+      {
+        url: "/global/storage/upgrade/sessions/{sessionID}/retry",
+        ...options,
+        ...params,
+      },
+    )
+  }
+
   snapshot = new Snapshot({ client: this.client })
 }
 
@@ -5667,6 +5863,36 @@ export class Runtime extends HeyApiClient {
   }
 
   /**
+   * Get Agent worker capacity status
+   *
+   * Get the explicit Agent worker ceiling, the capacity the runtime resolves from it, and whether configuration or the machine decided it.
+   */
+  public agentWorkers<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      scopeID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "scopeID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<RuntimeAgentWorkersResponses, RuntimeAgentWorkersErrors, ThrowOnError>({
+      url: "/runtime/agent-workers",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * Dispose scope runtime
    *
    * Clean up and dispose the current scope runtime, releasing scoped resources.
@@ -6387,6 +6613,7 @@ export class Domain extends HeyApiClient {
         | "commands"
         | "permissions"
         | "runtime"
+        | "storage"
         | "plugins"
         | "channels"
         | "holos"
@@ -6395,6 +6622,7 @@ export class Domain extends HeyApiClient {
         | "library"
         | "mcp"
         | "skills"
+        | "worktree"
         | "voice"
       directory?: string
       scopeID?: string
@@ -6435,6 +6663,7 @@ export class Domain extends HeyApiClient {
         | "commands"
         | "permissions"
         | "runtime"
+        | "storage"
         | "plugins"
         | "channels"
         | "holos"
@@ -6443,6 +6672,7 @@ export class Domain extends HeyApiClient {
         | "library"
         | "mcp"
         | "skills"
+        | "worktree"
         | "voice"
       directory?: string
       scopeID?: string
@@ -6490,6 +6720,7 @@ export class Domain extends HeyApiClient {
         | "commands"
         | "permissions"
         | "runtime"
+        | "storage"
         | "plugins"
         | "channels"
         | "holos"
@@ -6498,6 +6729,7 @@ export class Domain extends HeyApiClient {
         | "library"
         | "mcp"
         | "skills"
+        | "worktree"
         | "voice"
       directory?: string
       scopeID?: string
@@ -6746,6 +6978,7 @@ export class Config extends HeyApiClient {
         | "commands"
         | "permissions"
         | "runtime"
+        | "storage"
         | "plugins"
         | "channels"
         | "holos"
@@ -6754,6 +6987,7 @@ export class Config extends HeyApiClient {
         | "library"
         | "mcp"
         | "skills"
+        | "worktree"
         | "voice"
         | Array<
             | "general"
@@ -6763,6 +6997,7 @@ export class Config extends HeyApiClient {
             | "commands"
             | "permissions"
             | "runtime"
+            | "storage"
             | "plugins"
             | "channels"
             | "holos"
@@ -6771,6 +7006,7 @@ export class Config extends HeyApiClient {
             | "library"
             | "mcp"
             | "skills"
+            | "worktree"
             | "voice"
           >
       includeSecrets?: string
@@ -6833,6 +7069,221 @@ export class Config extends HeyApiClient {
   domain = new Domain({ client: this.client })
 
   import = new Import({ client: this.client })
+}
+
+export class Secrets extends HeyApiClient {
+  /**
+   * List secret vault entries
+   *
+   * List registered secret vault entries. Values are never returned.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      scopeID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "scopeID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SecretsListResponses, SecretsListErrors, ThrowOnError>({
+      url: "/secrets",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Register a secret
+   *
+   * Register a value in the secret vault. Idempotent for an already-registered value.
+   */
+  public create<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      scopeID?: string
+      secretCreateInput?: SecretCreateInput
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "scopeID" },
+            { key: "secretCreateInput", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SecretsCreateResponses, SecretsCreateErrors, ThrowOnError>({
+      url: "/secrets",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Remove a secret
+   *
+   * Remove one vault entry. Historical mask tokens stop resolving and render as revoked; re-registering the same value restores them.
+   */
+  public remove<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      scopeID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "scopeID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<SecretsRemoveResponses, SecretsRemoveErrors, ThrowOnError>({
+      url: "/secrets/{id}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Update a secret's policy
+   *
+   * Replace the per-key resolution policy of one vault entry.
+   */
+  public updatePolicy<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      scopeID?: string
+      secretPolicyInput?: SecretPolicyInput
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "scopeID" },
+            { key: "secretPolicyInput", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      SecretsUpdatePolicyResponses,
+      SecretsUpdatePolicyErrors,
+      ThrowOnError
+    >({
+      url: "/secrets/{id}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Rotate a secret's value
+   *
+   * Replace the value of one vault entry; policy and resolve history carry over.
+   */
+  public rotate<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      scopeID?: string
+      secretRotateInput?: SecretRotateInput
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "scopeID" },
+            { key: "secretRotateInput", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SecretsRotateResponses, SecretsRotateErrors, ThrowOnError>({
+      url: "/secrets/{id}/rotate",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Read a secret's resolve history
+   *
+   * Read the bounded resolve audit trail of one vault entry.
+   */
+  public history<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      scopeID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "scopeID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SecretsHistoryResponses, SecretsHistoryErrors, ThrowOnError>({
+      url: "/secrets/{id}/history",
+      ...options,
+      ...params,
+    })
+  }
 }
 
 export class ControlProfile extends HeyApiClient {
@@ -7443,6 +7894,7 @@ export class Permission extends HeyApiClient {
     parameters?: {
       directory?: string
       scopeID?: string
+      sessionID?: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -7453,6 +7905,7 @@ export class Permission extends HeyApiClient {
           args: [
             { in: "query", key: "directory" },
             { in: "query", key: "scopeID" },
+            { in: "query", key: "sessionID" },
           ],
         },
       ],
@@ -12615,6 +13068,8 @@ export class SynergyClient extends HeyApiClient {
   pty = new Pty({ client: this.client })
 
   config = new Config({ client: this.client })
+
+  secrets = new Secrets({ client: this.client })
 
   runtime = new Runtime({ client: this.client })
 

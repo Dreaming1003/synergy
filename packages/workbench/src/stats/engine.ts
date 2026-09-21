@@ -1,13 +1,10 @@
 import { RolloutSnapshot } from "@ericsanchezok/synergy-harness/session/rollout/snapshot"
 import { OperationDigest } from "./types"
-import z from "zod"
 import { Lock } from "@ericsanchezok/synergy-harness/util/lock"
 import { readRolloutRevision } from "@ericsanchezok/synergy-harness/rollout"
 import type { Info as SessionInfo } from "@ericsanchezok/synergy-harness/session/types"
-import { Scope } from "@ericsanchezok/synergy-harness/scope"
 import { Storage } from "@ericsanchezok/synergy-harness/storage/storage"
 import { StoragePath } from "@ericsanchezok/synergy-harness/storage/path"
-import { Identifier } from "@ericsanchezok/synergy-harness/id/id"
 import { Aggregator } from "./aggregator"
 import { StatsStorage } from "./storage"
 import { Rollup } from "./rollup"
@@ -23,14 +20,45 @@ export namespace Engine {
    * update digests + daily buckets, recompute snapshot.
    */
   export async function update(onProgress?: ProgressCallback): Promise<StatsSnapshot> {
-    return refresh(false, onProgress)
+    return requestRefresh(false, onProgress)
+  }
+
+  const jobs = Storage.state(
+    () =>
+      new Map<
+        boolean,
+        {
+          promise: Promise<StatsSnapshot>
+          listeners: Set<ProgressCallback>
+        }
+      >(),
+  )
+
+  function requestRefresh(full: boolean, onProgress?: ProgressCallback): Promise<StatsSnapshot> {
+    const running = jobs()
+    const existing = running.get(full) ?? (!full ? running.get(true) : undefined)
+    if (existing) {
+      if (onProgress) existing.listeners.add(onProgress)
+      return existing.promise.finally(() => {
+        if (onProgress) existing.listeners.delete(onProgress)
+      })
+    }
+    const listeners = new Set<ProgressCallback>(onProgress ? [onProgress] : [])
+    const promise = refresh(full, (event) => {
+      for (const listener of listeners)
+        void Promise.resolve()
+          .then(() => listener(event))
+          .catch(() => listeners.delete(listener))
+    }).finally(() => running.delete(full))
+    running.set(full, { promise, listeners })
+    return promise
   }
 
   async function operationDigests() {
     const result: OperationDigest[] = []
     const retained = new Set<string>()
-    for (const scopeID of await Storage.scan(["operations"], { strict: true })) {
-      for (const operationID of await Storage.scan(["operations", scopeID], { strict: true })) {
+    for (const scopeID of await Storage.scan(["operations"])) {
+      for (const operationID of await Storage.scan(["operations", scopeID])) {
         const owner = { kind: "operation" as const, scopeID, operationID }
         const revision = await readRolloutRevision(owner)
         if (!revision) continue
@@ -50,8 +78,8 @@ export namespace Engine {
         result.push(digest)
       }
     }
-    for (const scopeID of await Storage.scan(StoragePath.statsOperations(), { strict: true }))
-      for (const id of await Storage.scan([...StoragePath.statsOperations(), scopeID], { strict: true })) {
+    for (const scopeID of await Storage.scan(StoragePath.statsOperations()))
+      for (const id of await Storage.scan([...StoragePath.statsOperations(), scopeID])) {
         const key = StoragePath.statsOperation(scopeID, id)
         if (!retained.has(key.join("/"))) await Storage.remove(key)
       }
@@ -143,18 +171,15 @@ export namespace Engine {
     return snapshot
   }
 
-  /**
-   * Refresh changed session and rollout digests before returning the snapshot.
-   */
-  export async function get(onProgress?: ProgressCallback): Promise<StatsSnapshot> {
-    return update(onProgress)
+  export async function get(): Promise<StatsSnapshot | null> {
+    return (await StatsStorage.getSnapshot()) ?? null
   }
 
   /**
    * Force full recompute from scratch (clears all cached stats).
    */
   export async function recompute(onProgress?: ProgressCallback): Promise<StatsSnapshot> {
-    return refresh(true, onProgress)
+    return requestRefresh(true, onProgress)
   }
 
   // -----------------------------------------------------------------------
@@ -163,31 +188,7 @@ export namespace Engine {
 
   async function getAllSessions(): Promise<SessionInfo[]> {
     const sessions: SessionInfo[] = []
-    const scopeIDs = await Storage.scan(StoragePath.scopeRoot())
-    const scopes = await Storage.readMany<z.infer<typeof Scope.Info>>(
-      scopeIDs.map((id) => StoragePath.scope(Identifier.asScopeID(id))),
-    )
-    const homeScopeID = Identifier.asScopeID("home")
-    const homeSessionIDs = await Storage.scan(StoragePath.sessionsRoot(homeScopeID))
-    const homeSessions = await Storage.readMany<SessionInfo>(
-      homeSessionIDs.map((sid) => StoragePath.sessionInfo(homeScopeID, Identifier.asSessionID(sid))),
-    )
-    for (const info of homeSessions) {
-      if (info) sessions.push(info)
-    }
-
-    for (const scope of scopes) {
-      if (!scope) continue
-      const scopeID = Identifier.asScopeID(scope.id)
-      const sessionIDs = await Storage.scan(StoragePath.sessionsRoot(scopeID))
-      const sessionInfos = await Storage.readMany<SessionInfo>(
-        sessionIDs.map((sid) => StoragePath.sessionInfo(scopeID, Identifier.asSessionID(sid))),
-      )
-      for (const info of sessionInfos) {
-        if (info) sessions.push(info)
-      }
-    }
-
+    for await (const record of Storage.records<SessionInfo>({ kind: "session" })) sessions.push(record.value)
     return sessions
   }
 }

@@ -40,9 +40,10 @@ import {
   type RootNavSectionKey,
 } from "./nav"
 import { createDesktopBadgeSync } from "./desktop-badge"
+import { createCompletionNoticeClearer } from "./completion-notice"
 import { HOME_SCOPE_KEY } from "@/utils/scope"
 import { isEphemeralTestWorktree } from "@/utils/ephemeral-test-worktree"
-import { planMessagePageApply } from "../session-message-page"
+import { planPrefetchApply } from "./prefetch-apply"
 import { internMessages, internParts } from "../string-intern"
 import { findSessionIndex } from "../session-collection"
 import { classifyScopeEvent } from "./event-routing"
@@ -95,6 +96,13 @@ export interface NavEntry {
   pinned: number
   archived: boolean
   parentID?: string
+  blueprint?: {
+    loopID?: string
+    loopRole?: "execution" | "audit"
+    phase?: "running" | "waiting" | "auditing"
+  }
+  workspaceType?: string
+  workflow?: { kind: string; active: boolean }
   endpointKind?: "channel"
   chatId?: string
   chatName?: string
@@ -1065,11 +1073,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
     // Nav entries are populated via loadScopeNav / loadGlobalRecent / loadRootNavSection.
     // Session events trigger depth-preserving refreshes via refreshScopeNav / etc.
 
-    function childStoreForScope(scope: LocalScope | undefined) {
-      if (!scope) return undefined
-      return globalSync.peekScopeState(scope.worktree)?.[0]
-    }
-
     type PrefetchQueue = {
       inflight: Set<string>
       pending: string[]
@@ -1100,6 +1103,10 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       const [, setChildStore] = globalSync.ensureScopeState(scopeKey)
       const request = globalSync.captureResourceRequest(scopeKey, sessionID, "message")
       const revision = globalSync.beginContextProjection(scopeKey, sessionID)
+      // Prefetch runs the same per-message part-snapshot gate as the
+      // foreground loader: a response captured before a streaming mutation
+      // must not overwrite a live part bucket with its older snapshot.
+      const partSnapshotRequest = globalSync.capturePartSnapshotRequest(scopeKey, sessionID)
       return retry(() =>
         globalSdk.client.session.messagePage({
           ...scopeRequest(scopeKey),
@@ -1109,8 +1116,13 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       )
         .then((response) => {
           if (prefetchToken.value !== token || !response.data) return
+          const plan = planPrefetchApply({
+            page: response.data,
+            partSnapshotAction: (messageID) =>
+              globalSync.partSnapshotAction(scopeKey, sessionID, messageID, partSnapshotRequest),
+          })
+          if (plan.status === "retry") return
           globalSync.applyResourceResponse(scopeKey, sessionID, "message", request, response.response?.headers, () => {
-            const plan = planMessagePageApply({ page: response.data! })
             batch(() => {
               setChildStore("message", sessionID, reconcile(internMessages(plan.window.messages), { key: "id" }))
               setChildStore("messageWindow", sessionID, reconcile(plan.metadata))
@@ -1194,21 +1206,20 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       )
     }
 
-    async function clearCompletionNotice(directory: string, sessionID: string) {
-      const entry = navEntryForSession(directory, sessionID)
-      if (!entry?.completionNotice.unread) return
-      setNavEntryCompletionNotice(directory, sessionID, { unread: false, unreadCount: 0 })
-      try {
-        await globalSdk.client.session.update({
+    const clearCompletionNotice = createCompletionNoticeClearer({
+      server: () => server.url,
+      read: (directory, sessionID) => navEntryForSession(directory, sessionID)?.completionNotice,
+      write: setNavEntryCompletionNotice,
+      ready: async (sessionID) =>
+        (await globalSdk.client.storage.upgradeSession({ sessionID }, { throwOnError: true })).data?.state === "ready",
+      update: (directory, sessionID) =>
+        globalSdk.client.session.update({
           ...scopeRequest(directory),
           sessionID,
           completionNotice: { unread: false },
-        })
-      } catch (err) {
-        console.warn("Failed to clear session completion notice", err)
-        if (entry) setNavEntryCompletionNotice(directory, sessionID, entry.completionNotice)
-      }
-    }
+        }),
+      failed: (error) => console.warn("Failed to clear session completion notice", error),
+    })
 
     async function archiveSession(session: Session) {
       const scopeKey = scopeKeyForSession(session)
@@ -1279,7 +1290,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         recentEntries: recentNavEntries,
         hasMoreRecent,
         loadMoreNav,
-        childStoreForScope,
         prefetchSession,
         resetPrefetch,
         archiveSession,
@@ -1289,6 +1299,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         unreadCompletionCount,
         loadScopeNav: (directory: string) => loadScopeNav(directory),
         navEntries: () => navEntries,
+        navEntryForSession,
         scopeIndexLoaded,
       },
       scopes: {

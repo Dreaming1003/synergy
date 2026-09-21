@@ -125,6 +125,56 @@ describe.serial("performance observability store", () => {
     expect(summary.frontend.lcpMs).toBe(200)
   })
 
+  test("dashboard totals and percentiles cover the full scoped window beyond ranked details", async () => {
+    const time = Date.now() - 1000
+    const families = [
+      ["session.turn.duration", "session"],
+      ["tool.execution.duration", "tool"],
+      ["frontend.long_task.duration", "frontend"],
+      ["frontend.resource.duration", "frontend"],
+      ["llm.stream.initialization.duration", "llm"],
+      ["llm.stream.output_chars", "llm"],
+      ["unrelated.duration", "server"],
+    ] as const
+    for (const [name, module] of families) {
+      for (let value = 1; value <= 100; value++) {
+        ObservabilityStore.insertMetric({
+          metricId: `${name}-${value}`,
+          time: time + value,
+          name,
+          value,
+          unit: "ms",
+          module,
+          source: "backend",
+          scopeID: "scope_totals",
+          labels: {},
+          sampleRate: 1,
+        })
+      }
+      for (const [suffix, scopeID, at] of [
+        ["old", "scope_totals", time - 600_000],
+        ["other", "scope_other", time],
+      ] as const) {
+        ObservabilityStore.insertMetric({
+          metricId: `${name}-${suffix}`,
+          time: at,
+          name,
+          value: 10_000,
+          unit: "ms",
+          module,
+          source: "backend",
+          scopeID,
+          labels: {},
+          sampleRate: 1,
+        })
+      }
+    }
+    const summary = await PerformanceDashboard.summary({ windowMs: 300_000, scopeID: "scope_totals" })
+    expect(summary.sessions).toMatchObject({ turnCount: 100, llmCallCount: 100, toolCallCount: 100, p95TurnMs: 95 })
+    expect(summary.frontend).toMatchObject({ longTaskCount: 100, resourceP95Ms: 95 })
+    expect(summary.top.slowTools.length).toBeLessThanOrEqual(5)
+  })
+
   test("dashboard summary ranks provider and library durations from recorded metrics", async () => {
     ObservabilityMetrics.record({
       name: "llm.stream.initialization.duration",
@@ -295,6 +345,28 @@ describe.serial("performance observability store", () => {
     })
 
     expect(timeline.series[0]?.points.length).toBeLessThanOrEqual(ObservabilityConfig.current().maxTimelineBuckets)
+  })
+
+  test("timeline accepts the storage retention and queue metrics instead of rejecting the query", () => {
+    // `normalizeMetrics` rejects the whole query when any requested name is not
+    // in the catalog, so a storage series missing from the catalog would make
+    // the timeline endpoint return 400 rather than an empty series. These six
+    // names are what the storage queue and the retention pass report.
+    const storageMetrics = [
+      "storage.queue.depth",
+      "storage.queue.wait",
+      "storage.queue.hold",
+      "storage.retention.pass",
+      "storage.retention.deleted_records",
+      "storage.retention.budget_ratio",
+    ]
+    const timeline = PerformanceTimeline.get({ metric: storageMetrics, windowMs: 60_000 })
+    expect(timeline.series.map((entry) => entry.name)).toEqual(storageMetrics)
+
+    // The gate is only meaningful if an unknown name still fails the query.
+    expect(() => PerformanceTimeline.get({ metric: ["storage.queue.depth", "storage.not.a.metric"] })).toThrow(
+      "Timeline metric is not allowed",
+    )
   })
 
   test("coalesces repeated issue events while preserving occurrence counts", () => {
@@ -472,3 +544,35 @@ process.on("exit", () => {
   ObservabilityStore.close()
   for (const home of homes) rmSync(home, { recursive: true, force: true })
 })
+
+test("large metric windows retain exact timeline buckets and dashboard request totals", async () => {
+  const now = Date.now()
+  const scopeID = "indexed-metric-window"
+  const db = ObservabilityStore.initializeForMigration()
+  db.query(
+    `WITH RECURSIVE samples(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM samples WHERE i < 50001)
+    INSERT INTO obs_metrics(metric_id,time,name,value,unit,source,module,scope_id)
+    SELECT 'large-'||i, ?, 'http.request.duration', 2, 'ms', 'backend', 'server', ? FROM samples`,
+  ).run(now - 1000, scopeID)
+  db.query(
+    `INSERT INTO obs_metrics(metric_id,time,name,value,unit,source,module,scope_id)
+    VALUES ('early', ?, 'http.request.duration', 100, 'ms', 'backend', 'server', ?)`,
+  ).run(now - 2000, scopeID)
+  const timeline = PerformanceTimeline.get({
+    from: new Date(now - 2500).toISOString(),
+    to: new Date(now).toISOString(),
+    bucketMs: 1000,
+    metric: "http.request.duration",
+    stat: "sum",
+    scopeID,
+  })
+  expect(timeline.quality?.partial).not.toBe(true)
+  expect(timeline.series[0].sampleCount).toBe(50002)
+  expect(timeline.series[0].points[0].value).toBe(100)
+  expect(timeline.series[0].points[1].value).toBe(100002)
+  const summary = await PerformanceDashboard.summary({ windowMs: 10000, scopeID })
+  expect(summary.quality?.partial).not.toBe(true)
+  expect(summary.backend.requestCount).toBe(50002)
+  expect(summary.backend.p95RequestMs).toBe(2)
+  expect(summary.top.slowRoutes[0].value).toBe(100)
+}, 30_000)

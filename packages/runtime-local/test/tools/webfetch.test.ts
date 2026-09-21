@@ -5,12 +5,32 @@ import { WebFetchTool } from "../../src/tools/webfetch"
 const html =
   "<html><head><style>hidden-style</style><script>hidden-script</script></head><body><h1>Research methods</h1><p>A reproducible experiment measures the same phenomenon with independent observations.</p></body></html>"
 const requests: Array<{ accept: string | null }> = []
+const retryRequests = new Map<string, number>()
 const server = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,
   async fetch(request) {
     requests.push({ accept: request.headers.get("accept") })
     const pathname = new URL(request.url).pathname
+    if (pathname.startsWith("/retry/")) {
+      const count = (retryRequests.get(pathname) ?? 0) + 1
+      retryRequests.set(pathname, count)
+      const status = Number(pathname.split("/")[2])
+      if (count === 1 || pathname.includes("always"))
+        return new Response("unavailable", {
+          status,
+          headers: { "Retry-After": pathname.includes("wait") ? "60" : "0" },
+        })
+      return new Response("Recovered complete page", { headers: { "content-type": "text/plain" } })
+    }
+    if (pathname === "/slow-body")
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("partial"))
+          },
+        }),
+      )
     if (pathname === "/slow") {
       await Bun.sleep(100)
       return new Response("late")
@@ -109,12 +129,101 @@ test("classifies upstream failures and enforces declared and streamed response l
   }
 })
 test("aborts slow requests at configured timeout and honors caller cancellation", async () => {
-  await expect(tool.execute({ url: url("/slow"), format: "text", timeout: 0.01 }, context().ctx)).rejects.toThrow(
-    "Request timed out",
-  )
+  await expect(
+    tool.execute({ url: url("/slow"), format: "text", timeoutSeconds: 0.01 }, context().ctx),
+  ).rejects.toThrow("Request timed out")
   const controller = new AbortController()
-  controller.abort()
+  const reason = new DOMException("Cancelled by caller", "AbortError")
+  controller.abort(reason)
   await expect(tool.execute({ url: url("/slow"), format: "text" }, context(controller.signal).ctx)).rejects.toThrow(
-    "Request timed out",
+    "Cancelled by caller",
   )
+})
+
+test.each([408, 429, 500, 502, 503, 504])(
+  "retries HTTP %s reads within one permission and search attempt",
+  async (status) => {
+    const pathname = `/retry/${status}/${crypto.randomUUID()}`
+    const { ctx, permissions } = context()
+    const result = await tool.execute({ url: url(pathname), format: "text" }, ctx)
+    expect(result.output).toBe("Recovered complete page")
+    expect(retryRequests.get(pathname)).toBe(2)
+    expect(permissions).toEqual([url(pathname)])
+  },
+)
+
+test.each([403, 404, 501, 505])("does not retry HTTP %s reads", async (status) => {
+  const pathname = `/retry/${status}/${crypto.randomUUID()}`
+  await expect(tool.execute({ url: url(pathname), format: "text" }, context().ctx)).rejects.toThrow(
+    `status code: ${status}`,
+  )
+  expect(retryRequests.get(pathname)).toBe(1)
+})
+
+test("bounds attempts and includes body reading and backoff in the total deadline", async () => {
+  const pathname = `/retry/503/always-${crypto.randomUUID()}`
+  await expect(tool.execute({ url: url(pathname), format: "text" }, context().ctx)).rejects.toThrow("503")
+  expect(retryRequests.get(pathname)).toBe(3)
+  const waiting = `/retry/429/wait-${crypto.randomUUID()}`
+  await expect(
+    tool.execute({ url: url(waiting), format: "text", timeoutSeconds: 0.05 }, context().ctx),
+  ).rejects.toThrow("Request timed out")
+  expect(retryRequests.get(waiting)).toBe(1)
+  await expect(
+    tool.execute({ url: url("/slow-body"), format: "text", timeoutSeconds: 0.05 }, context().ctx),
+  ).rejects.toThrow("Request timed out")
+})
+
+// The shared classifier reports an unmapped certificate verification failure as indeterminate rather
+// than a proven transport failure; webfetch accepts it but keeps its own attempt and deadline budget.
+test("retries an unmapped certificate verification failure within its existing budget", async () => {
+  const original = globalThis.fetch
+  const calls: string[] = []
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const target = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+    calls.push(target)
+    if (calls.length === 1) throw new Error("unknown certificate verification error")
+    return new Response("Recovered secure page", { headers: { "content-type": "text/plain" } })
+  }) as unknown as typeof fetch
+  try {
+    const result = await tool.execute({ url: url("/tls-recover"), format: "text" }, context().ctx)
+    expect(calls).toHaveLength(2)
+    expect(result.output).toContain("Recovered secure page")
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("does not retry a mapped certificate failure", async () => {
+  const original = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls++
+    throw Object.assign(new Error("certificate has expired"), { code: "CERT_HAS_EXPIRED" })
+  }) as unknown as typeof fetch
+  try {
+    await expect(tool.execute({ url: url("/tls-expired"), format: "text" }, context().ctx)).rejects.toThrow(
+      "certificate has expired",
+    )
+    expect(calls).toBe(1)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("exhausts the opaque certificate retry budget and honors the total deadline", async () => {
+  const original = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls++
+    throw new Error("unknown certificate verification error")
+  }) as unknown as typeof fetch
+  try {
+    await expect(tool.execute({ url: url("/tls-always"), format: "text" }, context().ctx)).rejects.toThrow(
+      "unknown certificate verification error",
+    )
+    expect(calls).toBe(3)
+  } finally {
+    globalThis.fetch = original
+  }
 })

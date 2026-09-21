@@ -1,4 +1,6 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
+import { ObservabilityMetrics } from "../../src/observability/metrics"
+import { PolicyWorker } from "../../src/enforcement/policy-worker"
 import type {
   PolicyWorkerProcess,
   SpawnPolicyWorkerProcessOptions,
@@ -86,7 +88,7 @@ function fakeProcess(
           options.onMessage({
             type: "result",
             requestId,
-            result: { capabilities: [{ class: "shell_read", nonBypassable: false }] },
+            result: { capabilities: [{ class: "shell", nonBypassable: false }] },
             requests: ++requests,
             memoryBeforeRelease: policyMemory(),
             memoryAfterRelease: policyMemory(),
@@ -161,7 +163,7 @@ describe("PolicyWorkerPool", () => {
                 options.onMessage({
                   type: "result",
                   requestId: message.requestId,
-                  result: { capabilities: [{ class: "shell_read", nonBypassable: false }] },
+                  result: { capabilities: [{ class: "shell", nonBypassable: false }] },
                   requests: 1,
                   memoryBeforeRelease: {
                     rssBytes: 140,
@@ -189,7 +191,7 @@ describe("PolicyWorkerPool", () => {
     try {
       const first = pool.run(classificationInput())
       const second = pool.run(classificationInput())
-      await expect(first).resolves.toMatchObject({ capabilities: [{ class: "shell_read" }] })
+      await expect(first).resolves.toMatchObject({ capabilities: [{ class: "shell" }] })
       expect(sent.filter((message) => message.type === "run-start")).toHaveLength(1)
 
       const firstStart = sent.find(
@@ -237,7 +239,7 @@ describe("PolicyWorkerPool", () => {
 
     try {
       await expect(pool.run(classificationInput())).resolves.toMatchObject({
-        capabilities: [{ class: "shell_read" }],
+        capabilities: [{ class: "shell" }],
       })
       for (let i = 0; i < 40 && !states[0]?.killed; i++) await Bun.sleep(1)
       expect(states[0]?.killed).toBe(true)
@@ -434,7 +436,7 @@ describe("PolicyWorkerPool", () => {
       await expect(active).rejects.toMatchObject({ name: "AbortError" })
       expect(states[0].killed).toBe(true)
       await expect(pool.run(classificationInput())).resolves.toMatchObject({
-        capabilities: [{ class: "shell_read" }],
+        capabilities: [{ class: "shell" }],
       })
     } finally {
       await pool.stop()
@@ -458,7 +460,7 @@ describe("PolicyWorkerPool", () => {
       await expect(pool.run(classificationInput())).rejects.toBeInstanceOf(PolicyWorkerTimeoutError)
       expect(states[0].killed).toBe(true)
       await expect(pool.run(classificationInput())).resolves.toEqual({
-        capabilities: [{ class: "shell_read", nonBypassable: false }],
+        capabilities: [{ class: "shell", nonBypassable: false }],
       })
       expect(spawned).toBe(2)
     } finally {
@@ -483,7 +485,7 @@ describe("PolicyWorkerPool", () => {
       await expect(pool.run(classificationInput())).rejects.toBeInstanceOf(PolicyWorkerTimeoutError)
       expect(states[0].killed).toBe(true)
       await expect(pool.run(classificationInput())).resolves.toMatchObject({
-        capabilities: [{ class: "shell_read" }],
+        capabilities: [{ class: "shell" }],
       })
     } finally {
       await pool.stop()
@@ -510,7 +512,7 @@ describe("PolicyWorkerPool", () => {
       })
       expect(states[0].killed).toBe(true)
       await expect(pool.run(classificationInput())).resolves.toMatchObject({
-        capabilities: [{ class: "shell_read" }],
+        capabilities: [{ class: "shell" }],
       })
     } finally {
       await pool.stop()
@@ -533,19 +535,69 @@ describe("PolicyWorkerPool", () => {
 
     try {
       await expect(pool.run(classificationInput())).resolves.toMatchObject({
-        capabilities: [{ class: "shell_read" }],
+        capabilities: [{ class: "shell" }],
       })
       expect(states[0].killed).toBe(false)
       await expect(pool.run(classificationInput())).resolves.toMatchObject({
-        capabilities: [{ class: "shell_read" }],
+        capabilities: [{ class: "shell" }],
       })
       expect(states[0].killed).toBe(true)
       await expect(pool.run(classificationInput())).resolves.toMatchObject({
-        capabilities: [{ class: "shell_read" }],
+        capabilities: [{ class: "shell" }],
       })
       expect(spawned).toBe(2)
     } finally {
       await pool.stop()
+    }
+  })
+
+  test("records worker ready latency when a spawned worker becomes ready", async () => {
+    using _metrics = spyOn(ObservabilityMetrics, "record")
+    const pool = new PolicyWorkerPool(
+      { ...DEFAULT_POLICY_WORKER_POOL_OPTIONS, size: 1, heartbeatTimeoutMs: 10_000 },
+      (options) => fakeProcess(options, "result", { killed: false }),
+    )
+    try {
+      pool.start()
+      await Bun.sleep(0)
+      const calls = (
+        _metrics as unknown as {
+          mock: { calls: Array<Array<{ name?: string; unit?: string }>> }
+        }
+      ).mock.calls
+      expect(calls.some((call) => call[0]?.name === "policy.worker.ready_latency" && call[0]?.unit === "ms")).toBe(true)
+    } finally {
+      await pool.stop()
+    }
+  })
+})
+
+describe("PolicyWorker prewarm", () => {
+  test("creates the pool once without awaiting readiness and locks later reconfiguration", async () => {
+    using _start = spyOn(PolicyWorkerPool.prototype, "start").mockImplementation(() => {})
+    await PolicyWorker.stop()
+    PolicyWorker.configure({ ...DEFAULT_POLICY_WORKER_POOL_OPTIONS, size: 1 })
+    try {
+      PolicyWorker.prewarm()
+      PolicyWorker.prewarm()
+      expect(() => PolicyWorker.configure()).toThrow("cannot be reconfigured")
+      expect(PolicyWorker.stats().configured).toBe(1)
+    } finally {
+      await PolicyWorker.stop()
+      PolicyWorker.configure()
+    }
+  })
+
+  test("is a no-op while admission is closed", async () => {
+    await PolicyWorker.stop()
+    // stop() closes admission; configure() re-opens it, so close it explicitly.
+    PolicyWorker.configure({ ...DEFAULT_POLICY_WORKER_POOL_OPTIONS, size: 1 })
+    PolicyWorker.closeAdmission()
+    try {
+      PolicyWorker.prewarm()
+      expect(() => PolicyWorker.configure()).not.toThrow()
+    } finally {
+      PolicyWorker.configure()
     }
   })
 })

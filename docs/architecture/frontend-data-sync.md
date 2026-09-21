@@ -45,21 +45,25 @@ Incoming events are batched on an approximately 16 ms cadence while visible. Rep
 
 The sync layer has:
 
-- one global store for paths, project list, providers, provider auth, and global Agenda data;
+- one global store for paths, project list, providers, provider auth, global Agenda data, and the session runtime indexes;
 - one lazily created store per home/project Scope;
 - message arrays keyed by session ID (window, not full transcript);
 - `messageWindow` metadata keyed by session ID (cursor, hasMore, total, mode, pendingLatest, tailMissingLatest);
 - `latestContextMessage` keyed by session ID, holding the latest eligible assistant snapshot independently of the visible message window;
 - part arrays keyed by message ID;
-- per-session buckets for status, diffs, todo, DAG, inbox, permissions, questions, and Plan Blueprint offers;
-- per-Scope collections for sessions, agents, commands, config, MCP, LSP, VCS, Cortex, and Agenda.
+- per-session buckets for diffs, todo, DAG, inbox, and Plan Blueprint offers;
+- per-Scope collections for sessions, agents, commands, config, MCP, LSP, VCS, and Agenda.
+
+**Session runtime indexes are global.** Session status and the pending permission and question requests live in the global store keyed by session ID, and the visible Cortex task list in the same store keyed by task ID (it is process-wide, not Scope-scoped), rather than in a per-Scope store, because surfaces that render many sessions at once (sidebar rows, the mobile drawer, the Kanban board, the status bar) read them across every Scope while a Scope store is released as soon as its last retention lease ends. The index holds only non-idle statuses: an `idle` event deletes the key. `GET /global/session/status` (`global.session.statuses`) is the cross-Scope snapshot, and it merges each Scope's recoverable statuses — the only way `recovering` reaches a client at all, because no producer publishes it on the event bus. Its operationId deliberately does not read `global.session.status`: the SDK generator groups methods by the first two operationId segments and ignores a leading `global`, so that name collides with the scoped `session.status` and the generator silently drops or retargets the scoped method. The global indexes follow the same post-stamp discipline as the Scope buckets through one `GlobalRuntimeWriteTracker`: only keys with an event write after the response stamp override the snapshot, and a `session.updated` carrying `info.working` fills a status the index has no entry for, while a real status event always wins.
+
+**Session identity is projected, not stored.** A row's identity — Blueprint binding and phase, workspace type, workflow kind and activity, parent, category — travels on the navigation entry (`SessionNavEntry`), which is paginated, persisted, and refreshed by `session.updated`. That projection is what keeps a row's glyph intact while its Scope store is gone.
 
 **Diff data sources.** Two separate diff stores exist:
 
 - **Turn-level diffs** are stored in `message[n].summary.diffs` on the user message and reach the frontend through the existing `message.updated` state event. No new event, store bucket, or route was needed — the normal message reconcile path carries them.
 - **Session-level diffs** live in the `session_diff` bucket and aggregate all turn diffs for the Review workbench panel. They are loaded on demand through `sync.session.diff()` and never fetched implicitly.
 
-Global bootstrap starts the health check and the global config/path/Scope/provider/auth requests concurrently. Scope bootstrap limits concurrent instance requests to two. Each instance uses the generated `scope.bootstrap()` snapshot to load required provider, agent, config, and Scope identity plus optional path, command, session status/list, MCP, Cortex, Agenda, and project LSP/VCS state. The snapshot is reconciled in one Solid batch before the store becomes `partial`; permissions and questions keep their independent owner routes, and the store becomes `complete` after those requests settle.
+Global bootstrap starts the health check and the global config/path/Scope/provider/auth requests concurrently. Scope bootstrap limits concurrent instance requests to two. Each instance uses the generated `scope.bootstrap()` snapshot to load required provider, agent, config, and Scope identity plus optional path, command, session status/list, MCP, Cortex, Agenda, and project LSP/VCS state. The snapshot is reconciled in one Solid batch before the store becomes `partial`; permissions and questions keep their independent owner routes, and the store becomes `complete` after those requests settle. The server stamps the response sequence before reading snapshot fields, so a same-epoch response whose seq trails an event already applied was read before that event happened. Events stay authoritative only for the keys they wrote after the stamp: the write trackers record the last sequenced event write per key — the per-Scope tracker for the session list plus archive tombstones, and the global tracker for session status, permissions, questions, and Cortex tasks plus whole-bucket Cortex replacements — and snapshot application overlays only those post-stamp keys onto the snapshot — every other key converges to the snapshot, including its deletions, so state left stale by a missed event (an idle that never arrived) cannot survive a fail-open resync while a live busy status (which drives the sidebar running icon) is preserved. The per-Scope store registry is reactive: consumers that first observed no store for a directory re-run when it is created or evicted.
 
 ## Reconcile, Do Not Replace
 
@@ -100,7 +104,7 @@ The `messages` array in the store contains only the visible window messages, not
 
 ### Page size and cap
 
-- Frontend page loads use `limit: 200`; the store primary-message cap is 500.
+- The initial latest page uses `limit: 100`, sized to the rendered turn bound (`MAX_RENDERED_TURNS`), not the full transcript; history prepends, backfill, and refresh paths keep `limit: 200`. The store primary-message cap is 500.
 - The store's `DEFAULT_CAP` of 500 applies to primary messages in latest loads and to the full retained set during history prepends. Latest mode additionally retains dependency roots referenced by those primary messages, so the visible window may exceed 500 entries without losing a turn anchor.
 
 ### Latest mode
@@ -122,11 +126,15 @@ Eligible usage snapshots are assistant messages with `includeInContext !== false
 
 Context Usage category enrichment is asynchronous and fail-open. The terminal assistant update can arrive first with provider token totals only; a later ordinary `message.updated` event atomically adds only the category snapshot when the isolated estimator succeeds. If estimation is unavailable, the totals-only assistant remains authoritative and the frontend does not wait or synthesize a breakdown.
 
-Every no-cursor latest page apply seeds the projection, including normal session loads, navigation prefetch, reconnect/recovery refreshes, return-to-latest, stale-cursor recovery, and compaction reloads. Cursor/history pages never replace it. Latest page loads and background prefetches capture a `message` resource request token before the request. A latest response may replace the visible window only if no newer message event, authoritative part checkpoint/removal, history prepend, or optimistic local message write invalidated that token while it was in flight. Background prefetches additionally run only when no message window exists, so they populate an initially empty bucket rather than displace a loaded conversation.
+Every no-cursor latest page apply seeds the projection, including normal session loads, navigation prefetch, reconnect/recovery refreshes, return-to-latest, stale-cursor recovery, and compaction reloads. Cursor/history pages never replace it. Latest page loads and background prefetches capture a `message` resource request token before the request. A latest response may replace the visible window only if no newer message event, authoritative part checkpoint/removal, history prepend, or optimistic local message write invalidated that token while it was in flight. Background prefetches evaluate per-message part freshness before accepting the resource response, so a rejected page cannot advance its watermark. They additionally run only when no message window exists, so they populate an initially empty bucket rather than displace a loaded conversation.
 
-Latest-page loading treats a freshness rejection as a superseded attempt, not a successful empty apply. The session message loader retries once with new request tokens and reports the bucket ready only after an apply succeeds. Repeated supersession becomes a visible load error while preserving any previously successful snapshot.
+Latest-page loading treats a freshness rejection as a superseded attempt, not a successful empty apply. The session message loader retries with new request tokens, pausing between attempts with a doubling backoff (100 ms up to 400 ms, at most four attempts), and reports the bucket ready only after an apply succeeds. A first view with no previously successful snapshot restarts the whole attempt window once after an 800 ms pause before surfacing failure, so a session streaming while the user switches to it still loads instead of stranding a blank transcript behind the retry button. Exhausted supersession remains a visible load error while preserving any previously successful snapshot.
 
 Each asynchronous latest-page request also captures a per-session projection revision. A newer latest-page request or a persisted `message.updated`/`message.removed` event advances that revision. After resource freshness accepts a page, the projection revision independently prevents an older response from overwriting newer event-driven Context usage. Complete persisted `message.updated` events reduce the projection inside the accepted event write even while history mode suppresses insertion into `messages`. Removing the projected message invalidates the key without a per-event request; the next authoritative latest page restores it.
+
+### History transitions
+
+The active session watches the server-owned rollback identity and redo validity as well as connection and reconnect recovery state. A rewind or redo identity change requests a `history-transition` sync, forcing the authoritative effective latest message window even when redo is unavailable. Applying that window replaces old branch messages and removes their part buckets through the existing message-page reconciliation path. The latest rollback summary supports immediate local filtering, including known dropped IDs outside the loaded cut boundary, but cannot represent every earlier rollback. Ordinary session metadata updates do not trigger this history reload.
 
 ### History mode
 
@@ -160,9 +168,9 @@ Scope initialization uses `GET /scope/bootstrap` (`scope.bootstrap()`). The serv
 Session detail loading is split by concern:
 
 - session metadata loads independently;
-- messages load through `session.messagePage()` in page size 200, stored in a bounded window capped at 500;
+- messages load through `session.messagePage()` — an initial latest page of 100 for the rendered bound, 200 for history prepends — stored in a bounded window capped at 500;
 - parts are sorted and reconciled under their owning message;
-- inbox, todo, and DAG refresh together through `session.volatileBatch()`, while diff, permissions, and questions retain separate refresh paths.
+- inbox, todo, and DAG refresh together through `session.volatileBatch()`, while diff and questions retain separate refresh paths and pending permissions load only for the viewed session through the `sessionID` filter on `/permission`;
 
 An accepted local root remains visible through a client-only optimistic marker when the queued response assigns a different canonical message ID. Acceptance atomically rekeys the message, its part bucket, and any history-mode pending ID instead of deleting the rendered root. Authoritative events and latest pages replace the marked message when the same ID materializes; until then, canonical-only actions and new-session transition completion remain blocked, while Inbox timeline cards still deduplicate by rendered message ID.
 
@@ -273,7 +281,9 @@ Optimistic message insertion/removal, authoritative part checkpoints/removals fo
 
 Streaming `message.part.delta` frames do not invalidate resource freshness. They remain unsequenced, append-only projections whose next full checkpoint converges authoritative part state.
 
-Message-page requests also capture a local per-message part revision map. Applied delta, checkpoint, and removal events advance only the affected message revision. A mutation applied to an existing local bucket makes an otherwise accepted snapshot preserve that live bucket. A checkpoint or removal ignored because its parent message is outside the loaded window marks that message as requiring a newer snapshot; an in-flight page retries only when its returned effective window contains the affected message, so unrelated orphan events do not supersede the whole session page. Scope release and message-bucket eviction retire these local request tokens.
+Message-page requests also capture a local per-message part revision map. Applied delta, checkpoint, and removal events advance only the affected message revision. A mutation applied to an existing local bucket makes an otherwise accepted snapshot preserve that live bucket. A checkpoint or removal ignored because its parent message is outside the loaded window marks that message as requiring a newer snapshot; an in-flight page retries only when its returned effective window contains the affected message, so unrelated orphan events do not supersede the whole session page. When the window is loaded in latest mode, such a drop additionally schedules one debounced, budget-bounded repair reload per session (2 s debounce, at most 3 attempts per 60 s window) through the shared session-window reload loader, so a terminal checkpoint dropped while its message raced the window converges without a manual refresh; drops for sessions with no loaded window stay cold-load-on-next-view. Repair checks latest mode again before requesting and applying a page, preserves diff/inbox state, and joins pending reloads. Compaction cancels queued repairs and can supersede an in-flight repair. Scope release and message-bucket eviction retire these local request tokens, cancel pending repairs, and release in-flight reloads.
+
+Back-to-back ignored checkpoints for the same message with no capture in between coalesce into one mark — every in-flight request predates the original mark and already retries, while a capture in between re-arms the mark so that request still sees the newer checkpoint — which bounds the retry area during streaming bursts.
 
 ### Snapshot version guard
 
@@ -320,6 +330,8 @@ For each streaming part, the wire sends:
 
 A checkpoint and delta are mutually exclusive for one increment, preventing double append.
 
+Delta-bearing text/reasoning checkpoints preserve accumulated text when the incoming text is a strict prefix. No-delta writes, including intentional truncations and final checkpoints, replace the text authoritatively. All part-update events carry the streaming transport classification, so the delta field distinguishes incremental writes.
+
 Streaming frames remain unsequenced because they are convergent rather than journaled state. If a delta arrives before its part exists locally, the frontend ignores it; the next full checkpoint creates or corrects the authoritative part.
 
 Encoder checkpoint state is transport-local. The global WebSocket delta clients share one encoder because they receive the same frames; each SSE connection owns another encoder. A global encoder shared across independent transports would let one consumer's checkpoint timing corrupt another's convergence.
@@ -334,13 +346,13 @@ Streaming Markdown creates a fixed set of token elements through DOM APIs and re
 
 A session switch opens the fresh scroller at the top; the page pins it to the bottom through one re-armed init chain once the message window becomes ready. A forced pin is a short follow contract: the auto-scroll hook stays active for a settle window (default 1000 ms), re-pins through late content growth (images, code highlighting), and extends the window per growth. While follow is inactive, content growth fires no scroll event, so the hook reports the bottom distance through `onMeasure` and consumers derive scrolled-up state from that measurement; the session page gates the reporting until its initial pin has consumed so partially laid-out content cannot flash the jump button, and remounting a scroller resets stale user-scrolled state. The session shell remounts its page subtree keyed by session ID, and Solid mounts the successor viewport before the swapped-out owner's cleanup runs: viewport releases therefore attribute the element they bound (`setScrollRef(undefined, el)` / `contentRef(undefined, el)`), and holders ignore a release whose element no longer owns the binding — an unattributed release from the stale owner would otherwise drop the successor's binding, leaving the new scroller at the top with a dead jump button.
 
-While the page is hidden, per-part delta frames are merged into one pending delta per part before application; a full `message.part.updated` checkpoint for the same part clears that pending delta (the checkpoint is authoritative, so merged deltas never double-append). Visible pages keep per-delta application so token receive telemetry stays intact.
+While the page is hidden, per-part delta frames are merged into one pending delta per part in their original queue position; a full `message.part.updated` checkpoint for the same part clears an earlier pending delta in either visibility mode (the checkpoint is authoritative, so merged deltas never double-append). Deltas received after a checkpoint remain after that checkpoint, allowing it to create or update the part first. Visible pages keep per-delta application so token receive telemetry stays intact.
 
 ## Server Part Write-Behind
 
 Network streaming and disk persistence are separate optimizations.
 
-`PartWriteBuffer` coalesces streaming text/reasoning persistence per part at a default 500 ms interval. It always retains the newest full part value.
+`PartWriteBuffer` coalesces streaming text/reasoning persistence per part at a default 500 ms interval. It retains the caller's newest part value by reference and snapshots it once at flush, so successive deltas are priced incrementally instead of re-serializing the accumulated part.
 
 - streaming increments defer disk writes;
 - discrete tool/status changes write immediately;
@@ -378,13 +390,13 @@ Fetch-before-swap prevents an empty timeline flash. Part buckets belonging to me
 Loaded message and part buckets are memory-bounded independently of session metadata.
 
 - the global LRU spans Scope/session bucket keys;
-- at most 15 session buckets are retained;
+- at most 30 session buckets are retained, covering the recently viewed working set;
 - the actively viewed session is protected even if it is the oldest;
 - board panes get no eviction protection: they enter the normal load path when the board is mounted (touching their bucket, which keeps them near the LRU head) and refill from the loader after eviction, so a board pane can never silently show a blanked timeline;
 - eviction removes that session's message array, all parts owned by those messages, the session's `messageWindow` metadata, and its latest Context projection;
 - revisiting an evicted session reloads it through normal message page sync.
 
-Session lists, status, inbox, todo, and other non-message state are not evicted by this policy.
+Session lists, inbox, todo, and other non-message state are not evicted by this policy. Session runtime state is not subject to it either: status, the pending permission/question requests, and the visible Cortex task list live in the global indexes, so message-bucket eviction never touches them.
 
 ## Composer Intent
 
@@ -411,12 +423,12 @@ Composer snapshots, settled-draft notifications, selected-text snapshots, comple
 - One global event WebSocket multiplexes events by owning Scope directory.
 - State events are sequenced per Scope epoch; streaming events are unsequenced.
 - Replay returns `ok` or `reset` JSON and full resync is the fail-open recovery. Live gaps replay from the retained pre-gap watermark and do not apply the triggering event before recovery.
-- SyncProvider holds a Scope lease and registers message-loader disposal before returning. The last lease releases the Scope; overlapping transition owners and visible Kanban panes share it. Departing board panes cancel their requests before releasing their Scope lease. At most eight unleased background Scopes remain in LRU order. Bootstrap, resync, replay, and session-list responses apply only to their original live store instance. Scope release clears queued bootstrap work, replay tracking, refresh timers, message-LRU membership, and all begun context projections. Timer and projection cleanup use exact Scope identity. See the [transition lifecycle decision](../decisions/implemented/bug-fix/2026-09-07-transition-lifecycle-retention.md).
-- Scope bootstrap is one aggregated generated-SDK snapshot plus independent permission/question requests; reconnect invalidates volatile freshness for all retained sessions, clears inactive volatile buckets, and batch-refreshes only the viewed session.
+- SyncProvider holds a Scope lease and registers message-loader disposal before returning. The last lease moves the Scope into the inactive LRU; overlapping transition owners and visible Kanban panes share it. Departing board panes cancel their requests before releasing their Scope lease. At most eight unleased Scopes remain in LRU order, including recently viewed Scopes, so opening a global panel preserves sidebar status and warm message windows. Bootstrap, resync, replay, and session-list responses apply only to their original live store instance. Scope eviction clears queued bootstrap work, replay tracking, refresh timers, message-LRU membership, and all begun context projections. Timer and projection cleanup use exact Scope identity. See the [transition lifecycle decision](../decisions/implemented/bug-fix/2026-09-07-transition-lifecycle-retention.md).
+- Scope bootstrap is one aggregated generated-SDK snapshot plus independent permission/question requests that apply to the global indexes; reconnect invalidates volatile freshness for all retained sessions, clears inactive volatile buckets, and batch-refreshes only the viewed session. A snapshot response applies with per-key post-stamp overlay: only keys whose last sequenced event write postdates the response stamp keep their event value (tracked with archive tombstones; epoch changes reset tracking), while every other key converges to the snapshot including its deletions. The per-Scope store registry is reactive so consumers that observed no store re-run on creation and eviction.
 - Bounded domain event queues use explicit recovery signals rather than silent loss. For File workspace watcher overflow, `file.watcher.updated` carries `resync: true`, and the File context reloads its root, expanded directories, and active document.
 - Every event passes the Scope epoch pre-filter; DAG, Todo, Inbox, and Message additionally use resource-level snapshot/event freshness (generation + revision tokens and version comparison). Optimistic message writes and authoritative part mutations for messages present in the loaded window invalidate concurrent Message requests; streaming deltas do not. Unversioned snapshots are accepted only when no intervening same-resource write occurred.
 - Store updates reconcile existing leaves and identities.
-- Superseded latest-message snapshots retry before a bucket is marked ready; per-message part decisions apply unchanged buckets, preserve newer live buckets, and retry only pages that contain an ignored out-of-window mutation.
+- Superseded latest-message snapshots retry with doubling backoff before a bucket is marked ready, and a first view with no snapshot restarts the attempt window once; per-message part decisions apply unchanged buckets, preserve newer live buckets, and retry only pages that contain an ignored out-of-window mutation, whose marks coalesce until a capture re-arms them.
 - Streaming deltas converge through periodic checkpoints and a final full checkpoint on normal completion, error, or abort.
 - Active text rendering processes appended suffixes rather than rescanning accumulated snapshots.
 - Session-scoped snapshot reads flush pending part write-behind first, and disk write-behind never delays discrete or terminal persistence.
@@ -440,7 +452,20 @@ Composer snapshots, settled-draft notifications, selected-text snapshots, comple
   instead of rescanning the message window, so a new message invalidates only the projection memo rather than every rendered turn.
 - `BrowserViewEffects` keeps its handled-callID set bounded to the timeline
   window, releasing callIDs that were trimmed or switched away.
+- Model readiness is derived from the global provider snapshot, not from the startup health probe. `resolveModelReadiness` reads only `connected`, `runtimeAvailability`, and `authHealth`, and an app-wide readiness surface renders inside the synchronized shell so it observes a populated snapshot before it can render. The `GET /global/health` probe — including `modelReady` and its bounded provider wait — is a startup and diagnostic signal for the CLI and daemon consumers, never a UI readiness source, and no readiness consumer may cache it.
 
 ## Tool content retention
 
 Tool review tabs persist session/message/part identity and a selected path. The mounted panel loads that message through the Scope-aware generated SDK and aborts obsolete requests. It does not persist tool payloads in layout state or create a session-wide eager fetch. File links use the existing workspace-file loading and eviction owner. String interning has bounded admission maps as well as a bounded retained-value map; promotion removes the admission reference. Rendering and cache capacities follow the [bounded tool rendering decision](../decisions/implemented/bug-fix/2026-09-07-bound-tool-rendering-memory.md).
+
+Library navigation and search controls remain outside content Suspense boundaries. Usage reads return the last computed snapshot without refreshing history; an explicit sync streams incremental refresh progress, and concurrent refreshes share a job. A new-session handoff keeps observing canonical message arrival after its deadline, so an error state can converge when materialization eventually finishes. Adjacent sessions are not automatically prefetched during route transitions; explicit hover prefetch remains available.
+
+## Historical upgrade status
+
+The status bar polls the generated `storage.upgradeStatus` method while historical owners remain unresolved. This progress snapshot is independent of session event watermarks and never triggers per-event data reloads. New work remains available; selecting old history waits for that owner’s migration and recovery. The separate paginated upgrade catalog exposes unresolved identities without rescanning legacy files.
+
+## Historical preparation
+
+The Session route gates message loading on the generated storage preparation API. Its component-owned controller polls only while pending/preparing, backs off while hidden and ignores disposed navigation responses. It does not synthesize message events or replace Scope watermarks. Returning to the workspace leaves durable preparation running. The status bar distinguishes historical convergence from independent backup completion and exposes background pause/resume; quarantined data remains blocked for repair.
+
+Navigation clears a completion notice only after the owner reports ready. Concurrent clears share an in-flight guard through optimistic rollback so a rejected write cannot feed back into the reactive effect as an unbounded retry. Readiness replies from a previous server cannot mutate the current server or its navigation state.

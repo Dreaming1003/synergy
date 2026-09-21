@@ -139,12 +139,30 @@ export type DesktopZoomBridge = {
   set(zoomFactor: number): Promise<number>
 }
 
+export type DesktopPowerSnapshot = {
+  keepAwakeWhileRunning: boolean
+  active: boolean
+}
+
+export type DesktopPowerBridge = {
+  get(): Promise<DesktopPowerSnapshot>
+  set(update: { keepAwakeWhileRunning: boolean }): Promise<DesktopPowerSnapshot>
+  /** Ask the shell to re-check server activity now instead of waiting for its poll. */
+  activityChanged(): Promise<void>
+  onEvent?(listener: (event: { type: "power"; snapshot: DesktopPowerSnapshot }) => void): () => void
+}
+
 export type ClipboardBridge = {
   writeText(text: string): Promise<boolean>
 }
 
 export type DesktopBadgeBridge = {
   setState(state: { count: number }): Promise<void>
+}
+
+export type DirectoryPickerDenied = {
+  denied: true
+  message: string
 }
 
 export type Platform = {
@@ -166,8 +184,11 @@ export type Platform = {
   /** Send a system notification (optional deep link; tag collapses duplicates) */
   notify(title: string, description?: string, href?: string, tag?: string): Promise<void>
 
-  /** Open directory picker dialog */
-  openDirectoryPickerDialog?(opts?: { title?: string; multiple?: boolean }): Promise<string | string[] | null>
+  /** Open directory picker dialog; portal denial resolves as plain { denied: true; message } data */
+  openDirectoryPickerDialog?(opts?: {
+    title?: string
+    multiple?: boolean
+  }): Promise<string | string[] | DirectoryPickerDenied | null>
 
   /** Fetch override */
   fetch?: typeof fetch
@@ -192,6 +213,9 @@ export type Platform = {
 
   /** Desktop window zoom bridge, provided by the desktop shell. */
   desktopZoom?: DesktopZoomBridge
+
+  /** Desktop keep-awake bridge, provided by the desktop shell. */
+  desktopPower?: DesktopPowerBridge
 
   /** Clipboard bridge, provided by the desktop shell when browser clipboard permissions are not enough. */
   clipboard?: ClipboardBridge

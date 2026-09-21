@@ -6,6 +6,7 @@ import {
   gitProtectedSubpaths,
   protectedMetadataUnderWritableRoot,
   PROTECTED_METADATA_PATH_NAMES,
+  readDenyPathsFor,
   uniqueRoots,
   isMetadataWriteDenied,
 } from "./policy"
@@ -23,6 +24,7 @@ export interface SynergyFileSystemSandboxPolicy {
   protectedMetadataNames: string[]
   protectedPaths: string[]
   dataDenyRoots: string[]
+  readDenyPaths?: string[]
   includePlatformDefaults: boolean
   workspace: string
 }
@@ -140,6 +142,16 @@ export function buildPermissionProfile(input: SandboxPolicyInput): SynergySandbo
     readableRoots.push(input.executionCwd)
   }
 
+  // Deny-list read model: reads are allowed globally and only
+  // credential-bearing locations stay denied. The deny set has one owner
+  // (`readDenyPathsFor`) so the macOS and Linux backends cannot drift, and it
+  // is derived from the workspace and explicit deny roots alone — a writable
+  // root is never grounds to prune an entry. Each backend is responsible for
+  // making a kept deny effective through rule or mount order.
+  const readDenyPaths = readDenyPathsFor({
+    workspace: input.workspace,
+    extraDenyPaths: input.dataDenyRoots,
+  })
   const fileSystem: SynergyFileSystemSandboxPolicy = {
     readableRoots,
     writableRoots,
@@ -148,6 +160,7 @@ export function buildPermissionProfile(input: SandboxPolicyInput): SynergySandbo
     protectedMetadataNames: protectedNames,
     protectedPaths,
     dataDenyRoots,
+    readDenyPaths,
     includePlatformDefaults: true,
     workspace: input.workspace,
   }

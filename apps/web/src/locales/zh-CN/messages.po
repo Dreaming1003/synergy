@@ -1859,6 +1859,14 @@ msgid "app.dialog.directory.toast.pickerCantOpen"
 msgstr "无法打开文件夹选择器。"
 
 #. ── Dialogs ──────────────────────────────────────────────────────────────────
+msgid "app.dialog.directory.toast.pickerDenied"
+msgstr "文件夹选择器权限被拒绝"
+
+#. ── Dialogs ──────────────────────────────────────────────────────────────────
+msgid "app.dialog.directory.toast.pickerDeniedHint"
+msgstr "桌面 Portal 拒绝了该请求，通常是因为 Synergy 以更改后的主用户组启动（例如 newgrp docker）。请从正常的桌面会话重新启动 Synergy。"
+
+#. ── Dialogs ──────────────────────────────────────────────────────────────────
 msgid "app.dialog.directory.toast.pickerFailed"
 msgstr "文件夹选择器失败"
 
@@ -7368,8 +7376,28 @@ msgstr "synergy config"
 
 #. Runtime Lingui descriptors for app shell, entry, commands, and pages.
  *  Translate at use time via `useLocale().i18n._(descriptor)`.
-msgid "app.shell.modelNotConfigured"
-msgstr "尚未配置 AI 模型——请在终端中运行 {cmd} 完成设置"
+msgid "app.shell.modelUnavailable.action.connect"
+msgstr "连接提供商"
+
+#. Runtime Lingui descriptors for app shell, entry, commands, and pages.
+ *  Translate at use time via `useLocale().i18n._(descriptor)`.
+msgid "app.shell.modelUnavailable.action.review"
+msgstr "查看提供商"
+
+#. Runtime Lingui descriptors for app shell, entry, commands, and pages.
+ *  Translate at use time via `useLocale().i18n._(descriptor)`.
+msgid "app.shell.modelUnavailable.needsAttention"
+msgstr "已连接的提供商需要处理后，其模型才能使用。"
+
+#. Runtime Lingui descriptors for app shell, entry, commands, and pages.
+ *  Translate at use time via `useLocale().i18n._(descriptor)`.
+msgid "app.shell.modelUnavailable.notConfigured"
+msgstr "尚未连接任何 AI 提供商。连接一个即可选择模型，也可以在终端中运行 {cmd}。"
+
+#. Runtime Lingui descriptors for app shell, entry, commands, and pages.
+ *  Translate at use time via `useLocale().i18n._(descriptor)`.
+msgid "app.shell.modelUnavailable.restricted"
+msgstr "没有可选择的模型。请确认已连接的提供商已启用并提供模型。"
 
 #. js-lingui-explicit-id
 msgid "app.shell.window.maximize"
@@ -8541,6 +8569,18 @@ msgid "app.statusBar.runtime.recovering"
 msgstr "会话正在从未完成的回合中恢复"
 
 #. ── Status Bar ───────────────────────────────────────────────────────────────
+msgid "app.statusBar.runtime.recovering.incompleteTurn"
+msgstr "会话正在从未完成的回合中恢复"
+
+#. ── Status Bar ───────────────────────────────────────────────────────────────
+msgid "app.statusBar.runtime.recovering.pendingReply"
+msgstr "会话正在等待未回复的答复"
+
+#. ── Status Bar ───────────────────────────────────────────────────────────────
+msgid "app.statusBar.runtime.recovering.workflow"
+msgstr "BlueprintLoop 工作流仍占用此会话"
+
+#. ── Status Bar ───────────────────────────────────────────────────────────────
 msgid "app.statusBar.runtime.recoveringState"
 msgstr "正在恢复"
 
@@ -8779,6 +8819,70 @@ msgstr "隐藏"
 #. ── Top Bar ──────────────────────────────────────────────────────────────────
 msgid "app.topBar.sideWorkspace.open"
 msgstr "打开"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.attention"
+msgstr "有 {count} 个历史会话需要修复"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.backup"
+msgstr "正在完成恢复备份：{done}/{total}"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.backupAttention"
+msgstr "恢复备份需要检查"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.controlFailed"
+msgstr "无法更新准备状态，请重试。"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.leave"
+msgstr "返回工作区"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.pause"
+msgstr "暂停"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.paused"
+msgstr "历史记录准备已暂停"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.progress"
+msgstr "正在准备历史记录：{done}/{total}"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.resume"
+msgstr "继续"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.retry"
+msgstr "重试"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.sessionAttention"
+msgstr "这段会话需要处理"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.sessionFiles"
+msgstr "已准备 {count} 个文件"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.sessionPreparing"
+msgstr "正在准备这段会话"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.sessionRepair"
+msgstr "校验发现问题。原始数据和恢复文件均已保留，请检查存储诊断信息后再重试。"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.sessionRetryHelp"
+msgstr "准备未能完成。请检查连接和可用磁盘空间，然后重试。"
+
+#. js-lingui-explicit-id
+msgid "app.upgrade.sessionWait"
+msgstr "正在检查并升级历史记录。你可以离开此页面，继续使用其他会话。"
 
 #. ── Workspace core ───────────────────────────────────────────────────────────
 msgid "app.workspace.add.bottomPanel"
@@ -9429,6 +9533,22 @@ msgid "confirm.disconnectProvider.title"
 msgstr "断开提供商连接？"
 
 #. js-lingui-explicit-id
+msgid "confirm.fullAccess.cancel"
+msgstr "保持当前模式"
+
+#. js-lingui-explicit-id
+msgid "confirm.fullAccess.confirm"
+msgstr "启用完全访问权限"
+
+#. js-lingui-explicit-id
+msgid "confirm.fullAccess.desc"
+msgstr "完全访问权限会对其生效的会话移除 Synergy 的权限检查和工作区沙箱。智能体运行的任何命令、读写的任何文件，都不会事先征求你的同意。请仅用于你能够承受损失、或运行在可随时丢弃的环境中的工作。"
+
+#. js-lingui-explicit-id
+msgid "confirm.fullAccess.title"
+msgstr "启用完全访问权限？"
+
+#. js-lingui-explicit-id
 msgid "confirm.leaveWorktree.cancel"
 msgstr "留在工作树"
 
@@ -9528,9 +9648,29 @@ msgstr "卸载 {name}？它将从此 Synergy 安装中移除。"
 msgid "confirm.uninstallPlugin.title"
 msgstr "卸载插件？"
 
-#. ── Countdown ───────────────────────────────────────────────────────
-msgid "countdown.timeout-label"
-msgstr "{remaining} 秒超时"
+#. it a timeout would misstate what happens; only `tool_timeout` aborts.
+msgid "countdown.backgrounded"
+msgstr "已转后台"
+
+#. it a timeout would misstate what happens; only `tool_timeout` aborts.
+msgid "countdown.past-limit"
+msgstr "已超出限制"
+
+#. it a timeout would misstate what happens; only `tool_timeout` aborts.
+msgid "countdown.remaining"
+msgstr "剩余 {remaining} 秒"
+
+#. it a timeout would misstate what happens; only `tool_timeout` aborts.
+msgid "countdown.timed-out"
+msgstr "已超时"
+
+#. it a timeout would misstate what happens; only `tool_timeout` aborts.
+msgid "countdown.to-background"
+msgstr "{remaining} 秒后转后台"
+
+#. it a timeout would misstate what happens; only `tool_timeout` aborts.
+msgid "countdown.to-timeout"
+msgstr "{remaining} 秒后超时"
 
 #. ── DAG graph chrome ────────────────────────────────────────────────
 msgid "dag.chrome.blocked"
@@ -11079,6 +11219,20 @@ msgstr "请先停止会话，再更改工作流模式。"
  *  `i18n._({ ...descriptor, values: {...} })` when ICU placeholders are present.
 msgid "prompt.stopping"
 msgstr "正在停止…"
+
+#. Runtime Lingui descriptors for prompt-input component strings.
+ *  Each is a plain object with `id` + English `message`.
+ *  Translate at use time via `useLocale().i18n._(descriptor)` or
+ *  `i18n._({ ...descriptor, values: {...} })` when ICU placeholders are present.
+msgid "prompt.stopRun.control"
+msgstr "停止本次运行并取消其工作流"
+
+#. Runtime Lingui descriptors for prompt-input component strings.
+ *  Each is a plain object with `id` + English `message`.
+ *  Translate at use time via `useLocale().i18n._(descriptor)` or
+ *  `i18n._({ ...descriptor, values: {...} })` when ICU placeholders are present.
+msgid "prompt.stopRun.failed"
+msgstr "无法停止本次运行"
 
 #. Runtime Lingui descriptors for prompt-input component strings.
  *  Each is a plain object with `id` + English `message`.
@@ -12868,6 +13022,16 @@ msgstr "收件箱为空"
 
 #. Runtime Lingui descriptors for session component strings.
  *  Translate at use time via `useLocale().i18n._(descriptor)`.
+msgid "session.inbox.failed"
+msgstr "投递失败"
+
+#. Runtime Lingui descriptors for session component strings.
+ *  Translate at use time via `useLocale().i18n._(descriptor)`.
+msgid "session.inbox.failedStatus"
+msgstr "失败"
+
+#. Runtime Lingui descriptors for session component strings.
+ *  Translate at use time via `useLocale().i18n._(descriptor)`.
 msgid "session.inbox.frozen"
 msgstr "回退期间收件箱已冻结"
 
@@ -12979,6 +13143,16 @@ msgstr "请求失败"
  *  Translate at use time via `useLocale().i18n._(descriptor)`.
 msgid "session.inbox.restore"
 msgstr "恢复"
+
+#. Runtime Lingui descriptors for session component strings.
+ *  Translate at use time via `useLocale().i18n._(descriptor)`.
+msgid "session.inbox.retry"
+msgstr "重试投递"
+
+#. Runtime Lingui descriptors for session component strings.
+ *  Translate at use time via `useLocale().i18n._(descriptor)`.
+msgid "session.inbox.retryFailed"
+msgstr "重试消息失败"
 
 #. Runtime Lingui descriptors for session component strings.
  *  Translate at use time via `useLocale().i18n._(descriptor)`.
@@ -13622,12 +13796,32 @@ msgid "session.state.home.unread"
 msgstr "全局会话；回复已生成"
 
 #. js-lingui-explicit-id
+msgid "session.state.loop"
+msgstr "Light Loop 会话"
+
+#. js-lingui-explicit-id
+msgid "session.state.loop.unread"
+msgstr "Light Loop 会话；回复已生成"
+
+#. js-lingui-explicit-id
+msgid "session.state.loopWaiting"
+msgstr "Light Loop 等待你处理"
+
+#. js-lingui-explicit-id
+msgid "session.state.recovering"
+msgstr "会话恢复中"
+
+#. js-lingui-explicit-id
 msgid "session.state.running"
 msgstr "正在运行的会话"
 
 #. js-lingui-explicit-id
 msgid "session.state.runningBlueprint"
 msgstr "正在运行 Blueprint"
+
+#. js-lingui-explicit-id
+msgid "session.state.runningLoop"
+msgstr "正在运行 Light Loop"
 
 #. js-lingui-explicit-id
 msgid "session.state.waiting"
@@ -14897,6 +15091,18 @@ msgid "settings.catalog.sandbox.searchTerms"
 msgstr "沙箱 | 隔离 | 降级"
 
 #. js-lingui-explicit-id
+msgid "settings.catalog.secrets.description"
+msgstr "已注册的密钥从模型上下文打码，在执行时解析。"
+
+#. js-lingui-explicit-id
+msgid "settings.catalog.secrets.label"
+msgstr "密钥"
+
+#. js-lingui-explicit-id
+msgid "settings.catalog.secrets.searchTerms"
+msgstr "密钥 | 密钥库 | api 密钥 | 令牌 | 掩码 | 凭据"
+
+#. js-lingui-explicit-id
 msgid "settings.catalog.skills.description"
 msgstr "选择从哪些其他智能体工具发现技能。"
 
@@ -15349,6 +15555,26 @@ msgid "settings.controlProfile.guarded.label"
 msgstr "受控"
 
 #. js-lingui-explicit-id
+msgid "settings.controlProfile.nonInteractive.aria"
+msgstr "非交互会话的权限模式"
+
+#. js-lingui-explicit-id
+msgid "settings.controlProfile.nonInteractive.autonomous"
+msgstr "自动"
+
+#. js-lingui-explicit-id
+msgid "settings.controlProfile.nonInteractive.desc"
+msgstr "用于渠道和定时日程启动的会话，这类会话没有人可以回答权限确认。此处不提供“守护”模式，因为无人值守的确认请求将永远无法得到回应。更改仅对之后新建的会话生效。"
+
+#. js-lingui-explicit-id
+msgid "settings.controlProfile.nonInteractive.fullAccess"
+msgstr "完全访问权限"
+
+#. js-lingui-explicit-id
+msgid "settings.controlProfile.nonInteractive.title"
+msgstr "非交互会话"
+
+#. js-lingui-explicit-id
 msgid "settings.controlProfile.page.desc"
 msgstr "设置会话和智能体在执行操作时如何请求确认。"
 
@@ -15767,6 +15993,26 @@ msgstr "外观、行为和通知偏好设置。"
 #. js-lingui-explicit-id
 msgid "settings.general.page.title"
 msgstr "常规"
+
+#. js-lingui-explicit-id
+msgid "settings.general.preventSleep.active"
+msgstr "正在保持此电脑唤醒"
+
+#. js-lingui-explicit-id
+msgid "settings.general.preventSleep.description"
+msgstr "当任意 Synergy 智能体正在工作时保持此电脑唤醒。显示器仍可关闭，合上笔记本盖子仍可能使电脑休眠。"
+
+#. js-lingui-explicit-id
+msgid "settings.general.preventSleep.failed"
+msgstr "无法更改休眠设置"
+
+#. js-lingui-explicit-id
+msgid "settings.general.preventSleep.idle"
+msgstr "等待任务"
+
+#. js-lingui-explicit-id
+msgid "settings.general.preventSleep.title"
+msgstr "运行期间阻止休眠"
 
 #. js-lingui-explicit-id
 msgid "settings.general.theme.description"
@@ -17005,10 +17251,6 @@ msgid "settings.mcp.builtins.apiKey.clearUndo"
 msgstr "保留已存储的密钥"
 
 #. js-lingui-explicit-id
-msgid "settings.mcp.builtins.apiKey.configured"
-msgstr "已设置密钥"
-
-#. js-lingui-explicit-id
 msgid "settings.mcp.builtins.apiKey.description"
 msgstr "可选。将作为 Bearer 令牌发送，用于提升匿名额度之外的速率限制。"
 
@@ -17017,8 +17259,24 @@ msgid "settings.mcp.builtins.apiKey.label"
 msgstr "API 密钥"
 
 #. js-lingui-explicit-id
+msgid "settings.mcp.builtins.apiKey.pending"
+msgstr "尚未保存"
+
+#. js-lingui-explicit-id
 msgid "settings.mcp.builtins.apiKey.placeholder"
 msgstr "粘贴密钥以提升速率限制"
+
+#. js-lingui-explicit-id
+msgid "settings.mcp.builtins.apiKey.replace"
+msgstr "粘贴新密钥以替换已存储的密钥"
+
+#. js-lingui-explicit-id
+msgid "settings.mcp.builtins.apiKey.saved"
+msgstr "已设置密钥"
+
+#. js-lingui-explicit-id
+msgid "settings.mcp.builtins.apiKey.unset"
+msgstr "未设置密钥"
 
 #. js-lingui-explicit-id
 msgid "settings.mcp.builtins.badge"
@@ -17033,18 +17291,6 @@ msgid "settings.mcp.builtins.section.title"
 msgstr "内置服务器"
 
 #. js-lingui-explicit-id
-msgid "settings.mcp.builtins.status.connected"
-msgstr "已连接"
-
-#. js-lingui-explicit-id
-msgid "settings.mcp.builtins.status.disabled"
-msgstr "已关闭"
-
-#. js-lingui-explicit-id
-msgid "settings.mcp.builtins.status.other"
-msgstr "不可用"
-
-#. js-lingui-explicit-id
 msgid "settings.mcp.card.collapse"
 msgstr "收起服务器详情"
 
@@ -17055,10 +17301,6 @@ msgstr "未设置命令"
 #. js-lingui-explicit-id
 msgid "settings.mcp.card.connectionType"
 msgstr "连接类型"
-
-#. js-lingui-explicit-id
-msgid "settings.mcp.card.enabled"
-msgstr "已启用"
 
 #. js-lingui-explicit-id
 msgid "settings.mcp.card.env"
@@ -17523,6 +17765,10 @@ msgstr "插件"
 #. js-lingui-explicit-id
 msgid "settings.panel.loading.label"
 msgstr "正在加载…"
+
+#. js-lingui-explicit-id
+msgid "settings.panel.preventSleep.saveFailed"
+msgstr "休眠设置无法保存"
 
 #. js-lingui-explicit-id
 msgid "settings.panel.reference.formatterDescription"
@@ -18105,12 +18351,16 @@ msgid "settings.runtime.agents.agent.title"
 msgstr "智能体"
 
 #. js-lingui-explicit-id
-msgid "settings.runtime.agents.agentWorkers.automatic"
-msgstr "自动"
+msgid "settings.runtime.agents.agentWorkers.derived"
+msgstr "自动 · 由机器推导：{value}"
 
 #. js-lingui-explicit-id
 msgid "settings.runtime.agents.agentWorkers.desc"
 msgstr "可并行运行的模型 Turn 上限。调小后，活跃 Turn 会先正常结束，多余的 Worker 随后退出。"
+
+#. js-lingui-explicit-id
+msgid "settings.runtime.agents.agentWorkers.explicit"
+msgstr "已配置：{value}"
 
 #. js-lingui-explicit-id
 msgid "settings.runtime.agents.agentWorkers.placeholder"
@@ -18607,6 +18857,154 @@ msgstr "已保存 {label}"
 #. js-lingui-explicit-id
 msgid "settings.save.unsaved"
 msgstr "未保存"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.action.cancel"
+msgstr "保留"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.action.close"
+msgstr "关闭"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.action.confirm"
+msgstr "移除"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.action.edit"
+msgstr "编辑"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.action.history"
+msgstr "历史"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.action.remove"
+msgstr "移除"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.action.rotate"
+msgstr "轮换"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.action.save"
+msgstr "保存策略"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.history.empty"
+msgstr "暂无解析记录。"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.history.title"
+msgstr "最近解析"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.list.empty"
+msgstr "尚未注册任何密钥。"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.list.title"
+msgstr "已注册的密钥"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.page.description"
+msgstr "已注册的密钥在模型可见的所有位置都被打码，仅在工具执行时解析为真实值。密钥值不会发送到浏览器；查看请使用 CLI。"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.page.title"
+msgstr "密钥"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.register.button"
+msgstr "注册"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.register.description"
+msgstr "粘贴一个值即可在所有会话中打码。重复注册已知值不会产生任何变化。"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.register.title"
+msgstr "注册密钥"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.removeConfirm.desc"
+msgstr "历史会话中的掩码引用将不再解析并显示为已撤销。重新注册相同的值可以恢复它们。"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.removeConfirm.title"
+msgstr "移除此密钥？"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.revealHint"
+msgstr "查看密钥值请运行：synergy secrets reveal <id>"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.rotate.hint"
+msgstr "新值会得到新的 id；策略与历史记录会保留。"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.rotate.title"
+msgstr "轮换值"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.row.cap"
+msgstr "单会话解析上限"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.row.capPlaceholder"
+msgstr "留空表示不限"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.row.resolves"
+msgstr "解析次数"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.row.source"
+msgstr "来源"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.toast.emptyValue"
+msgstr "请输入非空值。"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.toast.failed"
+msgstr "操作失败"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.toast.policy"
+msgstr "策略已保存"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.toast.registered"
+msgstr "密钥已注册"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.toast.registeredDesc"
+msgstr "该值现已在所有位置被打码。"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.toast.removed"
+msgstr "密钥已移除"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.toast.removedDesc"
+msgstr "历史掩码引用将不再解析。"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.toast.rotated"
+msgstr "密钥已轮换"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.tools.label"
+msgstr "工具白名单（可选）"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.tools.placeholder"
+msgstr "例如 bash, mcp — 留空表示所有工具"
+
+#. js-lingui-explicit-id
+msgid "settings.secrets.value.label"
+msgstr "密钥值"
 
 #. js-lingui-explicit-id
 msgid "settings.skills.agents.desc"

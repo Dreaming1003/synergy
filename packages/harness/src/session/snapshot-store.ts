@@ -10,6 +10,7 @@ import { Storage } from "../storage/storage"
 import { StoragePath } from "../storage/path"
 import { SnapshotGit } from "./snapshot-git"
 import { SnapshotLease } from "./snapshot-lease"
+import { SnapshotProtection } from "./snapshot-protection"
 
 export namespace SnapshotStore {
   export const Owner = z.object({ version: z.literal(2), backend: z.enum(["legacy", "shared", "deleted"]) })
@@ -39,7 +40,7 @@ export namespace SnapshotStore {
   }
 
   export function root(scopeID: string) {
-    return path.join(Global.Path.data, "snapshot-v2", component(scopeID))
+    return path.join(Storage.current().artifactDirectory, "snapshot-v2", component(scopeID))
   }
 
   export function repository(scopeID: string) {
@@ -47,13 +48,18 @@ export namespace SnapshotStore {
   }
 
   export function legacyRepository(scopeID: string, sessionID: string) {
-    return path.join(Global.Path.snapshot, component(scopeID), component(sessionID))
+    return path.join(
+      path.join(Storage.current().artifactDirectory, "snapshot"),
+      component(scopeID),
+      component(sessionID),
+    )
   }
 
   export function cache(scopeID: string, sessionID?: string) {
     return path.join(
       Global.Path.cache,
       "snapshot-index",
+      createHash("sha256").update(Storage.current().artifactDirectory).digest("hex").slice(0, 16),
       component(scopeID),
       ...(sessionID ? [component(sessionID)] : []),
     )
@@ -67,7 +73,7 @@ export namespace SnapshotStore {
   }
 
   export function write<T>(key: string[], value: T) {
-    return Storage.write(key, value, { durable: true })
+    return Storage.write(key, value)
   }
 
   export async function owner(scopeID: string, sessionID: string) {
@@ -103,6 +109,15 @@ export namespace SnapshotStore {
   export async function withSession<T>(sessionID: string, fn: () => Promise<T>, signal?: AbortSignal) {
     const scopeID = ScopeContext.current.scope.id
     component(sessionID)
+    if (
+      (await owner(scopeID, sessionID))?.backend === "legacy" &&
+      (await SnapshotProtection.active(Storage.current().artifactDirectory))
+    ) {
+      const { SnapshotMaintenance } = await import("./snapshot-maintenance")
+      const result = await SnapshotMaintenance.migrate(scopeID, { apply: true, sessionID, signal })
+      if (result.results.some((result) => result.status !== "migrated"))
+        throw new StorageError("Protected historical snapshots are not ready")
+    }
     return SnapshotLease.use(
       scopeID,
       false,
@@ -120,8 +135,14 @@ export namespace SnapshotStore {
     )
   }
 
-  export async function command(repo: string, args: string[], signal?: AbortSignal) {
-    const result = await SnapshotGit.run(["git", "--git-dir", repo, ...args], path.dirname(repo), undefined, signal)
+  export async function command(repo: string, args: string[], signal?: AbortSignal, stdin?: string) {
+    const result = await SnapshotGit.run(
+      ["git", "--git-dir", repo, ...args],
+      path.dirname(repo),
+      undefined,
+      signal,
+      stdin,
+    )
     if (result.exitCode !== 0)
       throw new StorageError(`Snapshot git ${args[0]} failed (exit code ${result.exitCode}): ${result.stderr.trim()}`, {
         cause: { exitCode: result.exitCode, stderr: result.stderr },
@@ -134,17 +155,21 @@ export namespace SnapshotStore {
       { directory: SnapshotLease.directory(), key: `snapshot-init:${operation.repository}` },
       async () => {
         if (operation.backend === "legacy") {
+          await SnapshotProtection.assertWritable(Storage.current().artifactDirectory)
           if (!(await Bun.file(path.join(operation.repository, "HEAD")).exists()))
             throw new StorageError("Legacy snapshot repository is missing")
           return
         }
         await initializeRepository(operation.scopeID)
-        if (!(await owner(operation.scopeID, operation.sessionID))) {
-          await write(StoragePath.snapshotOwner(operation.scopeID, operation.sessionID), {
-            version: 2,
-            backend: "shared",
-          } satisfies Owner)
-        }
+        await Storage.transaction(async () => {
+          const current = await owner(operation.scopeID, operation.sessionID)
+          if (current?.backend === "deleted") throw new StorageError("Session snapshot ownership was deleted")
+          if (!current)
+            await write(StoragePath.snapshotOwner(operation.scopeID, operation.sessionID), {
+              version: 2,
+              backend: "shared",
+            } satisfies Owner)
+        })
       },
     )
   }
@@ -216,6 +241,42 @@ export namespace SnapshotStore {
     return result.exitCode === 0 && result.text.trim() === (record?.backend === "legacy" ? "tree" : hash)
   }
 
+  // Batched ownership check: one git subprocess answers the whole hash set
+  // instead of one process per hash, so callers looping over fork or export
+  // candidates stop paying spawn latency per snapshot step.
+  export async function ownsMany(scopeID: string, sessionID: string, hashes: string[]) {
+    const owned = new Set<string>()
+    const valid = hashes.filter((hash) => OID.test(hash))
+    if (!valid.length) return owned
+    const record = await owner(scopeID, sessionID)
+    if (record?.backend === "deleted") return owned
+    const legacy = record?.backend === "legacy"
+    const repo = legacy ? legacyRepository(scopeID, sessionID) : repository(scopeID)
+    if (!(await Bun.file(path.join(repo, "HEAD")).exists())) return owned
+    if (legacy) {
+      // Provenance: https://git-scm.com/docs/git-cat-file (BATCH OUTPUT).
+      // A missing object reports as a "missing" batch line rather than an
+      // error exit, and the type column carries the same answer as cat-file -t.
+      const input = valid.map((hash) => `${hash}\n`).join("")
+      const text = await command(repo, ["cat-file", "--batch-check=%(objectname) %(objecttype)"], undefined, input)
+      const types = new Map<string, string>()
+      for (const line of text.split("\n")) {
+        const [objectname, objecttype] = line.trim().split(" ")
+        if (objectname && objecttype) types.set(objectname, objecttype)
+      }
+      for (const hash of valid) if (types.get(hash) === "tree") owned.add(hash)
+      return owned
+    }
+    const prefix = `refs/synergy/snapshots/${component(sessionID)}/`
+    const requested = new Set(valid)
+    const text = await command(repo, ["for-each-ref", "--format=%(refname) %(objectname)", prefix])
+    for (const line of text.split("\n")) {
+      const [ref, hash] = line.trim().split(" ")
+      if (requested.has(hash) && ref === reference(sessionID, hash)) owned.add(hash)
+    }
+    return owned
+  }
+
   export function ownsCurrent(hash: string) {
     const operation = current()
     return owns(operation.scopeID, operation.sessionID, hash)
@@ -234,5 +295,17 @@ export namespace SnapshotStore {
       signal,
     )
     return result.exitCode === 0
+  }
+
+  // Batched retention write: one update-ref --stdin process records every
+  // retained tree under the same refs as the single-hash retainCurrent path.
+  export async function retainMany(scopeID: string, sessionID: string, hashes: string[]) {
+    const updates: string[] = []
+    for (const hash of new Set(hashes)) {
+      if (!OID.test(hash)) continue
+      updates.push(`update ${reference(sessionID, hash)} ${hash}`)
+    }
+    if (!updates.length) return
+    await command(repository(scopeID), ["update-ref", "--stdin"], undefined, `${updates.join("\n")}\n`)
   }
 }

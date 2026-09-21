@@ -12,6 +12,7 @@ import {
   expandGitProtectedSubpaths,
   joinPathLike,
   uniqueRoots,
+  readDenyPathsFor,
 } from "@ericsanchezok/synergy-harness/sandbox/policy"
 import { Log } from "@ericsanchezok/synergy-harness/util/log"
 import { isWsl1 } from "./wsl"
@@ -500,7 +501,7 @@ export namespace LinuxBackend {
    * Security invariants:
    * - sandboxed: true only when the helper binary is actually used
    * - If helper is unavailable, returns skipReason to signal unavailability
-   * - NEVER --ro-bind / / in inline bwrap path
+   * - Reads follow the deny-list model (`--ro-bind / /` plus credential covers)
    * - read_only mode must enforce read-only workspace
    * - Protected paths must not be writable
    */
@@ -563,16 +564,7 @@ export namespace LinuxBackend {
 
     const homedir = os.homedir()
     const workspace = opts.workspace
-    // Full-network children share the host network namespace but start from a
-    // --tmpfs root, so resolv.conf and CA stores would be invisible. Bind the
-    // network config paths read-only when full networking is approved; every
-    // entry is existence-filtered because bwrap hard-fails on missing sources.
-    const networkConfigRoots =
-      opts.networkMode === "full"
-        ? ["/etc", "/etc/resolv.conf", "/run/systemd/resolve", "/var/run/systemd/resolve"].filter((p) =>
-            fs.existsSync(p),
-          )
-        : []
+    const writableRoots = opts.sandboxMode === "workspace_write" ? [workspace, ...(opts.extraWritableRoots ?? [])] : []
 
     // Aggregate protected paths: the platform defaults plus every protected
     // path accumulated by the enforcement gate — which includes `<root>/.git`
@@ -588,17 +580,66 @@ export namespace LinuxBackend {
       uniqueRoots([...DEFAULT_PROTECTED_PATHS(homedir, workspace), ...(opts.protectedPaths ?? [])]),
     ).filter((p) => fs.existsSync(p))
 
+    // Stage 2 re-reads the helper profile at the same absolute path inside
+    // the sandbox. The plan's final controlled-tmp bind shadows every host
+    // path under /tmp, so a profile staged under a /tmp workspace or the
+    // host tmpdir is invisible to stage 2. The runtime cache dir is a
+    // default sandbox read root and never under /tmp; create it up front so
+    // the readable-roots existence filter below keeps it.
+    const stagingDir = joinPathLike(os.homedir(), ".synergy", "cache", "synergy-sandbox")
+    try {
+      fs.mkdirSync(stagingDir, { recursive: true })
+    } catch {
+      // Staging falls back below; this directory only matters when a
+      // sandboxed stage 2 re-reads the profile.
+    }
+
+    // A helper resolved under os.tmpdir() — test homes and custom
+    // SYNERGY_HOME setups — sits under the plan's final controlled-/tmp
+    // bind, which shadows every host path under /tmp: stage 2 re-execs the
+    // same absolute path inside the sandbox and dies with execvp ENOENT
+    // before any command runs. Mirror the profile staging above: copy the
+    // verified binary into the real-home staging dir, which is never under
+    // /tmp, and exec that copy. Production installs live under the real
+    // home and keep running in place.
+    let helperExecPath = helper.path
+    const relHelperToTmp = path.relative(os.tmpdir(), helper.path)
+    if (relHelperToTmp !== "" && !relHelperToTmp.startsWith("..") && !path.isAbsolute(relHelperToTmp)) {
+      try {
+        const staged = path.join(stagingDir, "synergy-sandbox-linux")
+        if (!isTarballHelperUpToDate(helper.path, staged)) {
+          fs.copyFileSync(helper.path, staged)
+          fs.chmodSync(staged, 0o755)
+        }
+        helperExecPath = staged
+      } catch (e) {
+        log.warn("failed to stage sandbox helper outside /tmp; stage 2 re-exec will fail", {
+          helper: helper.path,
+          error: String(e),
+        })
+      }
+    }
+
+    // Read model: reads are allowed globally and only credential and sensitive
+    // paths stay unreadable — the same deny list macOS compiles into its
+    // Seatbelt profile, produced here by the shared `readDenyPathsFor` owner so
+    // the platforms cannot drift. Declaring "/" as the readable root makes the
+    // helper bind the host root read-only, which covers the workspace, the
+    // dynamic-linker entry points, the staged helper, and the network config
+    // paths in one bind; the deny list is what keeps credentials unreadable.
+    // Ordinary external reads therefore no longer depend on the enforcement
+    // gate predicting the paths a command will touch.
+    const readDenyPaths = readDenyPathsFor({
+      workspace,
+      extraDenyPaths: opts.dataDenyRoots,
+    })
+
     // Build the sandbox permission profile JSON for the helper
     const profile: Record<string, unknown> = {
       fileSystem: {
         workspace,
-        readableRoots: [
-          workspace,
-          ...(opts.runtimeReadRoots ?? defaultRuntimeReadRoots(homedir)),
-          ...(opts.extraReadRoots ?? []),
-          ...networkConfigRoots,
-        ],
-        writableRoots: opts.sandboxMode === "workspace_write" ? [workspace, ...(opts.extraWritableRoots ?? [])] : [],
+        readableRoots: ["/"],
+        writableRoots,
         readOnlySubpaths: protectedPaths,
         protectedPaths,
         // Without ".git" in the metadata names, the helper's per-root ro-bind
@@ -606,6 +647,7 @@ export namespace LinuxBackend {
         // the granular hooks/config read-only mounts above keep the tamper and
         // code-execution surface protected while git writes work.
         protectedMetadataNames: [".agents", ".codex"],
+        dataDenyRoots: readDenyPaths,
         includePlatformDefaults: true,
       },
       network: {
@@ -615,14 +657,35 @@ export namespace LinuxBackend {
       },
     }
 
-    // Write profile to a private temp file. The helper consumes this path before
-    // entering bwrap; keep the file unpredictable and owner-readable only.
-    const tmpDir = os.tmpdir()
-    const profilePath = path.join(tmpDir, `synergy-sandbox-linux-${crypto.randomBytes(8).toString("hex")}.json`)
-    fs.writeFileSync(profilePath, JSON.stringify(profile, null, 2), { encoding: "utf-8", mode: 0o600 })
+    // Stage the profile where stage 2 can re-read it at the same absolute
+    // path (see stagingDir above). Keep the name unpredictable and the file
+    // owner-readable only; execution cleanup removes it afterwards.
+    // Synthetic workspaces and unwritable homes fall back to the workspace
+    // controlled tmp and then the host tmpdir, where only stage 1 reads
+    // the file.
+    const fileName = `synergy-sandbox-linux-${crypto.randomBytes(8).toString("hex")}.json`
+    const body = JSON.stringify(profile, null, 2)
+    let profilePath: string
+    try {
+      profilePath = path.join(stagingDir, fileName)
+      fs.writeFileSync(profilePath, body, { encoding: "utf-8", mode: 0o600 })
+    } catch {
+      try {
+        const tmpDir = joinPathLike(workspace, ".synergy", "tmp")
+        fs.mkdirSync(tmpDir, { recursive: true })
+        profilePath = path.join(tmpDir, fileName)
+        fs.writeFileSync(profilePath, body, { encoding: "utf-8", mode: 0o600 })
+      } catch {
+        profilePath = path.join(os.tmpdir(), fileName)
+        fs.writeFileSync(profilePath, body, { encoding: "utf-8", mode: 0o600 })
+        log.warn("staged sandbox profile outside sandbox-visible roots; stage 2 cannot re-read it", {
+          workspace,
+        })
+      }
+    }
 
     return {
-      command: helper.path,
+      command: helperExecPath,
       args: ["--sandbox-policy-cwd", opts.workspace, "--permission-profile", profilePath, "--", command, ...args],
       sandboxed: true,
       tempPath: profilePath,

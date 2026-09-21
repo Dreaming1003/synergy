@@ -52,6 +52,12 @@ type SynergyDesktop = {
     onEvent(listener: (event: unknown) => void): () => void
   }
   badge: { setState(state: unknown): Promise<unknown> }
+  power: {
+    get(): Promise<unknown>
+    set(update: unknown): Promise<unknown>
+    activityChanged(): Promise<unknown>
+    onEvent(listener: (event: unknown) => void): () => void
+  }
   browserNative: {
     attachView(input: unknown): Promise<unknown>
     detachView(input: unknown): Promise<unknown>
@@ -128,6 +134,13 @@ describe("desktop preload bridge", () => {
     expect(await desktop.openDirectoryPickerDialog({ multiple: true })).toBeNull()
   })
 
+  test("surfaces portal denial as a plain-data response across the bridge", async () => {
+    const denial = { denied: true, message: "Portal file dialogs are not allowed for this process" }
+    expectInvoke("dialog:select-directory", [{ title: "Add project", multiple: true }], denial)
+    const selected = await desktop.openDirectoryPickerDialog({ title: "Add project", multiple: true })
+    expect(selected).toEqual(denial)
+  })
+
   test("forwards theme and window state operations and subscribes to events", async () => {
     expectInvoke("desktop.theme.get", [], { version: 2 })
     expect(await desktop.theme.get()).toEqual({ version: 2 })
@@ -166,6 +179,36 @@ describe("desktop preload bridge", () => {
     const windowListener = electronMockState.ipcListeners.find((entry) => entry.channel === "desktop-window:event")
     windowListener!.wrapped(null, { type: "state", state: { maximized: true, fullscreen: false, focused: true } })
     expect(windowEvents).toEqual([{ type: "state", state: { maximized: true, fullscreen: false, focused: true } }])
+  })
+
+  test("routes power save state through IPC and subscribes to events", async () => {
+    expectInvoke("desktop.power.get", [], { keepAwakeWhileRunning: false, active: false })
+    expect(await desktop.power.get()).toEqual({ keepAwakeWhileRunning: false, active: false })
+
+    expectInvoke("desktop.power.set", [{ keepAwakeWhileRunning: true }], {
+      keepAwakeWhileRunning: true,
+      active: true,
+    })
+    expect(await desktop.power.set({ keepAwakeWhileRunning: true })).toEqual({
+      keepAwakeWhileRunning: true,
+      active: true,
+    })
+
+    expectInvoke("desktop.power.activityChanged", [], undefined)
+    await desktop.power.activityChanged()
+
+    const powerEvents: unknown[] = []
+    const offPower = desktop.power.onEvent((event) => powerEvents.push(event))
+    const powerListener = electronMockState.ipcListeners.find((entry) => entry.channel === "desktop-power:event")
+    expect(powerListener).toBeDefined()
+    powerListener!.wrapped(null, { type: "power", snapshot: { keepAwakeWhileRunning: true, active: true } })
+    expect(powerEvents).toEqual([{ type: "power", snapshot: { keepAwakeWhileRunning: true, active: true } }])
+    offPower()
+    expect(
+      electronMockState.ipcListeners.some(
+        (entry) => entry.channel === "desktop-power:event" && entry.wrapped === powerListener!.wrapped,
+      ),
+    ).toBe(false)
   })
 
   test("parses browser native events through the shared schema", () => {
