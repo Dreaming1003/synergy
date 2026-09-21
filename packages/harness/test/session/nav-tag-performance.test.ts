@@ -4,7 +4,7 @@ import { SessionNav } from "../../src/session/nav"
 import { Storage } from "../../src/storage/storage"
 import { StoragePath } from "../../src/storage/path"
 import { tmpdir } from "../support/fixture"
-
+import { Identifier } from "../../src/id/id"
 describe("SessionNav tag performance", () => {
   test("measures tag query performance with large navigation indexes", async () => {
     const sizes = [100, 500, 1000, 5000]
@@ -43,7 +43,7 @@ describe("SessionNav tag performance", () => {
             },
           }))
 
-          await Storage.write(StoragePath.sessionNavIndex(scope.id), {
+          await Storage.write(StoragePath.sessionNavIndex(Identifier.asScopeID(scope.id)), {
             version: 1,
             scopeID: scope.id,
             updatedAt: now,
