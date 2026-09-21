@@ -1,6 +1,7 @@
 import { Hono } from "hono"
 import { describeRoute, validator, resolver } from "hono-openapi"
 import z from "zod"
+import { Session } from "@ericsanchezok/synergy-harness/session"
 import { SessionNav, NavCategory, SessionNavResponse } from "@ericsanchezok/synergy-harness/session/nav"
 import { ScopeContext } from "@ericsanchezok/synergy-harness/scope/context"
 
@@ -10,7 +11,7 @@ const SessionNavQuery = z
   .object({
     scopeID: z.string().optional(),
     category: NavCategory.optional(),
-    tag: z.string().trim().min(1).optional(),
+    tag: Session.TagQuery.optional(),
     parentOnly: booleanQuery.optional(),
     includeArchived: booleanQuery.optional().default(false),
     limit: z.coerce.number().int().min(1).max(200).optional().default(20),

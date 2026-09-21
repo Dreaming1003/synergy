@@ -1848,6 +1848,11 @@ export type GlobalRecentResponse = {
   unreadCompletionCount: number
 }
 
+/**
+ * Filter sessions by tag
+ */
+export type SessionTagQuery = string
+
 export type GlobalAcknowledgeCompletionsResponse = {
   acknowledgedCount: number
   modifiedSessionCount: number
@@ -4935,6 +4940,8 @@ export type SessionScope = {
   sandboxes?: Array<string>
 }
 
+export type SessionTags = Array<unknown>
+
 export type FileDiff = {
   file: string
   additions: number
@@ -5161,7 +5168,7 @@ export type Session = {
     title?: string
   }
   category?: "project" | "home" | "channel" | "background" | "github"
-  tags?: Array<string>
+  tags?: SessionTags
   provenance?: "github"
   endpoint?: SessionEndpoint
   summary?: {
@@ -12592,7 +12599,7 @@ export type GlobalNavRecentData = {
     includeArchived?: boolean
     category?: "project" | "home" | "channel" | "background" | "github"
     channelType?: string
-    tag?: string
+    tag?: SessionTagQuery
     search?: string
     limit?: number
     cursorLastActivityAt?: number
@@ -14472,7 +14479,7 @@ export type SessionIndexData = {
     directory?: string
     scopeID?: string
     category?: "project" | "home" | "channel" | "background" | "github"
-    tag?: string
+    tag?: SessionTagQuery
     parentOnly?: "true" | "false"
     includeArchived?: "true" | "false"
     limit?: number
@@ -14647,10 +14654,7 @@ export type SessionListData = {
      * Only include pinned sessions
      */
     pinned?: boolean
-    /**
-     * Filter sessions by tag
-     */
-    tag?: string
+    tag?: SessionTagQuery
     /**
      * Only include top-level sessions (exclude subsessions). Default: true
      */
@@ -14686,6 +14690,7 @@ export type SessionCreateData = {
   body?: {
     parentID?: string
     title?: string
+    tags?: SessionTags
     id?: string
     controlProfile?: "guarded" | "autonomous" | "full_access"
     workspace?: SessionWorkspaceSelection
@@ -14836,7 +14841,7 @@ export type SessionGetResponse = SessionGetResponses[keyof SessionGetResponses]
 export type SessionUpdateData = {
   body?: {
     title?: string
-    tags?: Array<string>
+    tags?: SessionTags
     pinned?: number
     controlProfile?: "guarded" | "autonomous" | "full_access"
     resolvePendingPermissions?: boolean

@@ -3498,8 +3498,7 @@
             "in": "query",
             "name": "tag",
             "schema": {
-              "type": "string",
-              "minLength": 1
+              "$ref": "#/components/schemas/SessionTagQuery"
             }
           },
           {
@@ -7317,8 +7316,7 @@
             "in": "query",
             "name": "tag",
             "schema": {
-              "type": "string",
-              "minLength": 1
+              "$ref": "#/components/schemas/SessionTagQuery"
             }
           },
           {
@@ -7736,10 +7734,8 @@
             "in": "query",
             "name": "tag",
             "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "description": "Filter sessions by tag"
+              "$ref": "#/components/schemas/SessionTagQuery"
+            }
           },
           {
             "in": "query",
@@ -7862,6 +7858,9 @@
                   },
                   "title": {
                     "type": "string"
+                  },
+                  "tags": {
+                    "$ref": "#/components/schemas/SessionTags"
                   },
                   "id": {
                     "type": "string"
@@ -8200,13 +8199,7 @@
                     "type": "string"
                   },
                   "tags": {
-                    "maxItems": 20,
-                    "type": "array",
-                    "items": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 40
-                    }
+                    "$ref": "#/components/schemas/SessionTags"
                   },
                   "pinned": {
                     "type": "number"
@@ -33462,6 +33455,10 @@
         },
         "required": ["items", "nextCursor", "total", "unreadCompletionCount"]
       },
+      "SessionTagQuery": {
+        "description": "Filter sessions by tag",
+        "type": "string"
+      },
       "GlobalAcknowledgeCompletionsResponse": {
         "type": "object",
         "properties": {
@@ -39579,6 +39576,10 @@
         },
         "required": ["id"]
       },
+      "SessionTags": {
+        "type": "array",
+        "items": {}
+      },
       "FileDiff": {
         "type": "object",
         "properties": {
@@ -40318,14 +40319,7 @@
             "enum": ["project", "home", "channel", "background", "github"]
           },
           "tags": {
-            "default": [],
-            "maxItems": 20,
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 40
-            }
+            "$ref": "#/components/schemas/SessionTags"
           },
           "provenance": {
             "type": "string",

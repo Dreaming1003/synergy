@@ -32,6 +32,16 @@ describe("GET /global/recent", () => {
     })
   })
 
+  test("rejects an empty tag filter", async () => {
+    await ScopeContext.provide({
+      scope: Scope.home(),
+      fn: async () => {
+        const response = await Server.App().request("/global/recent?tag=%23")
+        expect(response.status).toBe(400)
+      },
+    })
+  })
+
   test("counts unread completions before pagination and excludes children and archived sessions", async () => {
     await using tmp = await tmpdir({ git: true })
     const scope = await tmp.scope()

@@ -665,6 +665,8 @@ import type {
   SessionStatusResponses,
   SessionSummarizeErrors,
   SessionSummarizeResponses,
+  SessionTagQuery,
+  SessionTags,
   SessionTodoErrors,
   SessionTodoResponses,
   SessionUnrollbackErrors,
@@ -2051,7 +2053,7 @@ export class Session extends HeyApiClient {
       directory?: string
       scopeID?: string
       category?: "project" | "home" | "channel" | "background" | "github"
-      tag?: string
+      tag?: SessionTagQuery
       parentOnly?: "true" | "false"
       includeArchived?: "true" | "false"
       limit?: number
@@ -2202,7 +2204,7 @@ export class Session extends HeyApiClient {
       since?: number
       before?: number
       pinned?: boolean
-      tag?: string
+      tag?: SessionTagQuery
       parentOnly?: boolean
     },
     options?: Options<never, ThrowOnError>,
@@ -2244,6 +2246,7 @@ export class Session extends HeyApiClient {
       scopeID?: string
       parentID?: string
       title?: string
+      tags?: SessionTags
       id?: string
       controlProfile?: "guarded" | "autonomous" | "full_access"
       workspace?: SessionWorkspaceSelection
@@ -2262,6 +2265,7 @@ export class Session extends HeyApiClient {
             { in: "query", key: "scopeID" },
             { in: "body", key: "parentID" },
             { in: "body", key: "title" },
+            { in: "body", key: "tags" },
             { in: "body", key: "id" },
             { in: "body", key: "controlProfile" },
             { in: "body", key: "workspace" },
@@ -2387,7 +2391,7 @@ export class Session extends HeyApiClient {
       directory?: string
       scopeID?: string
       title?: string
-      tags?: Array<string>
+      tags?: SessionTags
       pinned?: number
       controlProfile?: "guarded" | "autonomous" | "full_access"
       resolvePendingPermissions?: boolean
@@ -3771,7 +3775,7 @@ export class Nav extends HeyApiClient {
       includeArchived?: boolean
       category?: "project" | "home" | "channel" | "background" | "github"
       channelType?: string
-      tag?: string
+      tag?: SessionTagQuery
       search?: string
       limit?: number
       cursorLastActivityAt?: number

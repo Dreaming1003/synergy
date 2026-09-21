@@ -55,7 +55,7 @@ export const GlobalNavRoute = new Hono()
         includeArchived: booleanQuery.optional().default(false),
         category: NavCategory.optional(),
         channelType: z.string().min(1).optional(),
-        tag: z.string().trim().min(1).optional(),
+        tag: Session.TagQuery.optional(),
         search: z.string().optional(),
         limit: z.coerce.number().int().min(1).max(200).optional().default(20),
         cursorLastActivityAt: z.coerce.number().optional(),
