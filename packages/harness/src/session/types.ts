@@ -24,41 +24,43 @@ export const TagQuery = z
   .pipe(z.string().min(1).max(SESSION_TAG_MAX_LENGTH))
   .meta({ ref: "SessionTagQuery" })
 
-export const Tags = z.array(z.unknown()).transform((values, context) => {
-  const tags: string[] = []
-  values.forEach((value, index) => {
-    if (typeof value !== "string") {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: [index],
-        message: "Session tags must be strings",
-      })
-      return
-    }
+export const Tags = z
+  .array(z.unknown())
+  .transform((values, context) => {
+    const tags: string[] = []
+    values.forEach((value, index) => {
+      if (typeof value !== "string") {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: "Session tags must be strings",
+        })
+        return
+      }
 
-    const parsed = TagQuery.safeParse(value)
-    if (!parsed.success) {
-      const tooLong = parsed.error.issues.some((issue) => issue.code === z.ZodIssueCode.too_big)
-      if (!tooLong) return
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: [index],
-        message: "Session tags must be at most 40 characters after removing a leading hash",
-      })
-      return
-    }
-    tags.push(parsed.data)
+      const parsed = TagQuery.safeParse(value)
+      if (!parsed.success) {
+        const tooLong = parsed.error.issues.some((issue) => issue.code === z.ZodIssueCode.too_big)
+        if (!tooLong) return
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: "Session tags must be at most 40 characters after removing a leading hash",
+        })
+        return
+      }
+      tags.push(parsed.data)
+    })
+    return [...new Set(tags)]
   })
-  return [...new Set(tags)]
-})
-.refine((tags) => tags.every((tag) => tag.length <= SESSION_TAG_MAX_LENGTH), {
-  message: `Session tags can be at most ${SESSION_TAG_MAX_LENGTH} characters`,
-})
-.refine((tags) => tags.length <= SESSION_TAG_MAX_COUNT, {
-  message: `Sessions can have at most ${SESSION_TAG_MAX_COUNT} tags`,
-})
-.default([])
-.meta({ ref: "SessionTags" })
+  .refine((tags) => tags.every((tag) => tag.length <= SESSION_TAG_MAX_LENGTH), {
+    message: `Session tags can be at most ${SESSION_TAG_MAX_LENGTH} characters`,
+  })
+  .refine((tags) => tags.length <= SESSION_TAG_MAX_COUNT, {
+    message: `Sessions can have at most ${SESSION_TAG_MAX_COUNT} tags`,
+  })
+  .default([])
+  .meta({ ref: "SessionTags" })
 
 import { Identifier } from "../id/id"
 import type { Scope } from "../scope/types"

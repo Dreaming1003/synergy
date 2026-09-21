@@ -44,9 +44,7 @@ describe("GET /session/index (v2 nav)", () => {
       scope,
       fn: async () => {
         const app = Server.App()
-        const response = await app.request(
-          `/session/index?directory=${encodeURIComponent(scope.directory)}&tag=%23`,
-        )
+        const response = await app.request(`/session/index?directory=${encodeURIComponent(scope.directory)}&tag=%23`)
         expect(response.status).toBe(400)
       },
     })

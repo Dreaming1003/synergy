@@ -77,10 +77,7 @@ test("POST /session normalizes and bounds a tags array", async () => {
       expect(canonical.status).toBe(200)
       expect((await canonical.json()).tags).toEqual(["focus"])
 
-      const tooLong = await app.request(
-        "/session",
-        json("POST", { title: "Long tag", tags: [`#${"a".repeat(41)}`] }),
-      )
+      const tooLong = await app.request("/session", json("POST", { title: "Long tag", tags: [`#${"a".repeat(41)}`] }))
       expect(tooLong.status).toBe(400)
 
       const tooMany = await app.request(

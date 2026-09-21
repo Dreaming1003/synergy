@@ -35,12 +35,20 @@ describe("SessionNav.queryGlobal", () => {
         expect(scopeFocus.total).toBe(1)
         expect(scopeFocus.items[0]?.id).toBe(tagged.id)
 
-        const globalFocus = await SessionNav.queryGlobal({ search: token, tag: " #focus", parentOnly: false, limit: 20 })
-        const globalCanonical = await SessionNav.queryGlobal({ search: token, tag: "focus", parentOnly: false, limit: 20 })
+        const globalFocus = await SessionNav.queryGlobal({
+          search: token,
+          tag: " #focus",
+          parentOnly: false,
+          limit: 20,
+        })
+        const globalCanonical = await SessionNav.queryGlobal({
+          search: token,
+          tag: "focus",
+          parentOnly: false,
+          limit: 20,
+        })
         expect(globalFocus.total).toBe(globalCanonical.total)
-        expect(globalFocus.items.map((entry) => entry.id)).toEqual(
-          globalCanonical.items.map((entry) => entry.id),
-        )
+        expect(globalFocus.items.map((entry) => entry.id)).toEqual(globalCanonical.items.map((entry) => entry.id))
         expect(globalFocus.total).toBe(1)
         expect(globalFocus.items[0]?.id).toBe(tagged.id)
 
