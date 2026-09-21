@@ -41,3 +41,5 @@ A newly typed label is available immediately on that session, while broader tag 
 Exact filtering keeps server-owned pagination semantics predictable and applies the membership test before cursor slicing in navigation routes.
 
 Tag filters query the global navigation index before pagination, including history outside loaded sidebar pages. Query changes cancel outstanding requests, metadata events override older query responses, and reconnect reloads the selected filter. Tag menus retain failed input and serialize saves against the last accepted tag list. Repeated leading hash markers normalize idempotently, and generated tag arrays retain their string element type.
+
+The reusable tag input schema has no default: an omitted PATCH field means no tag edit. Persisted session parsing and creation apply the empty-list default at their own boundaries, so marking a session read preserves both its tags and activity timestamp.

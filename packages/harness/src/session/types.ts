@@ -9,7 +9,7 @@ export const SESSION_TAG_MAX_LENGTH = 40
 export const SESSION_TAG_MAX_COUNT = 20
 
 export function normalizeSessionTags(values: unknown): string[] {
-  return Tags.parse(values)
+  return Tags.parse(values === undefined ? [] : values)
 }
 
 export function normalizeSessionTag(value: unknown): string | undefined {
@@ -50,7 +50,6 @@ export const Tags = z
   .refine((tags) => tags.length <= SESSION_TAG_MAX_COUNT, {
     message: `Sessions can have at most ${SESSION_TAG_MAX_COUNT} tags`,
   })
-  .default([])
   .meta({ ref: "SessionTags" })
 
 import { Identifier } from "../id/id"
@@ -222,7 +221,7 @@ const BaseInfo = z.preprocess(
       })
       .optional(),
     category: z.enum(["project", "home", "channel", "background", "github"]).optional(),
-    tags: Tags,
+    tags: Tags.default([]),
     provenance: z.literal("github").optional(),
     endpoint: SessionEndpoint.Info.optional(),
     summary: z

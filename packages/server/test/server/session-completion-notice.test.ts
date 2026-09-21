@@ -14,7 +14,7 @@ describe("session completion notice route", () => {
       scope: await tmp.scope(),
       fn: async () => {
         const app = Server.App()
-        const session = await Session.create({})
+        const session = await Session.create({ tags: ["focus"] })
         await Session.update(session.id, (draft) => {
           draft.completionNotice.unread = true
           draft.completionNotice.unreadCount = 2
@@ -31,6 +31,7 @@ describe("session completion notice route", () => {
         const body = await response.json()
         expect(body.completionNotice).toEqual({ unread: false, unreadCount: 0, silent: false })
         expect(body.time.updated).toBe(before.time.updated)
+        expect(body.tags).toEqual(["focus"])
 
         const repeated = await app.request(`/session/${session.id}`, {
           method: "PATCH",
